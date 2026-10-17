@@ -19,6 +19,12 @@ Inventory tracking and Auction House posting tools are included as beta features
 1. Open any profession window or the crafting orders board.
 2. Type **/pcfo** to open settings.
 
+## Download
+
+- [CurseForge](https://www.curseforge.com/wow/addons/pocketcfo)
+- [Wago](https://addons.wago.io/addons/pocketcfo)
+- [WoWInterface](https://www.wowinterface.com/downloads/info27267)
+
 ## Found a bug? Have an idea?
 
 [Open an issue here](../../issues/new/choose). Pick **Bug report** or **Feature idea** and fill in the short form.
