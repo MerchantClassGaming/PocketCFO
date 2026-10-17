@@ -1,0 +1,46 @@
+name: Bug report
+description: Something isn't working right
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting! The more of this you fill in, the faster it gets fixed.
+
+  - type: input
+    id: version
+    attributes:
+      label: Addon version
+      description: Shown in your addon manager (CurseForge app, Wago, WowUp).
+      placeholder: v1.0.4
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead. If a number looks wrong, tell us the item or recipe and what you expected to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can I make it happen?
+      placeholder: |
+        1. Open Alchemy
+        2. Select a recipe
+        3. ...
+
+  - type: textarea
+    id: lua-error
+    attributes:
+      label: Error message (if you got one)
+      description: Paste the whole error. If you don't see errors, type /console scriptErrors 1 in chat and try again, or use BugSack.
+      render: text
+
+  - type: textarea
+    id: other-addons
+    attributes:
+      label: Other crafting or auction addons you use
+      placeholder: TSM, Auctionator, CraftSim...

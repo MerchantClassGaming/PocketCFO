@@ -1,0 +1,15 @@
+name: Feature idea
+description: Suggest something new or something better
+labels: ["feature"]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: How would it help you?
