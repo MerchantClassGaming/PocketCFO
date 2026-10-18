@@ -1,0 +1,35 @@
+## Interface: 120105
+## Title: PocketCFO Valuation
+## Notes: Pricing identity and valuation cache foundation - Merchant Class Gaming
+## Author: MerchantCGaming
+## Version: v1.1.0
+## SavedVariables: PocketCFO_ValuationDB
+## LoadOnDemand: 1
+
+## Dependencies: PocketCFO
+
+## Libraries
+..\PocketCFO\Libs\LibStub\LibStub.lua
+..\PocketCFO\Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+..\PocketCFO\Libs\AceAddon-3.0\AceAddon-3.0.lua
+..\PocketCFO\Libs\AceEvent-3.0\AceEvent-3.0.lua
+..\PocketCFO\Libs\AceDB-3.0\AceDB-3.0.lua
+
+## Core
+Core.lua
+
+## Modules
+Modules\PricingIdentity.lua
+Modules\VendorPriceDefaults.lua
+Modules\VendorPriceService.lua
+Modules\PricingCache.lua
+Modules\QualitySiblings.lua
+Modules\PricingValuation.lua
+Modules\ValuationRules.lua
+Modules\ValuationService.lua
+Modules\ValuationRuleSet.lua
+Modules\CustomValuationRegistrations.lua
+Modules\Tooltip.lua
+Modules\AHTab.lua
+Modules\FullScan.lua
+Modules\SearchRefresh.lua

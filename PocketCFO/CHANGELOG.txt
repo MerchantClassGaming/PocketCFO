@@ -1,0 +1,21 @@
+## New: See where your gold comes from
+
+Open it with **/pcfo gold**. The Gold window now has three tabs:
+
+**Balances**
+Your gold on every character, your Warband Bank, and your account total. Same as before.
+
+**Income**
+Where your gold came from: Patron Orders, Personal Orders, Auction House, Vendor, Loot & Quests, and more.
+- Pick Today, 7 Days, 30 Days, or All, and pick one character or all of them.
+- Click a source to see it split by profession, or to see which items you sold on the Auction House or to vendors.
+- A bar for each day shows how your income changes over time. Hover a bar to see that day.
+- Auction House sales are counted on the day they sold, not the day you collected the mail. Open your mailbox often to keep it up to date.
+- Gold you move between your own characters is never counted as income.
+
+**Orders**
+What your crafting orders actually earned you: the gold paid, plus the value of the rewards and any mats you got back, minus the mats you used.
+- See it by profession, then click a profession to compare Patron, Personal, Public, and Guild orders.
+- Uncheck order types to hide them. For example, uncheck everything but Patron to see which profession's patron orders pay best.
+
+Tracking starts when you install this update, so your history builds up from today.

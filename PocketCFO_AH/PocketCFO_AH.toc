@@ -1,0 +1,63 @@
+## Interface: 120105
+## Title: PocketCFO AH
+## Notes: Auction House scanner and listing reconciler - Merchant Class Gaming
+## Author: MerchantCGaming
+## Version: v1.1.0
+## SavedVariables: PocketCFO_AH_DB
+## LoadOnDemand: 1
+## LoadWith: Blizzard_AuctionHouseUI
+
+## Dependencies: PocketCFO
+## OptionalDeps: PocketCFO_Valuation
+
+## Libraries
+..\PocketCFO\Libs\LibStub\LibStub.lua
+..\PocketCFO\Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+..\PocketCFO\Libs\AceAddon-3.0\AceAddon-3.0.lua
+..\PocketCFO\Libs\AceEvent-3.0\AceEvent-3.0.lua
+..\PocketCFO\Libs\AceDB-3.0\AceDB-3.0.lua
+
+## Core
+Init.lua
+
+## Scanners
+Scanners\OwnedAuctionsScanner.lua
+
+## Services
+Services\AHListing\AHListingService.lua
+Services\AuctionLookup\AuctionLookupService.lua
+Services\MarketDiscoveryService\MarketDiscoveryResult.lua
+Services\MarketDiscoveryService\AuctionCandidateNormalizer.lua
+Services\MarketDiscoveryService\AuctionCandidateSearch.lua
+Services\MarketDiscoveryService\AuctionMatchFilter.lua
+Services\MarketDiscoveryService\MarketDiscoveryService.lua
+Services\MarketLadderService\LadderResult.lua
+Services\MarketLadderService\PurchaseOrderSorter.lua
+Services\MarketLadderService\OwnedPositionAnalyzer.lua
+Services\MarketLadderService\LadderBuilder.lua
+Services\MarketLadderService\MarketLadderService.lua
+Services\PostingEligibilityService\PostingEligibilityService.lua
+
+## Posting
+Posting\Evaluation\PostingEvaluator.lua
+Posting\Evaluation\PostingEvaluationPipeline.lua
+Posting\Execution\PostingExecution.lua
+Posting\Components\PostingController.lua
+Posting\UI\PostingUI.lua
+Cancelling\CancelEvaluation.lua
+Cancelling\CancelAuctionsController.lua
+UI\CancelAuctionsUI.lua
+Posting\Rules\PostingRuleRepository.lua
+Posting\Components\PostingRuleEditor.lua
+Posting\UI\PostingProfileEditorUI.lua
+Posting\UI\PostingProfileManagerUI.lua
+Posting\Rules\PostingProfileRepository.lua
+Posting\Rules\PostingRuleResolver.lua
+Posting\Queue\PostingQueuePipeline.lua
+UI\AuctionHousePostingShell.lua
+
+## Manager
+Infrastructure\AHSessionController.lua
+Posting\Components\PostingEventCapture.lua
+Posting\Components\PostingLifecycleController.lua
+Infrastructure\AHManager.lua

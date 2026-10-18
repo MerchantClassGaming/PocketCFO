@@ -1,0 +1,13 @@
+## Interface: 120105
+## Title: PocketCFO P&L
+## Notes: Gold balances, income sources, and profit views.
+## Author: MerchantClassGaming
+## Version: v1.1.0
+## LoadOnDemand: 1
+## Dependencies: PocketCFO
+
+Init.lua
+Services\IncomeReport.lua
+Services\OrderReport.lua
+UI\GoldWindow.lua
+UI\OrdersTab.lua

@@ -1,0 +1,21 @@
+## Interface: 120105
+## Title: PocketCFO Orders
+## Notes: Order tracking, bag opens, knowledge points, and Moxie listener.
+## Author: MerchantClassGaming
+## Version: v1.1.0
+## LoadOnDemand: 1
+## Dependencies: PocketCFO
+## SavedVariables: PocketCFO_Orders_DB
+
+Init.lua
+Services\OrderObservationBuilder.lua
+Services\OrderEconomicsService.lua
+Services\KnowledgeRewardRegistry.lua
+Services\OrderDisplayModelBuilder.lua
+OrdersLedger.lua
+BagOpens.lua
+KnowledgePointLog.lua
+MoxieListener.lua
+UI\OrderAnalysisContent.lua
+OrdersCompanionController.lua
+UI\PatronOrdersBoard.lua
