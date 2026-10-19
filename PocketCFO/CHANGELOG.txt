@@ -1,3 +1,6 @@
+v1.1.2
+Fixes a bug where opening the mailbox sometimes stopped tracking other sources of gold.
+
 v1.1.1
 Fixes a bug where some auction house sales were being attributed to Loot and Quests in the gold tracker.
 

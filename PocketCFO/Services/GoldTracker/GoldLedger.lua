@@ -85,6 +85,20 @@ local WINDOW_EVENTS = {
     BANKFRAME_CLOSED    = { "bank", false },
 }
 
+-- Interaction types (PLAYER_INTERACTION_MANAGER_FRAME_SHOW/HIDE arg1).
+-- MailInfo = 17 confirmed in-game 2026-10-19. Merchant / Auctioneer / Banker
+-- are read from Enum.PlayerInteractionType (Theoretical until seen).
+local INTERACTION_WINDOWS = {}
+do
+    local types = Enum and Enum.PlayerInteractionType or {}
+    INTERACTION_WINDOWS[types.MailInfo or 17] = "mail"
+    if types.Merchant then INTERACTION_WINDOWS[types.Merchant] = "merchant" end
+    if types.Auctioneer then INTERACTION_WINDOWS[types.Auctioneer] = "auction" end
+    if types.Banker then INTERACTION_WINDOWS[types.Banker] = "bank" end
+    if types.AccountBanker then INTERACTION_WINDOWS[types.AccountBanker] = "bank" end
+end
+
+local MAIL_HOLD_TIMEOUT = 20
 local LOOT_CLAIM_TTL = 3
 local UNKNOWN_LOG_SIZE = 50
 
@@ -233,9 +247,17 @@ end
 
 -- claim = { category, profession, amount (exact signed copper or nil),
 --           direction (1 / -1, used when amount is nil), reason, expiresAt }
+-- Evidence of another gold source (order, quest, vendor sale, warband) means
+-- you are not at the mailbox. Claims made AT the mailbox (mail to your own
+-- character) and loot messages do not close it.
+-- Theoretical: whether taking mail gold also fires CHAT_MSG_MONEY; loot is
+-- excluded until confirmed so it can never end a real mailbox session.
 function GoldLedger:AddClaim(claim)
     claim.expiresAt = GetTime() + (claim.ttl or CLAIM_TTL)
     self.claims[#self.claims + 1] = claim
+    if not claim.atMailbox and claim.category ~= "loot_quest" then
+        self:LeaveMailbox("evidence:" .. tostring(claim.category))
+    end
 end
 
 function GoldLedger:PruneClaims(now)
@@ -372,8 +394,13 @@ function GoldLedger:Flush()
     for _, entry in ipairs(pending) do
         local category, professionKey, reason, timestamp, item = self:Classify(entry)
         if category == "mail_hold" and self.windowOpen.mail then
+            entry.heldAt = GetTime()
             self.mailHeld[#self.mailHeld + 1] = entry
             held = held + 1
+            SessionLog("holding %s for mailbox matching", FormatCopper(entry.delta))
+            C_Timer.After(MAIL_HOLD_TIMEOUT + 0.5, function()
+                GoldLedger:ReleaseStaleHeld()
+            end)
         else
             if category == "mail_hold" then
                 -- Mailbox closed before this batch was processed.
@@ -467,24 +494,76 @@ function GoldLedger:OnAccountMoney()
     self.lastAccountMoney = accountMoney
 end
 
-function GoldLedger:OnWindowEvent(event)
-    local mapping = WINDOW_EVENTS[event]
-    if not mapping then
+-- Single place window state changes. Ignores repeats (the legacy event and the
+-- interaction event can both report the same open/close).
+function GoldLedger:SetWindow(window, isOpen, source)
+    local wasOpen = self.windowOpen[window] and true or false
+    if wasOpen == (isOpen and true or false) then
         return
     end
-    local window, isOpen = mapping[1], mapping[2]
     self.windowOpen[window] = isOpen or nil
     if not isOpen then
         self.windowClosedAt[window] = GetTime()
     end
-    if event == "MAIL_SHOW" then
-        self.mailSeen = nil
-        self.mailHeld = {}
-        self.mailGone = {}
-        self:OnMailInbox()
-    elseif event == "MAIL_CLOSED" then
-        self:SettleMail(true)
-        self.mailSeen = nil
+    if window == "mail" then
+        if isOpen then
+            SessionLog("mailbox opened source=%s", tostring(source))
+            self.mailSeen = nil
+            self.mailHeld = {}
+            self.mailGone = {}
+            self:OnMailInbox()
+        else
+            SessionLog("mailbox closed source=%s", tostring(source))
+            self:SettleMail(true)
+            self.mailSeen = nil
+        end
+    end
+end
+
+function GoldLedger:OnWindowEvent(event)
+    local mapping = WINDOW_EVENTS[event]
+    if mapping then
+        self:SetWindow(mapping[1], mapping[2], event)
+    end
+end
+
+-- PLAYER_INTERACTION_MANAGER_FRAME_SHOW/HIDE (arg = interaction type).
+-- Confirmed in-game 2026-10-19: closing the mailbox (X or Escape) fires
+-- FRAME_HIDE with type 17 and never fires MAIL_CLOSED.
+function GoldLedger:OnInteraction(event, interactionType)
+    local window = INTERACTION_WINDOWS[tonumber(interactionType)]
+    if window then
+        self:SetWindow(window, event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW", event .. ":" .. tostring(interactionType))
+    end
+end
+
+-- Another gold source just proved you are not at the mailbox: close the
+-- mailbox session (held gold is matched or released to Unknown).
+function GoldLedger:LeaveMailbox(reason)
+    if self.windowOpen.mail then
+        self:SetWindow("mail", false, reason)
+    end
+end
+
+-- Held mailbox gold that stays unmatched for MAIL_HOLD_TIMEOUT seconds is
+-- released to Unknown so a missed mailbox close can never swallow gold.
+function GoldLedger:ReleaseStaleHeld()
+    local now = GetTime()
+    local kept, released = {}, 0
+    for _, entry in ipairs(self.mailHeld) do
+        if now - (entry.heldAt or now) >= MAIL_HOLD_TIMEOUT then
+            local reason = "mail:timeout-unmatched"
+            self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
+            self:Record(entry.delta, "other", nil, reason, entry.timestamp)
+            released = released + 1
+        else
+            kept[#kept + 1] = entry
+        end
+    end
+    self.mailHeld = kept
+    if released > 0 then
+        SessionLog("released %d held mailbox gold change(s) after %ds", released, MAIL_HOLD_TIMEOUT)
+        self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
     end
 end
 
@@ -713,6 +792,7 @@ function GoldLedger:OnSendMail(recipient)
             category = "transfer",
             direction = -1,
             reason = "send-mail:own-character",
+            atMailbox = true,
         })
     end
 end
@@ -767,6 +847,9 @@ end
 -- ---------------------------------------------------------------------------
 
 function GoldLedger:OnEnteringWorld()
+    -- A loading screen closes every window.
+    self:LeaveMailbox("loading-screen")
+    self.windowOpen = {}
     self.lastMoney = GetMoney and GetMoney() or self.lastMoney
     self.lastAccountMoney = self:ReadAccountMoney() or self.lastAccountMoney
 end
@@ -782,6 +865,8 @@ function GoldLedger:OnEnable()
     for event in pairs(WINDOW_EVENTS) do
         self:RegisterEvent(event, "OnWindowEvent")
     end
+    self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", "OnInteraction")
+    self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE", "OnInteraction")
     self:OnEnteringWorld()
 end
 
