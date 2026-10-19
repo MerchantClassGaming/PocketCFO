@@ -488,6 +488,17 @@ function GoldWindow:GetSourceRow(index)
             GoldWindow:Render()
         end
     end)
+    row:SetScript("OnEnter", function(self)
+        if self.sourceKey == "other" then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine("Unknown")
+            GameTooltip:AddLine("Gold PocketCFO couldn't trace to a source.", 1, 1, 1, true)
+            GameTooltip:Show()
+        end
+    end)
+    row:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
 
     pane.sourceRows[index] = row
     return row
@@ -538,6 +549,31 @@ function GoldWindow:ShowBarTooltip(bar)
     GameTooltip:Show()
 end
 
+-- Adds up to MAX_ITEM_LINES item lines (plus one "N more items" line).
+local function AddItemLines(lines, items, indent)
+    for index, item in ipairs(items or {}) do
+        if index > MAX_ITEM_LINES then
+            local restCopper = 0
+            for rest = index, #items do
+                restCopper = restCopper + items[rest].copper
+            end
+            lines[#lines + 1] = {
+                label = string.format("%s|cff888888%d more items|r", indent, #items - MAX_ITEM_LINES),
+                copper = restCopper,
+                sub = true,
+                wide = true,
+            }
+            return
+        end
+        lines[#lines + 1] = {
+            label = string.format("%s|cffbbbbbb%s|r |cff888888x%d|r", indent, item.label, item.quantity or 0),
+            copper = item.copper,
+            sub = true,
+            wide = true,
+        }
+    end
+end
+
 function GoldWindow:RenderIncome()
     local pane = self.frame.incomePane
     local report = PocketCFO_PnL.IncomeReport
@@ -571,30 +607,11 @@ function GoldWindow:RenderIncome()
                     color = SUB_BAR_COLOR,
                     sub = true,
                 }
+                -- That profession's items, one level deeper.
+                AddItemLines(lines, profession.items, "        ")
             end
-        end
-        if isOpen and source.items and #source.items > 0 then
-            for index, item in ipairs(source.items) do
-                if index > MAX_ITEM_LINES then
-                    local restCopper = 0
-                    for rest = index, #source.items do
-                        restCopper = restCopper + source.items[rest].copper
-                    end
-                    lines[#lines + 1] = {
-                        label = string.format("    |cff888888%d more items|r", #source.items - MAX_ITEM_LINES),
-                        copper = restCopper,
-                        sub = true,
-                        wide = true,
-                    }
-                    break
-                end
-                lines[#lines + 1] = {
-                    label = string.format("    |cffbbbbbb%s|r |cff888888x%d|r", item.label, item.quantity or 0),
-                    copper = item.copper,
-                    sub = true,
-                    wide = true,
-                }
-            end
+        elseif isOpen then
+            AddItemLines(lines, source.items, "    ")
         end
     end
 

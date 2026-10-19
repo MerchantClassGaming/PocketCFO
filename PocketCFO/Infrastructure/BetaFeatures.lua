@@ -34,6 +34,12 @@ local FLAG_DEFINITIONS = {
     },
 }
 
+-- WoW Forever ships without the beta features: both flags read off and the
+-- toggles are not shown. PocketCFO.flavor is set by Flavor_Forever.lua.
+local function IsForever()
+    return PocketCFO.flavor == "forever"
+end
+
 local function SettingsTable()
     local globalDB = PocketCFO.db and PocketCFO.db.global
     if not globalDB then
@@ -44,11 +50,17 @@ local function SettingsTable()
 end
 
 function BetaFeatures:IsEnabled(key)
+    if IsForever() then
+        return false
+    end
     local settings = SettingsTable()
     return settings ~= nil and settings[key] == true
 end
 
 function BetaFeatures:SetEnabled(key, enabled)
+    if IsForever() then
+        return
+    end
     local settings = SettingsTable()
     if not settings then
         return
@@ -102,7 +114,13 @@ function BetaFeatures:CreateSettingsPanel()
 
     local checkButtons = {}
     local anchor = intro
-    for _, definition in ipairs(FLAG_DEFINITIONS) do
+    local definitions = FLAG_DEFINITIONS
+    if IsForever() then
+        header:SetText("Settings")
+        intro:SetText("Nothing to set up yet.")
+        definitions = {}
+    end
+    for _, definition in ipairs(definitions) do
         local checkButton = CreateFrame("CheckButton", nil, panel, "SettingsCheckBoxTemplate")
         checkButton:SetSize(21, 20)
         checkButton:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -18)

@@ -43,7 +43,15 @@ local function ResolveIconAndOutputItemID(recipeID, recipeInfo)
     end
 
     if recipeInfo and recipeInfo.spellID then
-        local spellIcon = select(3, GetSpellInfo(recipeInfo.spellID))
+        -- C_Spell.GetSpellInfo returns a table (iconID field); the global
+        -- GetSpellInfo is gone on newer clients.
+        local spellIcon
+        if C_Spell and C_Spell.GetSpellInfo then
+            local spellInfo = C_Spell.GetSpellInfo(recipeInfo.spellID)
+            spellIcon = spellInfo and spellInfo.iconID
+        elseif GetSpellInfo then
+            spellIcon = select(3, GetSpellInfo(recipeInfo.spellID))
+        end
         if spellIcon then return spellIcon, nil end
     end
 

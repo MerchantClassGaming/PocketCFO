@@ -2,7 +2,7 @@
 ## Title: PocketCFO P&L
 ## Notes: Gold balances, income sources, and profit views.
 ## Author: MerchantClassGaming
-## Version: v1.1.0
+## Version: v1.1.1
 ## LoadOnDemand: 1
 ## Dependencies: PocketCFO
 

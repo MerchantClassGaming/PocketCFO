@@ -115,7 +115,10 @@ end
 function GoldTracker:OnEnable()
     self:RegisterEvent("PLAYER_ENTERING_WORLD", "OnMoneyChanged")
     self:RegisterEvent("PLAYER_MONEY", "OnMoneyChanged")
-    self:RegisterEvent("ACCOUNT_MONEY", "OnMoneyChanged")
+    -- pcall: warband gold may not exist on every client (WoW Forever - Theoretical).
+    pcall(function()
+        self:RegisterEvent("ACCOUNT_MONEY", "OnMoneyChanged")
+    end)
     -- No PLAYER_LOGOUT save: every logged-out character was being stored as
     -- 0 (Brian, 2026-10-12), so GetMoney() evidently returns 0 by logout.
     -- PLAYER_MONEY already saves every change while logged in.

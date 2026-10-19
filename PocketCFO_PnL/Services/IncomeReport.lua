@@ -32,7 +32,7 @@ local CATEGORY_LABELS = {
     trade          = "Trade",
     mail           = "Mail",
     loot_quest     = "Loot & Quests",
-    other          = "Everything else",
+    other          = "Unknown",
 }
 
 local EXCLUDED_CATEGORIES = {
@@ -139,6 +139,20 @@ local function SortedList(map, labelFn)
     return list
 end
 
+local function SortedItems(itemMap)
+    local items = {}
+    for itemName, entry in pairs(itemMap or {}) do
+        items[#items + 1] = { label = itemName, copper = entry.copper, quantity = entry.quantity }
+    end
+    table.sort(items, function(a, b)
+        if a.copper ~= b.copper then
+            return a.copper > b.copper
+        end
+        return a.label < b.label
+    end)
+    return items
+end
+
 local function BuildChartBuckets(daily)
     local bucketSize = math.max(1, math.ceil(#daily / MAX_CHART_BARS))
     local buckets = {}
@@ -199,8 +213,10 @@ function IncomeReport:Build(periodKey, characterGUID)
                                     byCategoryProfession[category] = split
                                     split[professionKey] = (split[professionKey] or 0) + income
                                     if type(row.items) == "table" then
-                                        local items = byCategoryItem[category] or {}
-                                        byCategoryItem[category] = items
+                                        local byProfession = byCategoryItem[category] or {}
+                                        byCategoryItem[category] = byProfession
+                                        local items = byProfession[professionKey] or {}
+                                        byProfession[professionKey] = items
                                         for itemName, detail in pairs(row.items) do
                                             local entry = items[itemName] or { copper = 0, quantity = 0 }
                                             items[itemName] = entry
@@ -219,7 +235,7 @@ function IncomeReport:Build(periodKey, characterGUID)
     end
 
     local sources = SortedList(byCategory, function(key) return self:GetCategoryLabel(key) end)
-    -- "Everything else" always sits at the bottom.
+    -- "Unknown" always sits at the bottom.
     for index, source in ipairs(sources) do
         if source.key == "other" then
             table.remove(sources, index)
@@ -234,19 +250,17 @@ function IncomeReport:Build(periodKey, characterGUID)
         local onlyNone = #source.professions == 1 and source.professions[1].key == "none"
         source.showProfessions = #source.professions > 0 and not onlyNone
 
-        local items = {}
-        for itemName, entry in pairs(byCategoryItem[source.key] or {}) do
-            items[#items + 1] = { label = itemName, copper = entry.copper, quantity = entry.quantity }
+        -- Items stay grouped under the profession they were credited to.
+        local itemsByProfession = byCategoryItem[source.key] or {}
+        local itemCount = 0
+        for _, profession in ipairs(source.professions) do
+            profession.items = SortedItems(itemsByProfession[profession.key])
+            itemCount = itemCount + #profession.items
         end
-        table.sort(items, function(a, b)
-            if a.copper ~= b.copper then
-                return a.copper > b.copper
-            end
-            return a.label < b.label
-        end)
-        source.items = items
+        -- Single "No profession" source: its items list directly under the source.
+        source.items = onlyNone and source.professions[1].items or {}
 
-        source.expandable = source.showProfessions or #items > 0
+        source.expandable = source.showProfessions or itemCount > 0
     end
 
     return {

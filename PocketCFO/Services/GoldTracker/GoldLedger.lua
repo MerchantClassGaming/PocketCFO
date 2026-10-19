@@ -17,13 +17,15 @@
 -- related events can claim them regardless of which event arrives first.
 --   1. A claim with a matching exact amount wins (quest reward, vendor sale,
 --      warband deposit/withdraw).
---   2. Then a claim with no amount whose direction matches (order completed,
---      gold mailed to your own character).
---   3. Then whichever window was open (or closed within WINDOW_GRACE seconds)
---      when the gold changed.
---   4. Otherwise "other".
--- Gold gained while the mailbox is open is matched against the inbox instead
--- (see the Mailbox section).
+--   2. Gold gained while the mailbox is open is matched against the inbox
+--      (see the Mailbox section).
+--   3. Then a claim with no amount whose direction matches (order completed,
+--      loot-money message, gold mailed to your own character).
+--   4. Then a window rule: gold IN only by merchant or trade (the only ways
+--      gold goes up there); gold OUT by merchant, trade, AH or mail.
+--   5. Otherwise "other" (shown as Unknown) and logged in goldLedger.unknownLog
+--      (/mcg goldunknown) so each gap can be found and given a real rule.
+-- Rule: a category is only assigned for a specific reason, never as a guess.
 --
 -- Sends AceEvent message "MCG_GOLD_LEDGER_UPDATED" after each batch is saved.
 -- The Income view in PocketCFO_PnL reads GetDays().
@@ -54,14 +56,21 @@ local ORDER_CATEGORY = {
     [3] = "order_patron",
 }
 
--- Checked in this order when no claim matches.
-local WINDOW_CATEGORY = {
+-- Window rules, used only when no claim matches. Gold coming IN is credited by
+-- window only where that window is the only way gold can go up (selling to a
+-- vendor, a trade). Anything else coming in is "other" (shown as Unknown).
+-- Spending (not displayed yet) still uses every window.
+local INCOME_WINDOW_CATEGORY = {
+    { window = "merchant", category = "vendor" },
+    { window = "trade",    category = "trade" },
+}
+local SPEND_WINDOW_CATEGORY = {
     { window = "merchant", category = "vendor" },
     { window = "trade",    category = "trade" },
     { window = "auction",  category = "auction" },
-    { window = "loot",     category = "loot_quest" },
     { window = "mail",     category = "mail" },
 }
+local TRACKED_WINDOWS = { "merchant", "trade", "auction", "mail", "bank" }
 
 local WINDOW_EVENTS = {
     MERCHANT_SHOW       = { "merchant", true },
@@ -70,11 +79,14 @@ local WINDOW_EVENTS = {
     TRADE_CLOSED        = { "trade", false },
     AUCTION_HOUSE_SHOW  = { "auction", true },
     AUCTION_HOUSE_CLOSED = { "auction", false },
-    LOOT_OPENED         = { "loot", true },
-    LOOT_CLOSED         = { "loot", false },
     MAIL_SHOW           = { "mail", true },
     MAIL_CLOSED         = { "mail", false },
+    BANKFRAME_OPENED    = { "bank", true },
+    BANKFRAME_CLOSED    = { "bank", false },
 }
+
+local LOOT_CLAIM_TTL = 3
+local UNKNOWN_LOG_SIZE = 50
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -211,9 +223,9 @@ end
 function GoldLedger:SnapshotWindows()
     local now = GetTime()
     local active = {}
-    for _, entry in ipairs(WINDOW_CATEGORY) do
-        if self:IsWindowActive(entry.window, now) then
-            active[entry.window] = true
+    for _, window in ipairs(TRACKED_WINDOWS) do
+        if self:IsWindowActive(window, now) then
+            active[window] = true
         end
     end
     return active
@@ -236,12 +248,16 @@ function GoldLedger:PruneClaims(now)
     self.claims = kept
 end
 
-function GoldLedger:TakeClaim(delta)
+-- exactOnly: only claims with a matching exact amount.
+function GoldLedger:TakeClaim(delta, exactOnly)
     for index, claim in ipairs(self.claims) do
         if claim.amount ~= nil and claim.amount == delta then
             table.remove(self.claims, index)
             return claim
         end
+    end
+    if exactOnly then
+        return nil
     end
     local direction = delta > 0 and 1 or -1
     for index, claim in ipairs(self.claims) do
@@ -299,17 +315,51 @@ function GoldLedger:Record(delta, category, professionKey, reason, timestamp, it
 end
 
 -- Returns category, professionKey, reason, timestamp override, item.
+-- category "mail_hold" = gold gained at the open mailbox; matched against the
+-- inbox instead (see the Mailbox section).
 function GoldLedger:Classify(entry)
-    local claim = self:TakeClaim(entry.delta)
+    -- Exact-amount evidence first, then the open mailbox, then direction-only
+    -- evidence (loot message, order completed, mail to own character).
+    local claim = self:TakeClaim(entry.delta, true)
+    if not claim and entry.delta > 0 and entry.mailOpen then
+        return "mail_hold"
+    end
+    claim = claim or self:TakeClaim(entry.delta)
     if claim then
         return claim.category, claim.profession, claim.reason, claim.timestamp, claim.item
     end
-    for _, windowEntry in ipairs(WINDOW_CATEGORY) do
+    local rules = entry.delta > 0 and INCOME_WINDOW_CATEGORY or SPEND_WINDOW_CATEGORY
+    for _, windowEntry in ipairs(rules) do
         if entry.windows[windowEntry.window] then
             return windowEntry.category, nil, "window:" .. windowEntry.window
         end
     end
     return "other", nil, "unrecognized"
+end
+
+-- Unknown log: the last UNKNOWN_LOG_SIZE gold changes that could not be traced,
+-- with what was going on at the time. /mcg goldunknown lists them.
+function GoldLedger:LogUnknown(delta, reason, windows, timestamp)
+    local ledger = LedgerDB()
+    if not ledger then
+        return
+    end
+    ledger.unknownLog = ledger.unknownLog or {}
+    local open = {}
+    for window in pairs(windows or {}) do
+        open[#open + 1] = window
+    end
+    table.sort(open)
+    table.insert(ledger.unknownLog, 1, {
+        at = timestamp or time(),
+        character = UnitName and UnitName("player") or "?",
+        copper = delta,
+        reason = reason,
+        windows = table.concat(open, ","),
+    })
+    while #ledger.unknownLog > UNKNOWN_LOG_SIZE do
+        table.remove(ledger.unknownLog)
+    end
 end
 
 function GoldLedger:Flush()
@@ -321,11 +371,17 @@ function GoldLedger:Flush()
     local recorded, held = 0, 0
     for _, entry in ipairs(pending) do
         local category, professionKey, reason, timestamp, item = self:Classify(entry)
-        if category == "mail" and entry.delta > 0 and self.windowOpen.mail then
-            -- Matched against the inbox instead (see Mailbox section).
+        if category == "mail_hold" and self.windowOpen.mail then
             self.mailHeld[#self.mailHeld + 1] = entry
             held = held + 1
         else
+            if category == "mail_hold" then
+                -- Mailbox closed before this batch was processed.
+                category, reason = "other", "mail:closed-before-match"
+            end
+            if category == "other" then
+                self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
+            end
             self:Record(entry.delta, category, professionKey, reason, timestamp or entry.timestamp, item)
             recorded = recorded + 1
         end
@@ -377,6 +433,7 @@ function GoldLedger:OnPlayerMoney()
         delta = delta,
         timestamp = time(),
         windows = self:SnapshotWindows(),
+        mailOpen = self.windowOpen.mail and true or false,
     }
     self:ScheduleFlush()
 end
@@ -429,6 +486,18 @@ function GoldLedger:OnWindowEvent(event)
         self:SettleMail(true)
         self.mailSeen = nil
     end
+end
+
+-- The game's "You loot X" money message arrives with looted gold, so it is
+-- the evidence for Loot (replaces the old loot-window flag, which could stick).
+-- Theoretical: CHAT_MSG_MONEY fires for every money loot, auto-loot included.
+function GoldLedger:OnLootMoney()
+    self:AddClaim({
+        category = "loot_quest",
+        direction = 1,
+        reason = "loot-money",
+        ttl = LOOT_CLAIM_TTL,
+    })
 end
 
 function GoldLedger:OnQuestTurnedIn(_, questID, xpReward, moneyReward)
@@ -555,7 +624,9 @@ function GoldLedger:SettleMail(force)
 
     if force then
         for _, entry in ipairs(self.mailHeld) do
-            self:Record(entry.delta, "mail", nil, "mail:unmatched", entry.timestamp)
+            local reason = string.format("mail:unmatched goneMails=%d goneGold=%s", #self.mailGone, FormatCopper(goneTotal))
+            self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
+            self:Record(entry.delta, "other", nil, reason, entry.timestamp)
         end
         if #self.mailHeld > 0 or #self.mailGone > 0 then
             SessionLog("mailbox closed unmatched held=%s goneMails=%d goneGold=%s",
@@ -707,6 +778,7 @@ function GoldLedger:OnEnable()
     self:RegisterEvent("ACCOUNT_MONEY", "OnAccountMoney")
     self:RegisterEvent("QUEST_TURNED_IN", "OnQuestTurnedIn")
     self:RegisterEvent("MAIL_INBOX_UPDATE", "OnMailInbox")
+    self:RegisterEvent("CHAT_MSG_MONEY", "OnLootMoney")
     for event in pairs(WINDOW_EVENTS) do
         self:RegisterEvent(event, "OnWindowEvent")
     end
@@ -762,5 +834,31 @@ if diagnostics and diagnostics.RegisterCommand then
         category = "General",
     }, function(rest)
         diagnostics:ShowDump("Gold Sources", GoldLedger:BuildReport(rest))
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Diagnostics: /mcg goldunknown - recent gold changes that could not be traced
+-- ---------------------------------------------------------------------------
+if diagnostics and diagnostics.RegisterCommand then
+    diagnostics:RegisterCommand("goldunknown", {
+        name = "goldunknown",
+        description = "List the most recent gold changes that could not be traced to a source.",
+        usage = "/mcg goldunknown",
+        category = "General",
+    }, function()
+        local ledger = LedgerDB()
+        local log = ledger and ledger.unknownLog or {}
+        local lines = {}
+        for _, entry in ipairs(log) do
+            lines[#lines + 1] = string.format("%s  %s  %s  windows=%s  reason=%s",
+                date("%Y-%m-%d %H:%M:%S", entry.at or 0), tostring(entry.character),
+                FormatCopper(entry.copper), entry.windows ~= "" and entry.windows or "none",
+                tostring(entry.reason))
+        end
+        if #lines == 0 then
+            lines[1] = "No untraced gold recorded."
+        end
+        diagnostics:ShowDump("Unknown Gold", table.concat(lines, "\n"))
     end)
 end

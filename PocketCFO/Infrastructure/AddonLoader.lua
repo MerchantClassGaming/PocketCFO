@@ -27,7 +27,10 @@ end
 
 function AddonLoader:OnTradeSkillShow()
     self:SafeLoad("PocketCFO_Crafting")
-    self:SafeLoad("PocketCFO_Orders")
+    -- No crafting orders on WoW Forever; Orders has no Forever TOC.
+    if PocketCFO.flavor ~= "forever" then
+        self:SafeLoad("PocketCFO_Orders")
+    end
     self:SafeLoad("PocketCFO_Valuation")
 end
 
