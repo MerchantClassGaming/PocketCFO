@@ -27,7 +27,8 @@ OperationOutcomeService.YIELD_STATUS_LOW_SAMPLE = "lowSample"
 OperationOutcomeService.YIELD_STATUS_ESTABLISHED = "established"
 OperationOutcomeService.ESTABLISHED_THRESHOLD = 100
 
--- Local runs needed before the user's own results replace starter data.
+-- Max local runs needed before the user's own results replace starter data.
+-- Seed rows with fewer runs hand off once local runs match the seed's count.
 OperationOutcomeService.SEED_HANDOFF_RUN_COUNT = 20
 
 -- In-memory only, not persisted. Lets diagnostics inspect why observations
@@ -1672,13 +1673,20 @@ local function GetSeedOperations()
 end
 
 -- One rule for every handoff: the seed row wins until the user's own local
--- row reaches SEED_HANDOFF_RUN_COUNT runs, then local only.
+-- row matches the seed row's sample size (capped at SEED_HANDOFF_RUN_COUNT,
+-- and never on zero local runs), then local only. A thin seed row (e.g. 4
+-- runs) hands off after 4 local runs rather than masking 19 of the user's.
 local function ChooseSeedOrLocal(localRow, seedRow)
     if not seedRow then
         return localRow
     end
-    if localRow and (tonumber(localRow.runCount) or 0) >= OperationOutcomeService.SEED_HANDOFF_RUN_COUNT then
-        return localRow
+    if localRow then
+        local localRuns = tonumber(localRow.runCount) or 0
+        local seedRuns = tonumber(seedRow.runCount) or 0
+        local handoff = math.max(1, math.min(OperationOutcomeService.SEED_HANDOFF_RUN_COUNT, seedRuns))
+        if localRuns >= handoff then
+            return localRow
+        end
     end
     return seedRow
 end

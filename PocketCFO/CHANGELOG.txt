@@ -1,3 +1,7 @@
+v1.1.3
+Fixes a bug that analyzed engineering recycling incorrectly, giving bad numbers in the analysis window.
+Removed recipes from moxie bags as counting towards the bag's value. While you can get these recipes still, getting even 1 can drastically skew the bag's value, inflating the value of moxie. This means moxie will be slightly undervalued until better data can be collected.
+
 v1.1.2
 Fixes a bug where opening the mailbox sometimes stopped tracking other sources of gold.
 

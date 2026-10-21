@@ -234,6 +234,34 @@ local function SetLastLookup(itemLink, identity, marketKey, exact, value, freshn
     }
 end
 
+-- Containers: rare non-stackable drops (recipes/designs, tools...) left out
+-- of the bag value (CustomValuationRegistrations) are listed under it, so
+-- the jackpot is visible without driving the value (Brian, 2026-10-20).
+local MAX_POSSIBLE_DROP_LINES = 3
+
+local function AddPossibleDropLines(tooltip, result)
+    local drops = type(result) == "table" and result.possibleDrops or nil
+    if type(drops) ~= "table" or #drops == 0 then
+        return
+    end
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    for index, drop in ipairs(drops) do
+        if index > MAX_POSSIBLE_DROP_LINES then
+            local moreText = string.format("  ...and %d more rare drops", #drops - MAX_POSSIBLE_DROP_LINES)
+            if not TooltipHasLine(tooltip, moreText) then
+                tooltip:AddLine(moreText, 0.6, 0.6, 0.6)
+            end
+            break
+        end
+        local ok, name = pcall(getInfo, drop.itemID)
+        local text = string.format("Can also contain: %s (seen %d in %d opens)",
+            (ok and name) or "a rare item", tonumber(drop.timesSeen) or 0, tonumber(drop.openCount) or 0)
+        if not TooltipHasLine(tooltip, text) then
+            tooltip:AddLine(text, 0.6, 0.6, 0.6)
+        end
+    end
+end
+
 local function AddValuationLine(tooltip, data)
     if not tooltip then
         return
@@ -297,6 +325,7 @@ local function AddValuationLine(tooltip, data)
     end
 
     tooltip:AddLine(lineText, 0.2, 0.9, 0.8)
+    AddPossibleDropLines(tooltip, result)
     SetTooltipState(tooltip, itemLink, marketKey, lineText)
     if tooltip.Show then
         pcall(tooltip.Show, tooltip)

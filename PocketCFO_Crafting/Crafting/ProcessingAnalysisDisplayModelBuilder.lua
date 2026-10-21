@@ -107,13 +107,14 @@ local UNRESOLVED_REASON_NOTES = {
     statisticalProfileNotObserved = "No outcome observations yet for this input",
 }
 
--- Plain-language label for rows built from published starter data. The
--- run count comes from OperationOutcomeService's single handoff constant.
+-- Plain-language label for rows built from published starter data. Local
+-- data takes over once it matches the starter row's run count, capped at
+-- OperationOutcomeService's single handoff constant.
 local function SeedDataNote()
     local outcomeService = _G.PocketCFO and _G.PocketCFO.OperationOutcomeService
         or _G.PocketCFO_OperationOutcomeService
     local handoff = outcomeService and outcomeService.SEED_HANDOFF_RUN_COUNT or 20
-    return string.format("Starter data - your own crafts take over after %d.", handoff)
+    return string.format("Starter data - your own crafts take over once you've done as many runs (%d at most).", handoff)
 end
 
 function ProcessingAnalysisDisplayModelBuilder:GetSeedDataNote()

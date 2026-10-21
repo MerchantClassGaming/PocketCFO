@@ -3,8 +3,8 @@
 -- Prospecting, Milling, Alchemy Recycling, Engineering Recycling. Immutable at
 -- runtime - never copied into SavedVariables. OperationOutcomeService shows a
 -- seed row only until the user's own local runCount for that Statistical
--- Profile (or non-split Operation Profile) reaches SEED_HANDOFF_RUN_COUNT;
--- after that, local data only. Seed and local are never summed, because
+-- Profile (or non-split Operation Profile) reaches the seed row's own
+-- runCount, capped at SEED_HANDOFF_RUN_COUNT; after that, local data only. Seed and local are never summed, because
 -- resourcefulness/multicraft results depend on the crafter's own stats.
 --
 -- Source: Brian's SavedVariables (WTF/Account/<account>/SavedVariables/PocketCFO.lua, captured 2026-10-16),

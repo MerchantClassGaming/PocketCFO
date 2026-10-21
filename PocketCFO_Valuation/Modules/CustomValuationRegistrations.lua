@@ -15,6 +15,9 @@
 -- No valuation-purpose modes, no generalized valuation graph, no
 -- recommendation logic - just registration + two small evaluate() functions.
 
+-- Patch compat: Blizzard removed the global item APIs; route to C_Item.
+local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+
 local ADDON_NAME, _ = ...
 local PocketCFO_Valuation = _G.PocketCFO_Valuation
 
@@ -41,6 +44,33 @@ end
 -- dropped from the container's resolution) and retained in
 -- unvaluedDependencies for diagnostics - a container with at least one
 -- valuable output is never made fully unresolved by one unpriced ingredient.
+--
+-- Non-stackable outputs (recipes/designs, tools, pets...) are left out of the
+-- value and returned as possibleDrops (Brian, 2026-10-20). They are rare
+-- one-offs: a small sample can't estimate their drop rate (one Design in 9
+-- Alchemist Surplus opens added 11,111g to every bag, at roughly 1 in 100 in
+-- Brian's experience), and their price often rests on one listing. They're a
+-- bonus, not what the bag is worth.
+--
+-- An output whose item data isn't loaded yet can't be classified, so it is
+-- left out too and the result is flagged itemDataPending (never cached), so
+-- the value doesn't swing with whichever items the client happens to have
+-- loaded.
+
+-- true / false, or nil while item data isn't loaded. maxStack is
+-- GetItemInfo's 8th return (same read PricingIdentity uses).
+local function IsStackableItem(itemID)
+    if not itemID or not GetItemInfo then
+        return nil
+    end
+    local ok, name, _, _, _, _, _, _, maxStack = pcall(GetItemInfo, itemID)
+    maxStack = ok and name and tonumber(maxStack) or nil
+    if not maxStack then
+        return nil
+    end
+    return maxStack > 1
+end
+
 local function ComputeContainerValue(context)
     local containerOutcomeService = GetContainerOutcomeService()
     if not containerOutcomeService or type(containerOutcomeService.GetExpectedContents) ~= "function" then
@@ -58,26 +88,51 @@ local function ComputeContainerValue(context)
     local total = 0
     local anyValued = false
     local unvaluedDependencies = {}
+    local possibleDrops = {}
+    local itemDataPending = false
+    local openCount = tonumber(expected.effectiveOpenCount) or 0
 
     for _, row in ipairs(expected.expectedContents or {}) do
-        local priced = context.valuationService:GetItemValue({ itemID = row.itemID, configKey = row.configKey })
-        if priced and not priced.unresolved and priced.valuePerUnit ~= nil then
-            total = total + priced.valuePerUnit * row.expectedQuantity
-            anyValued = true
-        else
+        local stackable = IsStackableItem(row.itemID)
+        if stackable == nil then
+            itemDataPending = true
             unvaluedDependencies[#unvaluedDependencies + 1] = {
                 itemID = row.itemID,
                 configKey = row.configKey,
                 expectedQuantity = row.expectedQuantity,
+                reason = "itemDataPending",
             }
+        elseif stackable == false then
+            possibleDrops[#possibleDrops + 1] = {
+                itemID = row.itemID,
+                configKey = row.configKey,
+                expectedQuantity = row.expectedQuantity,
+                -- Total copies seen across all opens (one per drop for a
+                -- non-stackable).
+                timesSeen = math.floor((tonumber(row.expectedQuantity) or 0) * openCount + 0.5),
+                openCount = openCount,
+            }
+        else
+            local priced = context.valuationService:GetItemValue({ itemID = row.itemID, configKey = row.configKey })
+            if priced and not priced.unresolved and priced.valuePerUnit ~= nil then
+                total = total + priced.valuePerUnit * row.expectedQuantity
+                anyValued = true
+            else
+                unvaluedDependencies[#unvaluedDependencies + 1] = {
+                    itemID = row.itemID,
+                    configKey = row.configKey,
+                    expectedQuantity = row.expectedQuantity,
+                }
+            end
         end
     end
 
     if not anyValued then
         return {
             unresolved = true,
-            unresolvedReason = "noValuedContents",
+            unresolvedReason = itemDataPending and "itemDataPending" or "noValuedContents",
             unvaluedDependencies = unvaluedDependencies,
+            possibleDrops = possibleDrops,
         }
     end
 
@@ -90,6 +145,8 @@ local function ComputeContainerValue(context)
         -- valuationBasis="modeled" so Orders shows "(Estimated)".
         valuationBasis = "modeled",
         unvaluedDependencies = unvaluedDependencies,
+        possibleDrops = possibleDrops,
+        itemDataPending = itemDataPending,
     }
 end
 
@@ -128,7 +185,9 @@ local function EvaluateContainerValue(context)
     end
 
     local result = ComputeContainerValue(context)
-    if itemID and type(result) == "table" and not result.unresolved and result.valuePerUnit ~= nil then
+    -- A result missing not-yet-loaded items is a partial value - never cached.
+    if itemID and type(result) == "table" and not result.unresolved and result.valuePerUnit ~= nil
+        and not result.itemDataPending then
         containerValueCache[itemID] = { at = now, result = ShallowCopy(result) }
     end
     return result

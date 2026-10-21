@@ -13,6 +13,11 @@ local PocketCFO = _G.PocketCFO
 local PocketCFO_PnL = _G.PocketCFO_PnL
 
 local GoldWindow = PocketCFO_PnL:NewModule("GoldWindow", "AceEvent-3.0")
+
+-- WoW Forever: no crafting orders and no warband bank (ACCOUNT_BANK_* events
+-- invalid on the beta, none at the banker). The Orders tab and Warband Bank row
+-- are hidden there. Retail: flavor is nil, nothing changes.
+local IS_FOREVER = PocketCFO.flavor == "forever"
 -- Shared helpers for tab files (UI/OrdersTab.lua) are exposed on GoldWindow.ui
 -- at the bottom of this file.
 
@@ -172,8 +177,10 @@ function GoldWindow:BuildWindow()
     local tabDefs = {
         { key = "balances", label = "Balances" },
         { key = "income",   label = "Income" },
-        { key = "orders",   label = "Orders" },
     }
+    if not IS_FOREVER then
+        tabDefs[#tabDefs + 1] = { key = "orders", label = "Orders" }
+    end
     for index, def in ipairs(tabDefs) do
         local tab = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
         tab:SetSize(90, 22)
@@ -194,9 +201,11 @@ function GoldWindow:BuildWindow()
     frame.incomePane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
     frame.incomePane:SetSize(INNER_WIDTH, 10)
 
-    frame.ordersPane = CreateFrame("Frame", nil, frame)
-    frame.ordersPane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
-    frame.ordersPane:SetSize(INNER_WIDTH, 10)
+    if not IS_FOREVER then
+        frame.ordersPane = CreateFrame("Frame", nil, frame)
+        frame.ordersPane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
+        frame.ordersPane:SetSize(INNER_WIDTH, 10)
+    end
 
     self.frame = frame
     self.activeTab = "balances"
@@ -205,7 +214,9 @@ function GoldWindow:BuildWindow()
     self.expanded = {}
 
     self:BuildIncomeControls()
-    self:BuildOrdersPane()
+    if not IS_FOREVER then
+        self:BuildOrdersPane()
+    end
 
     if UISpecialFrames then
         table.insert(UISpecialFrames, "MCGCFOGoldWindow")
@@ -223,7 +234,7 @@ function GoldWindow:OnDataChanged()
 end
 
 function GoldWindow:ShowTab(tabKey)
-    if tabKey ~= "income" and tabKey ~= "orders" then
+    if tabKey ~= "income" and (tabKey ~= "orders" or IS_FOREVER) then
         tabKey = "balances"
     end
     self.activeTab = tabKey
@@ -315,16 +326,21 @@ function GoldWindow:RenderBalances()
 
     local warband = balances.warband
     local warbandCopper = warband and tonumber(warband.copper) or nil
+    if IS_FOREVER then
+        warbandCopper = nil
+    end
     local lines = {}
     lines[#lines + 1] = {
         name = "|cffffd100Account Total|r",
         money = FormatMoneyExact(characterTotal + (warbandCopper or 0)),
     }
-    lines[#lines + 1] = {
-        name = "Warband Bank",
-        money = warbandCopper and FormatMoneyExact(warbandCopper) or "|cff888888visit a bank to load|r",
-        age = warband and FormatAge(warband.updatedAt) or "",
-    }
+    if not IS_FOREVER then
+        lines[#lines + 1] = {
+            name = "Warband Bank",
+            money = warbandCopper and FormatMoneyExact(warbandCopper) or "|cff888888visit a bank to load|r",
+            age = warband and FormatAge(warband.updatedAt) or "",
+        }
+    end
     lines[#lines + 1] = {}
     local currentRealm = GetRealmName and GetRealmName()
     for _, entry in ipairs(characters) do

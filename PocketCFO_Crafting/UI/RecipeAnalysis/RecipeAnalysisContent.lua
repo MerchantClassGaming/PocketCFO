@@ -44,6 +44,11 @@ local function FormatSignedGoldSilver(copperValue)
     local absValue = math.floor(math.abs(copperValue) + 0.5)
     local gold = math.floor(absValue / 10000)
     local silver = math.floor((absValue % 10000) / 100)
+    -- Display only: a non-zero amount under 1 silver shows as 1 silver so it
+    -- never reads "0g 00s" (looks broken). Copper is noise; the math stays exact.
+    if absValue > 0 and absValue < 100 then
+        silver = 1
+    end
 
     local goldText = tostring(gold)
     local withCommas = goldText:reverse():gsub("(%d%d%d)", "%1,"):reverse()

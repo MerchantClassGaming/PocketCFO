@@ -1,0 +1,14 @@
+## Interface: 16001
+## X-TOC-File: Forever
+## Title: PocketCFO P&L
+## Notes: Gold balances, income sources, and profit views.
+## Author: MerchantClassGaming
+## Version: v1.1.3
+## LoadOnDemand: 1
+## Dependencies: PocketCFO
+
+Init.lua
+Services\IncomeReport.lua
+Services\OrderReport.lua
+UI\GoldWindow.lua
+UI\OrdersTab.lua

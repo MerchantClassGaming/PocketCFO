@@ -17,8 +17,11 @@
 --
 -- Multicraft bonus size: the game does not expose how many extra items a
 -- proc gives. Uses this recipe's own observed average from craft history
--- (OperationOutcomeService row-level multicraftExtraTotal / procCount) when
--- at least one proc has been seen, otherwise +1 (Brian's chosen default).
+-- (OperationOutcomeService row-level multicraftExtraTotal / procCount) once
+-- MIN_MULTICRAFT_PROCS procs have been seen, otherwise +1 (Brian's chosen
+-- default). +1 is the floor (a proc always makes at least one extra), so
+-- below the threshold profit errs low instead of letting one lucky early
+-- proc overstate it (Brian, 2026-10-20).
 --
 -- Output value is the sale value after the 5% auction house cut.
 --
@@ -39,6 +42,7 @@ local RecipeEconomicsService = PocketCFO_Crafting:NewModule("RecipeEconomicsServ
 
 RecipeEconomicsService.AUCTION_HOUSE_CUT = 0.05
 RecipeEconomicsService.DEFAULT_MULTICRAFT_BONUS = 1
+RecipeEconomicsService.MIN_MULTICRAFT_PROCS = 5
 
 local function GetObservationBuilder()
     return PocketCFO_Crafting:GetModule("RecipeObservationBuilder", true)
@@ -253,7 +257,8 @@ end
 -- This recipe's observed average extra items per Multicraft proc, from the
 -- row-level totals OperationOutcomeService already keeps for every recipe
 -- crafted (OperationObservationBuilder records multicraft evidence for all
--- ordinary crafts). nil when no proc has been observed yet.
+-- ordinary crafts). nil when no proc has been observed yet. The caller
+-- decides whether enough procs have been seen to use it.
 local function GetObservedMulticraftBonus(recipeID)
     local profileKeyService = GetProfileKeyService()
     local outcomeService = GetOutcomeService()
@@ -300,12 +305,15 @@ function RecipeEconomicsService:EvaluateObservation(observation)
     local multicraftBonus = nil
     local multicraftBonusSource = nil
     local multicraftProcsObserved = 0
+    local multicraftObservedAverage = nil
     local multicraftPct = NumberOrNil(observation.displayedMulticraftPct)
     if multicraftPct and multicraftPct > 0 then
         multicraftChance = multicraftPct / 100
         local observedBonus
         observedBonus, multicraftProcsObserved = GetObservedMulticraftBonus(observation.recipeID)
-        if observedBonus then
+        -- Kept even below the threshold so the tooltip can show it.
+        multicraftObservedAverage = observedBonus
+        if observedBonus and multicraftProcsObserved >= self.MIN_MULTICRAFT_PROCS then
             multicraftBonus = observedBonus
             multicraftBonusSource = "history"
         else
@@ -408,6 +416,8 @@ function RecipeEconomicsService:EvaluateObservation(observation)
             multicraftBonus = multicraftBonus,
             multicraftBonusSource = multicraftBonusSource,
             multicraftProcsObserved = multicraftProcsObserved,
+            multicraftObservedAverage = multicraftObservedAverage,
+            multicraftMinProcs = self.MIN_MULTICRAFT_PROCS,
             expectedExtraQuantity = expectedExtraQuantity,
             multicraftValue = multicraftValue,
             outputValue = outputValue,

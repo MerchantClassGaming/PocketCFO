@@ -2,7 +2,7 @@
 ## Title: PocketCFO Valuation
 ## Notes: Pricing identity and valuation cache foundation - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.1.2
+## Version: v1.1.3
 ## SavedVariables: PocketCFO_ValuationDB
 ## LoadOnDemand: 1
 

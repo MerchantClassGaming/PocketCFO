@@ -99,9 +99,20 @@ local function BuildMulticraftTooltip(economics)
             economics.multicraftProcsObserved or 0,
             (economics.multicraftProcsObserved == 1) and "time" or "times")
     end
-    return string.format(
-        "%s chance to make extra items. The game doesn't say how many extra a Multicraft makes, so this uses +1 until you've crafted this recipe and seen a Multicraft.",
-        chanceText)
+    -- Using +1: say why, and that it can only understate (a proc always makes
+    -- at least one extra). Show what this recipe's procs have made so far so
+    -- a big early proc is acknowledged, not ignored (Brian, 2026-10-20).
+    local text = string.format(
+        "%s chance to make extra items. The game doesn't say how many extra a Multicraft makes. Until you've seen %d Multicrafts on this recipe, this counts +1 extra, so profit may be higher than shown.",
+        chanceText, economics.multicraftMinProcs or 5)
+    local seen = tonumber(economics.multicraftProcsObserved) or 0
+    local average = tonumber(economics.multicraftObservedAverage)
+    if seen == 1 and average then
+        text = text .. string.format(" Your 1 Multicraft so far made %s extra.", FormatAmount(average))
+    elseif seen > 1 and average then
+        text = text .. string.format(" Your %d Multicrafts so far made about %s extra each.", seen, FormatAmount(average))
+    end
+    return text
 end
 
 local function FormatPoints(points)
@@ -239,6 +250,8 @@ function RecipeAnalysisDisplayModelBuilder:Build(economicsResult)
                 name = "Multicraft bonus",
                 quantity = extraQuantity,
                 lineValue = fullPerUnit * extraQuantity,
+                -- "(Estimated)" while the +1 default is in use.
+                valuationBasis = (economics.multicraftBonusSource == "default") and "modeled" or nil,
                 infoTitle = "Multicraft",
                 infoTooltip = BuildMulticraftTooltip(economics),
             }

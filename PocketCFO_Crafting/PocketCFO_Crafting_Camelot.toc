@@ -1,0 +1,66 @@
+## Interface: 16001
+## X-TOC-File: Forever
+## Title: PocketCFO Crafting
+## Notes: Crafting queue, recipe configuration, and inventory target evaluation - Merchant Class Gaming
+## Author: MerchantCGaming
+## Version: v1.1.3
+## SavedVariables: PocketCFO_Crafting_DB
+## LoadOnDemand: 1
+
+## Dependencies: PocketCFO
+
+## Libraries
+..\PocketCFO\Libs\LibStub\LibStub.lua
+..\PocketCFO\Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+..\PocketCFO\Libs\AceAddon-3.0\AceAddon-3.0.lua
+..\PocketCFO\Libs\AceEvent-3.0\AceEvent-3.0.lua
+..\PocketCFO\Libs\AceDB-3.0\AceDB-3.0.lua
+
+## Core
+Init.lua
+Infrastructure\HelperWindow.lua
+
+## Services
+Services\ProfessionContextService\ProfessionContextService.lua
+Services\ProcessingAnalysisRegistry\ProcessingAnalysisRegistry.lua
+
+## Infrastructure
+Infrastructure\AddonLoader.lua
+
+## Modules
+Crafting\RecipeConfigStore.lua
+Crafting\RecipeOptionResolver.lua
+Crafting\RecipeStateCapture.lua
+Crafting\RecipeStateRestore.lua
+Crafting\InventoryTargetEvaluator.lua
+Crafting\ProcessingRecommendationPolicy.lua
+Crafting\Policies\ProspectingAnalysisPolicy.lua
+Crafting\Policies\CrushingAnalysisPolicy.lua
+Crafting\Policies\MillingAnalysisPolicy.lua
+Crafting\Policies\EngineeringRecyclingAnalysisPolicy.lua
+Crafting\Policies\AlchemyRecyclingAnalysisPolicy.lua
+Crafting\ProcessingAnalysisDisplayModelBuilder.lua
+Crafting\ProcessingAnalysisController.lua
+Crafting\CraftAnalysisDisplayModelBuilder.lua
+Crafting\CraftAnalysisController.lua
+Crafting\RecipeObservationBuilder.lua
+Crafting\RecipeEconomicsService.lua
+Crafting\RecipeAnalysisDisplayModelBuilder.lua
+Crafting\LureAnalysisService.lua
+Crafting\LureAnalysisDisplayModelBuilder.lua
+Crafting\RecipeAnalysisController.lua
+UI\RecipeAnalysis\RecipeAnalysisContent.lua
+UI\PostingProfiles\PostingProfilesWindow.lua
+UI\PostingRules\RecipePostingRulesWindow.lua
+UI\InventoryManager\InventoryTargetDialogs.lua
+UI\InventoryManager\SaveToInventoryButton.lua
+UI\InventoryManager\CraftTooltipBuilder.lua
+Crafting\QueueGeneration.lua
+UI\InventoryManager\InventoryManagerWindow.lua
+Crafting\CraftQueueController.lua
+Statistics\CraftStatLog.lua
+Crafting\OperationObservationBuilder.lua
+Crafting\OperationHistoricalValuationEnricher.lua
+Crafting\ProcessingCaptureController.lua
+Crafting\CraftCompletionDispatcher.lua
+Crafting\CraftEventCapture.lua
