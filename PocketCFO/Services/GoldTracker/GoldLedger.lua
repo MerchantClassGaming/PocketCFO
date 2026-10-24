@@ -17,10 +17,13 @@
 -- related events can claim them regardless of which event arrives first.
 --   1. A claim with a matching exact amount wins (quest reward, vendor sale,
 --      warband deposit/withdraw).
---   2. Gold gained while the mailbox is open is matched against the inbox
---      (see the Mailbox section).
+--   2. Gold gained with the mailbox open is matched against the waiting list of
+--      mail seen holding gold (see the Mailbox section).
 --   3. Then a claim with no amount whose direction matches (order completed,
---      loot-money message, gold mailed to your own character).
+--      loot-money message, container opened from your bags, gold mailed to
+--      your own character).
+--   3b. Gold gained within MAIL_MATCH_AFTER_CLOSE of a mailbox visit is also
+--      matched against the waiting list (mail gold can arrive late).
 --   4. Then a window rule: gold IN only by merchant or trade (the only ways
 --      gold goes up there); gold OUT by merchant, trade, AH or mail.
 --   5. Otherwise "other" (shown as Unknown) and logged in goldLedger.unknownLog
@@ -101,9 +104,12 @@ do
     if types.AccountBanker then INTERACTION_WINDOWS[types.AccountBanker] = "bank" end
 end
 
-local MAIL_HOLD_TIMEOUT = 20
-local MAIL_CLOSE_GRACE = 3
+local MAIL_MATCH_AFTER_CLOSE = 300  -- seconds after a mailbox visit that late mail gold still matches
+local MAIL_WAIT_DAYS = 31           -- waiting mail older than this is dropped (mail is gone by then)
+local MAIL_SUBSET_CAP = 12          -- free-form combination search covers the newest N waiting mails
+local MAIL_LOG_SIZE = 100
 local LOOT_CLAIM_TTL = 3
+local CONTAINER_CLAIM_TTL = 10
 local UNKNOWN_LOG_SIZE = 50
 
 -- ---------------------------------------------------------------------------
@@ -226,10 +232,7 @@ GoldLedger.claims = {}
 GoldLedger.windowOpen = {}
 GoldLedger.windowClosedAt = {}
 GoldLedger.flushScheduled = false
-GoldLedger.mailNoted = nil  -- mailbox session: mails noted holding gold (nil = no session)
-GoldLedger.mailInbox = {}   -- mailbox session: count per mail in the latest inbox read
-GoldLedger.mailHeld = {}    -- gold gained during the mailbox session, waiting to be matched
-GoldLedger.mailClosing = false
+GoldLedger.mailSeq = 0      -- order in which waiting mails were noted (inbox order)
 
 function GoldLedger:IsWindowActive(window, now)
     if self.windowOpen[window] then
@@ -342,24 +345,30 @@ function GoldLedger:Record(delta, category, professionKey, reason, timestamp, it
 end
 
 -- Returns category, professionKey, reason, timestamp override, item.
--- category "mail_hold" = gold gained at the open mailbox; matched against the
--- inbox instead (see the Mailbox section).
+-- category "mail_matched" = the gold was matched to waiting mail and those mails
+-- were already recorded by MatchWaitingMail.
 function GoldLedger:Classify(entry)
-    -- Exact-amount evidence first, then the open mailbox, then direction-only
-    -- evidence (loot message, order completed, mail to own character).
+    -- Exact-amount evidence first, then waiting mail when at the mailbox, then
+    -- direction-only evidence, then waiting mail after a recent mailbox visit.
     local claim = self:TakeClaim(entry.delta, true)
-    if not claim and entry.delta > 0 and entry.mailOpen then
-        return "mail_hold"
+    if not claim and entry.delta > 0 and entry.mailOpen and self:MatchWaitingMail(entry.delta, true) then
+        return "mail_matched"
     end
     claim = claim or self:TakeClaim(entry.delta)
     if claim then
         return claim.category, claim.profession, claim.reason, claim.timestamp, claim.item
+    end
+    if entry.delta > 0 and entry.mailRecent and self:MatchWaitingMail(entry.delta, false) then
+        return "mail_matched"
     end
     local rules = entry.delta > 0 and INCOME_WINDOW_CATEGORY or SPEND_WINDOW_CATEGORY
     for _, windowEntry in ipairs(rules) do
         if entry.windows[windowEntry.window] then
             return windowEntry.category, nil, "window:" .. windowEntry.window
         end
+    end
+    if entry.delta > 0 and (entry.mailOpen or entry.mailRecent) then
+        return "other", nil, string.format("mail:no-waiting-match waiting=%d", self:WaitingCount())
     end
     return "other", nil, "unrecognized"
 end
@@ -395,34 +404,22 @@ function GoldLedger:Flush()
     self:PruneClaims(now)
     local pending = self.pending
     self.pending = {}
-    local recorded, held = 0, 0
+    local changed = false
     for _, entry in ipairs(pending) do
         local category, professionKey, reason, timestamp, item = self:Classify(entry)
-        if category == "mail_hold" and self:IsMailSessionActive() then
-            entry.heldAt = GetTime()
-            self.mailHeld[#self.mailHeld + 1] = entry
-            held = held + 1
-            SessionLog("holding %s for mailbox matching", FormatCopper(entry.delta))
-            C_Timer.After(MAIL_HOLD_TIMEOUT + 0.5, function()
-                GoldLedger:ReleaseStaleHeld()
-            end)
-        else
-            if category == "mail_hold" then
-                -- Mailbox closed before this batch was processed.
-                category, reason = "other", "mail:closed-before-match"
-            end
+        if category ~= "mail_matched" then
             if category == "other" then
                 self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
+                if entry.delta > 0 and (entry.mailOpen or entry.mailRecent) then
+                    self:MailLog("miss", entry.delta, reason)
+                end
             end
             self:Record(entry.delta, category, professionKey, reason, timestamp or entry.timestamp, item)
-            recorded = recorded + 1
         end
+        changed = true
     end
-    if recorded > 0 then
+    if changed then
         self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
-    end
-    if held > 0 then
-        self:SettleMail(false)
     end
 end
 
@@ -465,7 +462,8 @@ function GoldLedger:OnPlayerMoney()
         delta = delta,
         timestamp = time(),
         windows = self:SnapshotWindows(),
-        mailOpen = self:IsMailSessionActive(),
+        mailOpen = self.windowOpen.mail and true or false,
+        mailRecent = self:WasMailboxRecent(),
     }
     self:ScheduleFlush()
 end
@@ -511,25 +509,9 @@ function GoldLedger:SetWindow(window, isOpen, source)
         self.windowClosedAt[window] = GetTime()
     end
     if window == "mail" then
+        SessionLog("mailbox %s source=%s", isOpen and "opened" or "closed", tostring(source))
         if isOpen then
-            SessionLog("mailbox opened source=%s", tostring(source))
-            if self.mailNoted then
-                self:EndMailSession("reopened")
-            end
-            self:StartMailSession()
-            self:OnMailInbox()
-        else
-            -- Keep matching for MAIL_CLOSE_GRACE seconds: gold was seen to
-            -- arrive right as the mailbox closed.
-            SessionLog("mailbox closed source=%s", tostring(source))
-            if self.mailNoted then
-                self.mailClosing = true
-                C_Timer.After(MAIL_CLOSE_GRACE, function()
-                    if GoldLedger.mailClosing and not GoldLedger.windowOpen.mail then
-                        GoldLedger:EndMailSession("close-grace")
-                    end
-                end)
-            end
+            self:NoteInbox("open")
         end
     end
 end
@@ -551,37 +533,20 @@ function GoldLedger:OnInteraction(event, interactionType)
     end
 end
 
--- Another gold source just proved you are not at the mailbox: close the
--- mailbox session (held gold is matched or released to Unknown).
+-- Another gold source just proved you are not at the mailbox: treat the
+-- mailbox as closed (late mail gold still matches for MAIL_MATCH_AFTER_CLOSE).
 function GoldLedger:LeaveMailbox(reason)
     if self.windowOpen.mail then
         self:SetWindow("mail", false, reason)
     end
-    if self.mailNoted then
-        self:EndMailSession(reason)
-    end
 end
 
--- Held mailbox gold that stays unmatched for MAIL_HOLD_TIMEOUT seconds is
--- released to Unknown so a missed mailbox close can never swallow gold.
-function GoldLedger:ReleaseStaleHeld()
-    local now = GetTime()
-    local kept, released = {}, 0
-    for _, entry in ipairs(self.mailHeld) do
-        if now - (entry.heldAt or now) >= MAIL_HOLD_TIMEOUT then
-            local reason = "mail:timeout-unmatched"
-            self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
-            self:Record(entry.delta, "other", nil, reason, entry.timestamp)
-            released = released + 1
-        else
-            kept[#kept + 1] = entry
-        end
+function GoldLedger:WasMailboxRecent()
+    if self.windowOpen.mail then
+        return true
     end
-    self.mailHeld = kept
-    if released > 0 then
-        SessionLog("released %d held mailbox gold change(s) after %ds", released, MAIL_HOLD_TIMEOUT)
-        self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
-    end
+    local closedAt = self.windowClosedAt.mail
+    return closedAt ~= nil and (GetTime() - closedAt) <= MAIL_MATCH_AFTER_CLOSE
 end
 
 -- The game's "You loot X" money message arrives with looted gold, so it is
@@ -612,29 +577,52 @@ end
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- Mailbox: match gold taken from mail against the mails that held it
+-- Mailbox: waiting list of mail seen holding gold
 -- ---------------------------------------------------------------------------
--- When the mailbox opens, every mail holding gold is noted (amount, category,
--- sale date, item, profession). Gold that arrives during the mailbox session
--- is held, not recorded. A mail counts as "taken" when the inbox now has fewer
--- of it than were noted and not yet recorded:
---     missing = (noted - already recorded) - now in inbox
--- so a mail that briefly reappears is never counted twice (seen 2026-10-19:
--- with Open All on several AH sales the gold arrived late and the mails came
--- back in a later inbox read). New mail arriving mid-session is added.
--- Matching, each time held gold or the inbox changes:
---   1. A held amount equal to one missing mail records that mail.
---   2. Otherwise, held total equal to all missing mails records them all.
--- Each mail is recorded on its own (category, sale date, item, profession).
--- The session ends MAIL_CLOSE_GRACE seconds after the mailbox closes (gold
--- was seen to arrive right at close) or at once when another gold source
--- proves you left; held gold still unmatched then goes to Unknown.
--- Theoretical: a mail whose gold was taken drops out of the inbox read (AH
--- sale mails are deleted; mails with items remain with 0 gold).
+-- Every time the inbox is read (mailbox open, inbox update), each fully loaded
+-- mail holding gold goes on this character's waiting list with its details
+-- (category, sale date, item, profession). Nothing is recorded yet.
+-- When gold arrives (mailbox open, or up to MAIL_MATCH_AFTER_CLOSE after a
+-- visit) it is matched against the list, exactly to the copper:
+--   1. one waiting mail,
+--   2. a run of mails that sat next to each other in the inbox (Open All takes
+--      mail in order, so grouped gold is neighbours),
+--   3. any combination of the newest MAIL_SUBSET_CAP waiting mails.
+-- Matched mails are recorded and leave the list. Unmatched gold goes to
+-- Unknown. Mail that never pays (noted twice, never collected) just waits and
+-- is dropped after MAIL_WAIT_DAYS: it can never inflate income.
+-- Why not match against the inbox directly: mail gold arrives late, grouped,
+-- or after the mailbox closes, and half-loaded mails were misread (2026-10-19
+-- to 10-21). The list removes all of that timing.
+-- Saved per character in goldLedger.mailWaiting[characterGUID]; every note,
+-- match and miss is also saved in goldLedger.mailLog (/mcg goldmaillog).
+-- Theoretical: a mail is fully loaded once sender and subject are present and
+-- the subject is not the "Retrieving data" placeholder.
+
+local function RetrievingText()
+    return _G.RETRIEVING_DATA or "Retrieving data"
+end
+
+-- "Auction successful: %s" without the item part (localized global when present).
+local function IsAuctionSoldSubject(subject)
+    subject = tostring(subject or "")
+    local format = _G.AUCTION_SOLD_MAIL_SUBJECT
+    if format and format ~= "" then
+        local prefix = string.match(format, "^(.-)%%")
+        if prefix and prefix ~= "" and string.sub(subject, 1, #prefix) == prefix then
+            return true
+        end
+    end
+    return string.find(subject, "^Auction successful:") ~= nil
+end
 
 -- Describes one inbox mail that holds gold. Field order of
 -- GetInboxInvoiceInfo matches MailboxScanner (confirmed in use there).
 function GoldLedger:DescribeMail(mailIndex, sender, subject, money, daysLeft)
+    local mail = { money = money }
+    mail.loaded = sender ~= nil and sender ~= "" and subject ~= nil and subject ~= ""
+        and subject ~= RetrievingText()
+
     local invoiceType, invoiceItemName, invoiceCount
     if GetInboxInvoiceInfo then
         local ok, iType, iName, _, _, _, _, _, _, _, _, iCount = pcall(GetInboxInvoiceInfo, mailIndex)
@@ -643,12 +631,16 @@ function GoldLedger:DescribeMail(mailIndex, sender, subject, money, daysLeft)
         end
     end
 
-    local mail = {
-        signature = table.concat({ tostring(sender), tostring(subject), tostring(money) }, "|"),
-        money = money,
-    }
+    -- Arrival time from days left (mail is kept AH_MAIL_DAYS). Bucketed to 10
+    -- minutes for the identity key so small drift between reads still matches.
+    daysLeft = tonumber(daysLeft)
+    local arrival = daysLeft and (time() - math.floor((AH_MAIL_DAYS - daysLeft) * 86400)) or nil
+    mail.key = table.concat({ tostring(sender), tostring(subject), tostring(money),
+        tostring(arrival and math.floor(arrival / 600) or "?") }, "|")
+
     local isAuctionSale = invoiceType == "seller" or invoiceType == "seller_temp_invoice"
         or (sender ~= nil and _G.AUCTION_HOUSE ~= nil and tostring(sender) == tostring(_G.AUCTION_HOUSE))
+        or IsAuctionSoldSubject(subject)
 
     if isAuctionSale then
         mail.category = "auction"
@@ -667,160 +659,195 @@ function GoldLedger:DescribeMail(mailIndex, sender, subject, money, daysLeft)
     return mail
 end
 
--- Mails currently holding gold, grouped by signature (sender|subject|money)
--- in inbox order. Identical mails (same bag sold at the same price) are
--- interchangeable, so they are counted rather than told apart.
+-- Mails currently holding gold, in inbox order.
 function GoldLedger:ReadInbox()
-    local bySignature = {}
+    local mails = {}
     if not GetInboxNumItems or not GetInboxHeaderInfo then
-        return bySignature
+        return mails
     end
     local count = tonumber((GetInboxNumItems())) or 0
     for mailIndex = 1, count do
         local _, _, sender, subject, money, _, daysLeft = GetInboxHeaderInfo(mailIndex)
         money = tonumber(money)
         if money and money > 0 then
-            local mail = self:DescribeMail(mailIndex, sender, subject, money, daysLeft)
-            local list = bySignature[mail.signature] or {}
-            bySignature[mail.signature] = list
-            list[#list + 1] = mail
+            mails[#mails + 1] = self:DescribeMail(mailIndex, sender, subject, money, daysLeft)
         end
     end
-    return bySignature
+    return mails
 end
 
-function GoldLedger:IsMailSessionActive()
-    return (self.windowOpen.mail or self.mailClosing) and true or false
+function GoldLedger:WaitingList()
+    local ledger = LedgerDB()
+    local guid = UnitGUID and UnitGUID("player")
+    if not ledger or not guid then
+        return {}
+    end
+    ledger.mailWaiting = ledger.mailWaiting or {}
+    ledger.mailWaiting[guid] = ledger.mailWaiting[guid] or {}
+    return ledger.mailWaiting[guid]
 end
 
-function GoldLedger:StartMailSession()
-    self.mailNoted = {}      -- [signature] = { mail, ... } (mail.recorded once matched)
-    self.mailInbox = {}      -- [signature] = count holding gold in the latest read
-    self.mailHeld = {}
-    self.mailClosing = false
+function GoldLedger:WaitingCount()
+    return #self:WaitingList()
 end
 
-local function Unrecorded(list)
-    local result = {}
-    for _, mail in ipairs(list or {}) do
-        if not mail.recorded then
-            result[#result + 1] = mail
+-- Saved log of waiting-list activity (/mcg goldmaillog), newest first.
+function GoldLedger:MailLog(kind, copper, detail)
+    local ledger = LedgerDB()
+    if not ledger then
+        return
+    end
+    ledger.mailLog = ledger.mailLog or {}
+    table.insert(ledger.mailLog, 1, {
+        at = time(),
+        character = UnitName and UnitName("player") or "?",
+        kind = kind,
+        copper = copper,
+        detail = detail,
+    })
+    while #ledger.mailLog > MAIL_LOG_SIZE do
+        table.remove(ledger.mailLog)
+    end
+    SessionLog("mail %s %s %s", kind, FormatCopper(copper or 0), tostring(detail))
+end
+
+local function MailLabel(mail)
+    local itemName = mail.item and mail.item.name
+    return string.format("%s%s", tostring(mail.category), itemName and (" " .. itemName) or "")
+end
+
+-- Adds newly seen mail to the waiting list and fills in details on waiting
+-- mail that was incomplete. Identical mails are counted, not merged.
+function GoldLedger:NoteInbox(source)
+    local list = self:WaitingList()
+    local cutoff = time() - MAIL_WAIT_DAYS * 86400
+    for index = #list, 1, -1 do
+        if (list[index].notedAt or 0) < cutoff then
+            self:MailLog("expired", list[index].money, MailLabel(list[index]))
+            table.remove(list, index)
         end
     end
-    return result
-end
 
--- Mails whose gold has left the inbox and is not recorded yet.
-function GoldLedger:MissingMails()
-    local missing = {}
-    for signature, noted in pairs(self.mailNoted or {}) do
-        local unrecorded = Unrecorded(noted)
-        local gone = #unrecorded - (self.mailInbox[signature] or 0)
-        for index = 1, gone do
-            missing[#missing + 1] = unrecorded[index]
+    local waitingByKey = {}
+    for _, waiting in ipairs(list) do
+        waitingByKey[waiting.key] = waitingByKey[waiting.key] or {}
+        table.insert(waitingByKey[waiting.key], waiting)
+    end
+
+    local seenByKey, skipped = {}, 0
+    for _, mail in ipairs(self:ReadInbox()) do
+        if not mail.loaded then
+            skipped = skipped + 1
+        else
+            seenByKey[mail.key] = (seenByKey[mail.key] or 0) + 1
+            local existing = waitingByKey[mail.key] and waitingByKey[mail.key][seenByKey[mail.key]]
+            if existing then
+                if not existing.item and mail.item then
+                    existing.item, existing.profession, existing.reason = mail.item, mail.profession, mail.reason
+                    self:MailLog("upgraded", existing.money, MailLabel(existing))
+                end
+            else
+                self.mailSeq = self.mailSeq + 1
+                mail.seq = self.mailSeq
+                mail.notedAt = time()
+                mail.loaded = nil
+                list[#list + 1] = mail
+                self:MailLog("noted", mail.money, MailLabel(mail) .. " via " .. tostring(source))
+            end
         end
     end
-    return missing
+    if skipped > 0 then
+        SessionLog("mail inbox read skipped %d mail(s) still loading", skipped)
+    end
 end
 
 function GoldLedger:OnMailInbox()
-    if not self.windowOpen.mail or not self.mailNoted then
-        return
+    if self.windowOpen.mail then
+        self:NoteInbox("update")
     end
-    local current = self:ReadInbox()
-    self.mailInbox = {}
-    for signature, list in pairs(current) do
-        self.mailInbox[signature] = #list
-        local noted = self.mailNoted[signature] or {}
-        self.mailNoted[signature] = noted
-        local unrecorded = #Unrecorded(noted)
-        -- More of this mail than expected: new mail arrived during the session.
-        for index = unrecorded + 1, #list do
-            noted[#noted + 1] = list[index]
+end
+
+-- Finds waiting mail whose gold adds up exactly to amount. Returns a list.
+local function FindMailMatch(list, amount)
+    local sorted = {}
+    for _, mail in ipairs(list) do
+        sorted[#sorted + 1] = mail
+    end
+    table.sort(sorted, function(a, b) return (a.seq or 0) < (b.seq or 0) end)
+
+    -- 1. One mail.
+    for _, mail in ipairs(sorted) do
+        if mail.money == amount then
+            return { mail }
         end
     end
-    self:SettleMail(false)
-end
 
-function GoldLedger:RecordMail(mail)
-    mail.recorded = true
-    self:Record(mail.money, mail.category, mail.profession, mail.reason, mail.timestamp, mail.item)
-end
-
-function GoldLedger:SettleMail(force)
-    if not self.mailNoted then
-        return
-    end
-    local recorded = 0
-
-    -- 1. Held amounts that equal exactly one missing mail.
-    local stillHeld = {}
-    for _, entry in ipairs(self.mailHeld) do
-        local matched = false
-        for _, mail in ipairs(self:MissingMails()) do
-            if mail.money == entry.delta then
-                self:RecordMail(mail)
-                recorded = recorded + 1
-                matched = true
+    -- 2. A run of neighbours in inbox order.
+    for first = 1, #sorted do
+        local sum = 0
+        for last = first, #sorted do
+            sum = sum + sorted[last].money
+            if sum == amount then
+                local run = {}
+                for index = first, last do
+                    run[#run + 1] = sorted[index]
+                end
+                return run
+            elseif sum > amount then
                 break
             end
         end
-        if not matched then
-            stillHeld[#stillHeld + 1] = entry
-        end
-    end
-    self.mailHeld = stillHeld
-
-    -- 2. Remaining held total equal to all missing mails (gold arrived grouped).
-    local heldTotal, missingTotal = 0, 0
-    for _, entry in ipairs(self.mailHeld) do
-        heldTotal = heldTotal + entry.delta
-    end
-    local missing = self:MissingMails()
-    for _, mail in ipairs(missing) do
-        missingTotal = missingTotal + mail.money
-    end
-    if heldTotal > 0 and heldTotal == missingTotal then
-        for _, mail in ipairs(missing) do
-            self:RecordMail(mail)
-            recorded = recorded + 1
-        end
-        self.mailHeld = {}
-        heldTotal, missingTotal = 0, 0
     end
 
-    if recorded > 0 then
-        SessionLog("mail settled mails=%d", recorded)
-        self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
+    -- 3. Any combination of the newest MAIL_SUBSET_CAP mails.
+    local candidates = {}
+    for index = #sorted, math.max(1, #sorted - MAIL_SUBSET_CAP + 1), -1 do
+        candidates[#candidates + 1] = sorted[index]
     end
-
-    if force then
-        for _, entry in ipairs(self.mailHeld) do
-            local reason = string.format("mail:unmatched missingMails=%d missingGold=%s", #missing, FormatCopper(missingTotal))
-            self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
-            self:Record(entry.delta, "other", nil, reason, entry.timestamp)
+    local chosen = {}
+    local function Search(index, remaining)
+        if remaining == 0 then
+            return true
         end
-        if #self.mailHeld > 0 or #missing > 0 then
-            SessionLog("mailbox session ended unmatched held=%s missingMails=%d missingGold=%s",
-                FormatCopper(heldTotal), #missing, FormatCopper(missingTotal))
+        if remaining < 0 or index > #candidates then
+            return false
         end
-        if #self.mailHeld > 0 then
-            self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
+        chosen[#chosen + 1] = candidates[index]
+        if Search(index + 1, remaining - candidates[index].money) then
+            return true
         end
-        self.mailHeld = {}
+        chosen[#chosen] = nil
+        return Search(index + 1, remaining)
     end
+    if Search(1, amount) then
+        return chosen
+    end
+    return nil
 end
 
--- Ends the mailbox session: final match, leftovers to Unknown, state cleared.
-function GoldLedger:EndMailSession(reason)
-    if not self.mailNoted then
-        return
+-- Records the waiting mail matched by amount. With refresh, re-reads the open
+-- inbox once first if nothing matches (mail that loaded late).
+function GoldLedger:MatchWaitingMail(amount, refresh)
+    local list = self:WaitingList()
+    local matched = FindMailMatch(list, amount)
+    if not matched and refresh and self.windowOpen.mail then
+        self:NoteInbox("retry")
+        matched = FindMailMatch(list, amount)
     end
-    SessionLog("mailbox session ended reason=%s", tostring(reason))
-    self:SettleMail(true)
-    self.mailNoted = nil
-    self.mailInbox = {}
-    self.mailClosing = false
+    if not matched then
+        return false
+    end
+    for _, mail in ipairs(matched) do
+        for index = #list, 1, -1 do
+            if list[index] == mail then
+                table.remove(list, index)
+                break
+            end
+        end
+        self:Record(mail.money, mail.category, mail.profession, mail.reason, mail.timestamp, mail.item)
+    end
+    self:MailLog("match", amount, string.format("%d mail(s), %d still waiting", #matched, #list))
+    return true
 end
 
 -- AH sale mail is held for AH_MAIL_DAYS from the moment of the sale, so the
@@ -865,11 +892,25 @@ end
 -- sale produces one PLAYER_MONEY of exactly that amount. If not, the sale still
 -- lands in Vendor by the open-window rule, just without item or profession.
 function GoldLedger:OnUseContainerItem(bag, slot)
-    if not self.windowOpen.merchant or not C_Container or not C_Container.GetContainerItemInfo then
+    if not C_Container or not C_Container.GetContainerItemInfo then
         return
     end
     local ok, info = pcall(C_Container.GetContainerItemInfo, bag, slot)
-    if not ok or type(info) ~= "table" or not info.hyperlink or info.hasNoValue then
+    if not ok or type(info) ~= "table" or not info.hyperlink then
+        if not self.windowOpen.merchant then
+            SessionLog("bag item use: slot already empty or unreadable bag=%s slot=%s", tostring(bag), tostring(slot))
+        end
+        return
+    end
+    if self.windowOpen.merchant then
+        self:ClaimVendorSale(info)
+    elseif info.hasLoot then
+        self:ClaimContainerOpen(info)
+    end
+end
+
+function GoldLedger:ClaimVendorSale(info)
+    if info.hasNoValue then
         return
     end
     local getInfo = C_Item and C_Item.GetItemInfo or GetItemInfo
@@ -887,6 +928,25 @@ function GoldLedger:OnUseContainerItem(bag, slot)
         profession = professionKey,
         item = itemName and { name = itemName, quantity = quantity } or nil,
         reason = "vendor:sell profession-by=" .. tostring(how),
+    })
+end
+
+-- Opening a container from your bags (cache, trove, reward bag): gold that
+-- arrives within CONTAINER_CLAIM_TTL is credited to Loot & Quests with the
+-- container's name as the item. Seen 2026-10-23: an Overflowing Silvermoon
+-- Trove and an Apex chest paid gold with no loot-money claim, so it went to
+-- Unknown. Theoretical: info.hasLoot is true for these containers and the
+-- slot still holds the item when this post-hook runs.
+function GoldLedger:ClaimContainerOpen(info)
+    local getInfo = C_Item and C_Item.GetItemInfo or GetItemInfo
+    local itemName = (getInfo(info.hyperlink)) or info.itemName
+    SessionLog("container opened: %s", tostring(itemName))
+    self:AddClaim({
+        category = "loot_quest",
+        direction = 1,
+        item = itemName and { name = itemName, quantity = 1 } or nil,
+        reason = "container:" .. tostring(itemName),
+        ttl = CONTAINER_CLAIM_TTL,
     })
 end
 
@@ -1053,78 +1113,114 @@ if diagnostics and diagnostics.RegisterCommand then
 end
 
 -- ---------------------------------------------------------------------------
--- ONE-TIME FIX (2026-10-19): /mcg mailsalefix
--- Two Matatrueno AH sales double-counted by the old mailbox matcher went to
--- Unknown on 2026-10-19. Moves them to Auction House with item and profession
--- (looked up the same way as live sales) and removes them from the Unknown
--- log. Only acts if Unknown still holds both amounts. No window needed.
--- Delete this block after it has been run.
+-- Diagnostics: /mcg goldmaillog - mail waiting for its gold, and recent
+-- waiting-list activity (saved, so it works with debug off)
 -- ---------------------------------------------------------------------------
 if diagnostics and diagnostics.RegisterCommand then
-    diagnostics:RegisterCommand("mailsalefix", {
-        name = "mailsalefix",
-        description = "One-time: move two 2026-10-19 Matatrueno AH sales from Unknown to Auction House.",
-        usage = "/mcg mailsalefix",
+    diagnostics:RegisterCommand("goldmaillog", {
+        name = "goldmaillog",
+        description = "Show mail waiting for its gold and recent mail matching activity.",
+        usage = "/mcg goldmaillog",
+        category = "General",
+    }, function()
+        local ledger = LedgerDB()
+        local characters = PocketCFO.db.global.gold and PocketCFO.db.global.gold.characters or {}
+        local lines = { "=== Mail waiting for its gold ===" }
+        for guid, list in pairs(ledger and ledger.mailWaiting or {}) do
+            for _, mail in ipairs(list) do
+                lines[#lines + 1] = string.format("  %s  %s  %s  %s  noted %s",
+                    tostring(characters[guid] and characters[guid].name or guid), FormatCopper(mail.money),
+                    tostring(mail.category), mail.item and mail.item.name or "-",
+                    date("%m-%d %H:%M", mail.notedAt or 0))
+            end
+        end
+        if #lines == 1 then
+            lines[#lines + 1] = "  (none)"
+        end
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "=== Recent activity (newest first) ==="
+        for _, entry in ipairs(ledger and ledger.mailLog or {}) do
+            lines[#lines + 1] = string.format("  %s  %s  %-8s %s  %s",
+                date("%m-%d %H:%M:%S", entry.at or 0), tostring(entry.character), tostring(entry.kind),
+                FormatCopper(entry.copper or 0), tostring(entry.detail))
+        end
+        diagnostics:ShowDump("Gold Mail Log", table.concat(lines, "\n"))
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- ONE-TIME FIX (2026-10-23): /mcg containerfix
+-- Matatodos container opens on 2026-10-23 went to Unknown before containers
+-- were recognized. Moves each one still in Unknown (matched by its exact
+-- amount in the Unknown log) to Loot & Quests with the container name.
+-- Safe to run more than once. No window needed. Delete after it has been run.
+-- ---------------------------------------------------------------------------
+if diagnostics and diagnostics.RegisterCommand then
+    diagnostics:RegisterCommand("containerfix", {
+        name = "containerfix",
+        description = "One-time: move 2026-10-23 Matatodos container opens from Unknown to Loot & Quests.",
+        usage = "/mcg containerfix",
         category = "General",
     }, function()
         local ok, err = pcall(function()
-            local DAY = "2026-10-19"
-            local SALES = {
-                { copper = 23334742, name = "Sin'dorei Alchemist's Mixing Rod" },
-                { copper = 21875285, name = "Junker's Big Ol' Bag" },
+            local DAY = "2026-10-23"
+            local OPENS = {
+                { copper = 20437618, name = "Overflowing Silvermoon Trove" },
+                { copper = 19583515, name = "Apex Chest" },
+                { copper = 10675723, name = "Aqir Research Satchel" },
             }
             local ledger = LedgerDB()
             local characters = PocketCFO.db.global.gold and PocketCFO.db.global.gold.characters or {}
             local guid
             for characterGUID, entry in pairs(characters) do
-                if entry.name == "Matatrueno" then
+                if entry.name == "Matatodos" then
                     guid = characterGUID
                 end
             end
             local character = guid and ledger and ledger.days[DAY] and ledger.days[DAY][guid]
-            local unknownRow = character and character.other and character.other.none
-            local total = SALES[1].copper + SALES[2].copper
-            if not unknownRow or (unknownRow.income or 0) < total then
-                PocketCFO:Print("mailsalefix: no change. Unknown for Matatrueno on %s does not hold both sales (found %s).",
-                    DAY, FormatCopper(unknownRow and unknownRow.income or 0))
+            if not character then
+                PocketCFO:Print("containerfix: no data for Matatodos on %s, nothing changed.", DAY)
                 return
             end
-            unknownRow.income = unknownRow.income - total
-            unknownRow.count = math.max(0, (unknownRow.count or 0) - 2)
-            if unknownRow.income == 0 and (unknownRow.spend or 0) == 0 then
-                character.other.none = nil
-                if next(character.other) == nil then
-                    character.other = nil
+            local moved = 0
+            for _, open in ipairs(OPENS) do
+                local logIndex
+                for index, entry in ipairs(ledger.unknownLog or {}) do
+                    if entry.character == "Matatodos" and entry.copper == open.copper then
+                        logIndex = index
+                        break
+                    end
+                end
+                local unknownRow = character.other and character.other.none
+                if logIndex and unknownRow and (unknownRow.income or 0) >= open.copper then
+                    table.remove(ledger.unknownLog, logIndex)
+                    unknownRow.income = unknownRow.income - open.copper
+                    unknownRow.count = math.max(0, (unknownRow.count or 0) - 1)
+                    if unknownRow.income == 0 and (unknownRow.spend or 0) == 0 then
+                        character.other.none = nil
+                        if next(character.other) == nil then
+                            character.other = nil
+                        end
+                    end
+                    character.loot_quest = character.loot_quest or {}
+                    local row = character.loot_quest.none or { income = 0, spend = 0, count = 0 }
+                    character.loot_quest.none = row
+                    row.items = row.items or {}
+                    row.income = row.income + open.copper
+                    row.count = row.count + 1
+                    local detail = row.items[open.name] or { copper = 0, quantity = 0 }
+                    row.items[open.name] = detail
+                    detail.copper = detail.copper + open.copper
+                    detail.quantity = detail.quantity + 1
+                    moved = moved + 1
+                    PocketCFO:Print("containerfix: %s %s -> Loot & Quests", open.name, FormatCopper(open.copper))
                 end
             end
-            character.auction = character.auction or {}
-            for _, sale in ipairs(SALES) do
-                local professionKey = ProfessionForItem(nil, sale.name) or "none"
-                local row = character.auction[professionKey] or { income = 0, spend = 0, count = 0 }
-                character.auction[professionKey] = row
-                row.income = row.income + sale.copper
-                row.count = row.count + 1
-                row.items = row.items or {}
-                local detail = row.items[sale.name] or { copper = 0, quantity = 0 }
-                row.items[sale.name] = detail
-                detail.copper = detail.copper + sale.copper
-                detail.quantity = detail.quantity + 1
-                PocketCFO:Print("mailsalefix: %s %s -> Auction House, profession %s", sale.name,
-                    FormatCopper(sale.copper), professionKey)
-            end
-            local kept = {}
-            for _, entry in ipairs(ledger.unknownLog or {}) do
-                local isFixed = entry.character == "Matatrueno"
-                    and (entry.copper == SALES[1].copper or entry.copper == SALES[2].copper)
-                if not isFixed then
-                    kept[#kept + 1] = entry
-                end
-            end
-            ledger.unknownLog = kept
+            PocketCFO:Print("containerfix: moved %d of %d.", moved, #OPENS)
             GoldLedger:SendMessage("MCG_GOLD_LEDGER_UPDATED")
         end)
         if not ok then
-            PocketCFO:Print("mailsalefix error: " .. tostring(err))
+            PocketCFO:Print("containerfix error: " .. tostring(err))
         end
     end)
 end

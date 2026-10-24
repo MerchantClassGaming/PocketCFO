@@ -572,6 +572,180 @@ function OrderObservationBuilder:BuildCurrentOrderObservation()
 end
 
 -- ---------------------------------------------------------------------------
+-- Quality options for list orders (Brian, 2026-10-23)
+-- ---------------------------------------------------------------------------
+-- An order that needs a quality above rank 1 can often be made more than one
+-- way: cheap mats + concentration, or best mats (with or without
+-- concentration). The game answers "what quality do these mats give, and
+-- what does concentration cost" for an order that is not open:
+-- GetCraftingOperationInfo(recipeID, reagentTbl, nil, concentrating) returns
+-- craftingQuality and concentrationCost. CONFIRMED in-game (/mcgd orderlist
+-- conc, 2026-10-23): Flawless Deadly Peridot with cheap mats returned skill
+-- 290/400 and concentrationCost=257, matching the game's own order view.
+--
+-- The reagent table holds ONLY quality mats. CONFIRMED (/mcgd orderdata,
+-- 2026-10-23): Blizzard's own transaction:CreateCraftingReagentInfoTbl()
+-- holds only slots with dataSlotType = 2; no-quality mats (dataSlotType = 1)
+-- are left out, dataSlotIndex only counts within a dataSlotType, and tables
+-- that included no-quality rows came back nil. Every required quality slot
+-- must be in the table - a missing slot did not reliably mean "cheapest".
+-- Theoretical: that minQuality and craftingQuality use the same rank scale
+-- on 5-rank recipes (confirmed only on 2-rank gems).
+local QUALITY_DATA_SLOT_TYPE = 2
+
+local function IsQualitySlotRow(slotRow)
+    local slot = type(slotRow) == "table" and slotRow.slot or nil
+    local basicType = (Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic) or 1
+    return type(slot) == "table"
+        and NumberOrNil(slot.dataSlotType) == QUALITY_DATA_SLOT_TYPE
+        and NumberOrNil(slot.reagentType) == basicType
+end
+
+-- Customer quality mats (order.reagents rows, matched to their slot by
+-- slotIndex) + the crafter's costed rows for the required quality slots.
+-- complete = false when a required quality slot the customer did not fill
+-- has no item to send - the game's answer would not be trustworthy then.
+local function BuildQualityReagentTbl(order, slotRows, crafterRows)
+    local slotByIndex = {}
+    for _, slotRow in ipairs(slotRows or {}) do
+        if slotRow.slotIndex then
+            slotByIndex[slotRow.slotIndex] = slotRow
+        end
+    end
+
+    local tbl = {}
+    local customerSlots = {}
+    for _, orderRow in ipairs(type(order.reagents) == "table" and order.reagents or {}) do
+        local slotIndex = type(orderRow) == "table" and NumberOrNil(orderRow.slotIndex) or nil
+        if slotIndex then
+            customerSlots[slotIndex] = true
+            if type(orderRow.reagentInfo) == "table" and IsQualitySlotRow(slotByIndex[slotIndex]) then
+                tbl[#tbl + 1] = orderRow.reagentInfo
+            end
+        end
+    end
+
+    local filledSlots = {}
+    for _, row in ipairs(crafterRows or {}) do
+        local slotRow = row.slotIndex and slotByIndex[row.slotIndex]
+        if row.itemID and IsQualitySlotRow(slotRow) then
+            tbl[#tbl + 1] = {
+                reagent = { itemID = row.itemID },
+                dataSlotIndex = slotRow.dataSlotIndex,
+                quantity = row.quantity,
+            }
+            filledSlots[row.slotIndex] = true
+        end
+    end
+
+    for _, slotRow in ipairs(slotRows or {}) do
+        if slotRow.required and IsQualitySlotRow(slotRow) and slotRow.slotIndex
+            and not customerSlots[slotRow.slotIndex] and not filledSlots[slotRow.slotIndex] then
+            return tbl, false
+        end
+    end
+    return tbl, true
+end
+
+local function ReadQualityResult(recipeID, reagentTbl, concentrating)
+    local ok, info = ApiCall(C_TradeSkillUI, "GetCraftingOperationInfo", recipeID, reagentTbl, nil, concentrating)
+    if not ok or type(info) ~= "table" or NumberOrNil(info.craftingQuality) == nil then
+        return nil
+    end
+    return {
+        craftingQuality = NumberOrNil(info.craftingQuality),
+        concentrationCost = NumberOrNil(info.concentrationCost) or 0,
+        concentrationCurrencyID = NumberOrNil(info.concentrationCurrencyID),
+    }
+end
+
+-- One way of making the order with one set of mats: without concentration
+-- if that already reaches the required rank, otherwise with it.
+-- @return option table, or nil + "unreachable" | "unknown"
+local function BuildQualityOption(key, recipeID, requiredRank, reagentTbl, crafterRows)
+    local plain = ReadQualityResult(recipeID, reagentTbl, false)
+    if not plain then
+        return nil, "unknown"
+    end
+    if plain.craftingQuality >= requiredRank then
+        return {
+            key = key,
+            crafterProvidedReagents = crafterRows,
+            craftingQuality = plain.craftingQuality,
+            concentrationCost = 0,
+        }
+    end
+    local boosted = ReadQualityResult(recipeID, reagentTbl, true)
+    if not boosted then
+        return nil, "unknown"
+    end
+    if boosted.craftingQuality >= requiredRank then
+        return {
+            key = key,
+            crafterProvidedReagents = crafterRows,
+            craftingQuality = boosted.craftingQuality,
+            concentrationCost = boosted.concentrationCost,
+            concentrationCurrencyID = boosted.concentrationCurrencyID or plain.concentrationCurrencyID,
+        }
+    end
+    return nil, "unreachable"
+end
+
+local function RowsSignature(rows)
+    local parts = {}
+    for _, row in ipairs(rows or {}) do
+        parts[#parts + 1] = tostring(row.slotIndex) .. ":" .. tostring(row.itemID) .. "x" .. tostring(row.quantity)
+    end
+    return table.concat(parts, "|")
+end
+
+-- @return options (array, best-first order not implied), unreachable (true
+--         when the game answered for every mat set and none reaches the
+--         required rank). Both nil when the order needs no quality above
+--         rank 1 or the game could not answer - the board then keeps its
+--         existing single estimate.
+local function BuildQualityOptions(order, recipeID, slotRows, claimedSlotKeys)
+    local requiredRank = NumberOrNil(order.minQuality) or 1
+    if requiredRank <= 1 then
+        return nil, nil
+    end
+
+    -- Throwaway diagnostics: these extra costings must not duplicate the
+    -- observation's own diagnostic rows.
+    local scratch = NewDiagnostics()
+    local cheapRows = NormalizeCrafterReagents(nil, {}, slotRows, claimedSlotKeys, scratch, false)
+    local bestRows = NormalizeCrafterReagents(nil, {}, slotRows, claimedSlotKeys, scratch, true)
+    local sets = { { key = "cheap", rows = cheapRows } }
+    if RowsSignature(bestRows) ~= RowsSignature(cheapRows) then
+        sets[#sets + 1] = { key = "best", rows = bestRows }
+    end
+
+    local options = {}
+    local anyUnknown = false
+    for _, set in ipairs(sets) do
+        local reagentTbl, complete = BuildQualityReagentTbl(order, slotRows, set.rows)
+        if not complete then
+            anyUnknown = true
+        else
+            local option, reason = BuildQualityOption(set.key, recipeID, requiredRank, reagentTbl, set.rows)
+            if option then
+                options[#options + 1] = option
+            elseif reason == "unknown" then
+                anyUnknown = true
+            end
+        end
+    end
+
+    if #options > 0 then
+        return options, nil
+    end
+    if anyUnknown then
+        return nil, nil
+    end
+    return nil, true
+end
+
+-- ---------------------------------------------------------------------------
 -- List-mode observation (Patron Orders board)
 -- ---------------------------------------------------------------------------
 -- Builds the same observation shape as BuildCurrentOrderObservation for an
@@ -588,6 +762,10 @@ end
 --   - Resourcefulness %: GetCraftingOperationInfoForOrder first, then
 --     GetCraftingOperationInfo(recipeID, {}, nil, false), which is the one
 --     that works for list orders (see below). concentrating=false.
+--   - qualityOptions / qualityUnreachable: the ways to reach the order's
+--     required rank (cheap or best mats, with concentration when needed) -
+--     see BuildQualityOptions. The board picks between them; the fields
+--     above keep the existing single estimate.
 function OrderObservationBuilder:BuildObservationFromListOrder(order)
     local diagnostics = NewDiagnostics()
     if type(order) ~= "table" then
@@ -644,6 +822,7 @@ function OrderObservationBuilder:BuildObservationFromListOrder(order)
     local consortiumCut = NumberOrNil(order.consortiumCut) or 0
 
     local outputItemID = ResolveOutputItemID(order, recipeInfo, schematicInfo)
+    local qualityOptions, qualityUnreachable = BuildQualityOptions(order, recipeID, slotRows, claimedSlotKeys)
 
     return {
         resolved = true,
@@ -671,6 +850,9 @@ function OrderObservationBuilder:BuildObservationFromListOrder(order)
             displayedResourcefulnessPct = resourcefulnessPct,
             concentrating = false,
             isListEstimate = true,
+
+            qualityOptions = qualityOptions,
+            qualityUnreachable = qualityUnreachable,
         },
         diagnostics = diagnostics,
     }

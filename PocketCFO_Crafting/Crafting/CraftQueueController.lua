@@ -506,6 +506,97 @@ function CraftQueueController:RefreshAnalysisAvailability(opts)
         and not self.analysisInitialLoadInProgress then
         self:BeginAnalysisInitialLoad()
     end
+
+    self:UpdateRecipeHeadline()
+end
+
+-- Headline above "Save to Inv. Manager": the top line of whichever analysis
+-- the selected recipe has, from the evaluation that just ran, so it can be
+-- seen while the Inventory view is up. Reads numbers the analysis already
+-- computed - no math here.
+--   liveRecipe:    displayModel.headline.
+--   craftAnalysis: the row for the quality the crafting window would make
+--                  right now (result.currentOutputConfigKey).
+--   processing:    the row for the input slotted in the crafting window
+--                  (e.g. the herb picked for Milling). Nothing slotted ->
+--                  nothing shown.
+-- Hidden whenever that number doesn't exist (no crafts of that quality yet,
+-- waiting on a price) and while the first-open "Loading..." placeholder is
+-- up (no partial numbers).
+
+-- Same pick ProcessingAnalysisController's FindSelectedInput makes, falling
+-- back to the profile-driving input (Milling/Prospecting's herb/ore slot).
+local function FindSlottedProcessingInput(recipeID)
+    local capture = PocketCFO_Crafting:GetModule("CraftEventCapture", true)
+    if not recipeID or not capture or not capture.GetLiveProcessingInputs then
+        return nil
+    end
+    local inputs = capture:GetLiveProcessingInputs(recipeID, "RecipeHeadline")
+    local driver
+    for _, input in ipairs(type(inputs) == "table" and inputs or {}) do
+        if type(input) == "table" and input.itemID then
+            if input.statisticalProfile == true or input.selectedCostInput == true then
+                return input
+            end
+            if not driver and input.profileDriver == true then
+                driver = input
+            end
+        end
+    end
+    return driver
+end
+
+-- Matches by configKey (exact quality); itemID only when the row has none.
+local function FindRowForItem(rows, configKey, itemID)
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+        if configKey and row.configKey == configKey then
+            return row
+        end
+    end
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+        if not row.configKey and itemID and row.itemID == itemID then
+            return row
+        end
+    end
+    return nil
+end
+
+-- Analysis list row -> SetHeadline's { value, style } shape.
+local function HeadlineFromAnalysisRow(row)
+    if type(row) ~= "table" or row.expectedPerCraft == nil then
+        return nil
+    end
+    if row.analysisMode == "unitAcquisitionCost" then
+        -- Panel shows this as a cost ("Cost / Derivate"), not a profit.
+        return { value = row.expectedPerCraft, style = "neutral", barLabel = "PocketCFO Cost / Derivate:" }
+    end
+    return { value = row.expectedPerCraft, style = "profit" }
+end
+
+function CraftQueueController:UpdateRecipeHeadline()
+    local button = PocketCFO_Crafting:GetModule("SaveToInventoryButton", true)
+    if not button or not button.SetHeadline then return end
+
+    local result = type(self.lastAnalysisResult) == "table" and self.lastAnalysisResult or nil
+    local headline
+    if result and not self.analysisInitialLoadInProgress then
+        if self.analysisMode == "liveRecipe" then
+            local model = result.displayModel
+            if type(model) == "table" and model.state == "resolved" then
+                headline = model.headline
+            end
+        elseif self.analysisMode == "craftAnalysis" then
+            if result.currentOutputConfigKey then
+                headline = HeadlineFromAnalysisRow(FindRowForItem(result.rows, result.currentOutputConfigKey, nil))
+            end
+        elseif self.analysisMode == "processing" then
+            local input = FindSlottedProcessingInput(result.recipeID)
+            if input then
+                headline = HeadlineFromAnalysisRow(FindRowForItem(result.rows, input.configKey, input.itemID))
+            end
+        end
+    end
+    button:SetHeadline(headline)
 end
 
 -- Shows/hides and relabels the Top Results/All Results toggle button.
@@ -877,7 +968,17 @@ end
 -- falls back to the list instead of showing Gem A's data under Gem B's
 -- selection.
 function CraftQueueController:OnLiveProcessingInputChanged()
-    if not self.analysisAvailable or self.viewMode ~= "analysis" then
+    if not self.analysisAvailable then
+        return
+    end
+    if self.viewMode ~= "analysis" then
+        -- Inventory view up: re-evaluate only so the headline above "Save
+        -- to Inv. Manager" follows mat/Concentrate/slotted-input changes.
+        -- Never renders or switches the view.
+        local inventoryWindow = GetWindow()
+        if inventoryWindow and inventoryWindow:IsShown() then
+            self:RefreshAnalysisAvailability()
+        end
         return
     end
     local window = GetWindow()
@@ -1333,9 +1434,9 @@ end
 -- repainting the stale self.lastAnalysisResult. RefreshAnalysisAvailability
 -- clears the flag itself whenever it actually runs.
 function CraftQueueController:OnPricingUpdated(_, marketKey, itemID, source)
-    SessionLog("CraftQueueController: PCFO_PRICING_UPDATED received marketKey=%s itemID=%s source=%s viewMode=%s",
-        tostring(marketKey), tostring(itemID), tostring(source), tostring(self.viewMode))
-
+    -- No per-message log line: a full scan sends one message per market
+    -- (~50k), which flooded the session log (2026-10-24). The debounced
+    -- refresh below still logs once per refresh.
     if pricingRefreshPending then return end
     pricingRefreshPending = true
 
@@ -1351,6 +1452,14 @@ function CraftQueueController:OnPricingUpdated(_, marketKey, itemID, source)
             self.analysisPricingDirty = true
             SessionLog("CraftQueueController: pricing-updated deferred reason=analysis-not-active analysisAvailable=%s viewMode=%s windowShown=%s",
                 tostring(self.analysisAvailable), tostring(self.viewMode), tostring(window ~= nil and window:IsShown()))
+            -- Inventory view up: re-evaluate only so the headline above
+            -- "Save to Inv. Manager" picks up the new price. Never renders
+            -- or switches the view.
+            if self.analysisAvailable
+                and self.viewMode ~= "analysis"
+                and window ~= nil and window:IsShown() then
+                self:RefreshAnalysisAvailability()
+            end
             return
         end
 
@@ -1589,6 +1698,10 @@ function CraftQueueController:OnConfigLoadedIntoCraftingWindow(message, configID
     self.highlightedConfigID = configID
     local window = GetWindow()
     if window and window:IsShown() then
+        -- RecipeStateRestore writes allocations directly (no
+        -- AllocationsModified), so re-evaluate here: the analysis and the
+        -- headline above "Save to Inv. Manager" must match the loaded config.
+        self:RefreshAnalysisAvailability()
         self:DoRender("config-loaded")
     end
 end

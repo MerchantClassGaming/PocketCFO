@@ -214,6 +214,101 @@ local function BaseKeyWithoutChosenStats(marketKey)
     return marketKey:sub(1, statsAt - 1)
 end
 
+-- Interchangeable versions (Brian, 2026-10-23): Darkmoon Decks are trinkets
+-- that come in several item levels and stats - "245846|ilvl90",
+-- "245846|ilvl220|stats:ITEM_MOD_INTELLECT_SHORT" - but every version makes
+-- the same Sigil (confirmed in-game: Darkmoon Sigil: Void crafted from a 90
+-- deck and a 220 deck stack together). So every version is worth the
+-- cheapest version.
+-- Explicit item ID list. Matching a category instead would catch normal
+-- trinkets/gear (and profession tools), where different item levels and
+-- stats really are different values. Add an ID here only when another item
+-- is confirmed to behave the same way. IDs from the saved price cache
+-- (2026-10-23); works on every client language.
+-- Used in two places so they can't drift apart:
+--   ResolveAHValue - an item-ID-only lookup prices the cheapest version
+--     instead of the base-item-level key (which is not a real item).
+--   "interchangeable-version-cap" rule (ValuationRuleSet.lua) - a linked
+--     version is capped at the cheapest version.
+-- Cheapest fresh price first; cheapest of any age only when nothing is
+-- fresh. Computed on lookup, never stored.
+local INTERCHANGEABLE_ITEM_IDS = {
+    [245855] = true, -- Darkmoon Deck: Blood
+    [245829] = true, -- Darkmoon Deck: Hunt
+    [245846] = true, -- Darkmoon Deck: Rot
+    [245750] = true, -- Darkmoon Deck: Void
+}
+
+-- item: a ValuationRules facts view (facts:View()), or any table with itemID.
+function ValuationService:IsInterchangeableVersionItem(item)
+    local itemID = type(item) == "table" and tonumber(item.itemID) or nil
+    return itemID ~= nil and INTERCHANGEABLE_ITEM_IDS[itemID] == true
+end
+
+local function IsItemIDOnlyLookup(normalized)
+    return normalized.itemLink == nil
+        and normalized.itemLevel == nil
+        and normalized.statFingerprint == nil
+        and normalized.qualityTier == nil
+end
+
+local function ResolveCheapestVersion(cacheModule, normalized, resolvedItemID, requestedKey)
+    if type(cacheModule.GetCandidatesForItemID) ~= "function" then
+        return nil
+    end
+    local itemID = normalized.itemID or resolvedItemID
+    local cheapestFresh, cheapestAny
+    local versionCount = 0
+    for _, candidate in ipairs(cacheModule:GetCandidatesForItemID(itemID) or {}) do
+        local candidateKey = type(candidate) == "table" and tostring(candidate.marketKey or "") or ""
+        if candidateKey ~= "" then
+            local value, freshness, row = cacheModule:GetValueByMarketKey(candidateKey)
+            value = tonumber(value)
+            if value then
+                versionCount = versionCount + 1
+                local entry = { key = candidateKey, value = value, freshness = freshness, row = row }
+                if freshness == "fresh" and (not cheapestFresh or value < cheapestFresh.value) then
+                    cheapestFresh = entry
+                end
+                if not cheapestAny or value < cheapestAny.value then
+                    cheapestAny = entry
+                end
+            end
+        end
+    end
+    local chosen = cheapestFresh or cheapestAny
+    if not chosen then
+        return nil
+    end
+    local row = chosen.row
+    return {
+        resolved = true,
+        value = chosen.value,
+        valuePerUnit = chosen.value,
+        currency = CURRENCY_COPPER,
+        basis = "cheapestVersion:" .. tostring(versionCount),
+        source = SOURCE_AH,
+        strategyKey = SOURCE_AH,
+        valuationBasis = BASIS_MARKET_OBSERVED,
+        itemID = itemID,
+        configKey = normalized.configKey,
+        isFresh = chosen.freshness == "fresh",
+        lastUpdated = row and row.timestamp,
+        unresolved = nil,
+        unresolvedReason = nil,
+        provenance = {
+            marketKey = chosen.key,
+            requestedMarketKey = requestedKey,
+            cheapestVersion = true,
+            versionCount = versionCount,
+            depthUsed = row and row.depthUsed,
+            cacheSource = row and row.source,
+            timestamp = row and row.timestamp,
+            isFresh = chosen.freshness == "fresh",
+        },
+    }
+end
+
 local function ResolveStatVariantAverage(cacheModule, marketKey, normalized, resolvedItemID)
     marketKey = tostring(marketKey or "")
     if marketKey == "" then
@@ -277,13 +372,25 @@ local function ResolveStatVariantAverage(cacheModule, marketKey, normalized, res
     }
 end
 
+--- Cheapest priced version of an item ID (see IsInterchangeableVersionItem),
+-- in GetItemValue's result shape, or nil when no version has a price. Reads
+-- the cache only, so a rule can call it without recursing into valuation.
+function ValuationService:GetCheapestVersionValue(itemID)
+    itemID = tonumber(itemID)
+    local cacheModule = GetPricingCache()
+    if not itemID or not cacheModule then
+        return nil
+    end
+    return ResolveCheapestVersion(cacheModule, { itemID = itemID }, itemID, nil)
+end
+
 -- Resolves an AH-derived value for a normalized itemRef using only existing
 -- PricingIdentity/PricingCache lookups - no new pricing math, all existing
 -- protections (bait/clown-auction depth-averaging lives upstream in
 -- PricingValuation.CalculateStackableValue) untouched. Returns nil, reason
 -- when no AH value is available so the caller can fall through to a
 -- registered custom strategy before giving up.
-local function ResolveAHValue(normalized)
+local function ResolveAHValue(normalized, facts)
     local identityModule = GetPricingIdentity()
     local cacheModule = GetPricingCache()
     if not identityModule or not cacheModule then
@@ -293,6 +400,17 @@ local function ResolveAHValue(normalized)
     local marketKey, resolvedItemID = ResolveMarketKey(identityModule, normalized)
     if not marketKey then
         return nil, "marketKeyUnresolved"
+    end
+
+    -- Base-item-level key from an item ID alone on an interchangeable
+    -- reagent: price the cheapest version instead (see
+    -- IsInterchangeableVersionItem).
+    if IsItemIDOnlyLookup(normalized) and tostring(marketKey):match("^%d+|ilvl%d+$")
+        and facts and ValuationService:IsInterchangeableVersionItem(facts:View()) then
+        local cheapest = ResolveCheapestVersion(cacheModule, normalized, resolvedItemID, marketKey)
+        if cheapest then
+            return cheapest
+        end
     end
 
     local value, freshness, row = cacheModule:GetValueByMarketKey(marketKey)
@@ -539,7 +657,7 @@ local function ResolveItemValueTrace(normalized, options)
     local customAttempted = FindCustomItemStrategy(normalized, facts) ~= nil
 
     local vendorResult, vendorUnresolvedReason = ResolveVendorValue(normalized)
-    local ahResult, ahUnresolvedReason = ResolveAHValue(normalized)
+    local ahResult, ahUnresolvedReason = ResolveAHValue(normalized, facts)
 
     local selected
     if customResult and customResult.resolved == true then
@@ -741,6 +859,11 @@ function ValuationService:ExplainValue(itemRef, options)
     local identityModule = GetPricingIdentity()
     local cacheModule = GetPricingCache()
     local marketKey = identityModule and (ResolveMarketKey(identityModule, normalized))
+    -- Show the key that was actually priced when the cheapest version won.
+    local ahProvenance = trace.ah and trace.ah.provenance
+    if ahProvenance and ahProvenance.cheapestVersion and ahProvenance.marketKey then
+        marketKey = ahProvenance.marketKey
+    end
     local cacheRow = (marketKey and cacheModule) and cacheModule:GetEntry(marketKey) or nil
     local candidates = (result.itemID and cacheModule and cacheModule.GetCandidatesForItemID)
         and cacheModule:GetCandidatesForItemID(result.itemID) or {}

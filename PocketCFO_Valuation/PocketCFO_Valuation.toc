@@ -2,7 +2,7 @@
 ## Title: PocketCFO Valuation
 ## Notes: Pricing identity and valuation cache foundation - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.1.3
+## Version: v1.2.0
 ## SavedVariables: PocketCFO_ValuationDB
 ## LoadOnDemand: 1
 
@@ -24,6 +24,7 @@ Modules\VendorPriceDefaults.lua
 Modules\VendorPriceService.lua
 Modules\PricingCache.lua
 Modules\QualitySiblings.lua
+Modules\ProfessionGearPairs.lua
 Modules\PricingValuation.lua
 Modules\ValuationRules.lua
 Modules\ValuationService.lua

@@ -262,6 +262,50 @@ local function AddPossibleDropLines(tooltip, result)
     end
 end
 
+-- AH summary rows and the item header above a listing: Blizzard fills these
+-- with GetItemKey(itemID, itemLevel, itemSuffix, requiredLevel), and the link
+-- they carry has the base item level, not the real one. Confirmed in-game
+-- 2026-10-24 (Sin'dorei Jeweler's Loupes summary row: getterName
+-- "GetItemKey", args 240959, 232, 0, 78; link built key ilvl206). Returns
+-- itemID, itemLevel for such a tooltip, else nil.
+local function GetItemKeyArgs(tooltip)
+    local info = tooltip and (tooltip.processingInfo or tooltip.info)
+    if type(info) ~= "table" or info.getterName ~= "GetItemKey" or type(info.getterArgs) ~= "table" then
+        return nil
+    end
+    local itemID, itemLevel = tonumber(info.getterArgs[1]), tonumber(info.getterArgs[2])
+    if not itemID or not itemLevel then
+        return nil
+    end
+    return itemID, itemLevel
+end
+
+-- A summary row covers every version of the item at that item level (e.g.
+-- tools with different stats). Shows the cheapest PocketCFO value among
+-- them (Brian, 2026-10-24: matches the row's lowest price, as Auctionator
+-- does). Each version goes through ValuationService so rules still apply.
+local function CheapestValueAtItemLevel(valuationService, cacheModule, itemID, itemLevel)
+    if not cacheModule.GetCandidatesForItemID then
+        return nil
+    end
+    local best
+    for _, row in ipairs(cacheModule:GetCandidatesForItemID(itemID) or {}) do
+        if type(row) == "table" and tonumber(row.itemLevel) == itemLevel then
+            local ok, result = pcall(valuationService.GetItemValue, valuationService, {
+                itemID = itemID,
+                itemLevel = row.itemLevel,
+                qualityTier = row.qualityTier,
+                statFingerprint = row.statFingerprint,
+            })
+            local value = ok and type(result) == "table" and not result.unresolved and tonumber(result.value) or nil
+            if value and (not best or value < best.value) then
+                best = result
+            end
+        end
+    end
+    return best
+end
+
 local function AddValuationLine(tooltip, data)
     if not tooltip then
         return
@@ -302,6 +346,18 @@ local function AddValuationLine(tooltip, data)
     local ok, result = pcall(valuationService.GetItemValue, valuationService, { itemID = itemID, itemLink = itemLink })
     local value = ok and type(result) == "table" and not result.unresolved and result.value or nil
     local exact = marketKey and cacheModule:GetEntry(marketKey) or nil
+
+    -- AH summary row / item header: price by the real item level instead.
+    if not value then
+        local keyItemID, keyItemLevel = GetItemKeyArgs(tooltip)
+        if keyItemID == itemID then
+            local cheapest = CheapestValueAtItemLevel(valuationService, cacheModule, keyItemID, keyItemLevel)
+            if cheapest then
+                ok, result, value = true, cheapest, cheapest.value
+                marketKey = tostring(itemID) .. "|itemKeyIlvl" .. tostring(keyItemLevel)
+            end
+        end
+    end
     local formatted = FormatCopper(value)
     if not formatted then
         local candidates = cacheModule.GetCandidatesForItemID and cacheModule:GetCandidatesForItemID(itemID) or {}

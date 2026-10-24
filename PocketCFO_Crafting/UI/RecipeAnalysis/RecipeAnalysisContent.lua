@@ -65,6 +65,11 @@ local function FormatGoldSilver(copperValue)
     return signed:sub(2)
 end
 
+-- Shared so the headline above "Save to Inv. Manager" (SaveToInventoryButton)
+-- formats money exactly like this panel.
+RecipeAnalysisContent.FormatSignedGoldSilver = FormatSignedGoldSilver
+RecipeAnalysisContent.FormatGoldSilver = FormatGoldSilver
+
 local function SetColor(fontString, color)
     fontString:SetTextColor(color[1], color[2], color[3], 1)
 end

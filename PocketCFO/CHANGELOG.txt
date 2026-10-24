@@ -1,31 +1,19 @@
-v1.1.3
-Fixes a bug that analyzed engineering recycling incorrectly, giving bad numbers in the analysis window.
-Removed recipes from moxie bags as counting towards the bag's value. While you can get these recipes still, getting even 1 can drastically skew the bag's value, inflating the value of moxie. This means moxie will be slightly undervalued until better data can be collected.
+Scans by realm is now supported. This means that if you play on multiple realms, you'll need to do a new scan for each unconnected realm. Connected realms will share scan data.
 
-v1.1.2
-Fixes a bug where opening the mailbox sometimes stopped tracking other sources of gold.
+Scan optimization - phase 1 would sometimes cut short on larger servers causing the scan to hang. Phase 3 also had an issue with larger servers where unpriced items would leave the scan hung and blizzard never sends updated information that would allow the scan to move forward with the data it was able to obtain.
 
-v1.1.1
-Fixes a bug where some auction house sales were being attributed to Loot and Quests in the gold tracker.
+A scan canceled by closing the Auction House now still starts the 15-minute cooldown, because Blizzard’s own cooldown already counts it. 
 
-v1.1.0
-New: See where your gold comes from
-Open it with /pcfo gold. The Gold window now has three tabs:
+Improved the way the patron orders board evaluates recipes. The board now evaluates both low and high quality mat completions of the recipe when an order requires higher quality outputs. It will tell you the cheapest way to fulfill the order, low quality mats and concentration or high quality mats, and present you with that option on the order board summary. It will also mark a recipe with a quality requirement you can't meet with mats and concentration to red and move it to the bottom with any orders you can't complete because you don't have the recipe.
 
-Balances
-Your gold on every character, your Warband Bank, and your account total. Same as before.
+Added a profit/loss view on each recipe in the bottom left that can be seen without having to open the recipe or crafting analysis window.
 
-Income
-Where your gold came from: Patron Orders, Personal Orders, Auction House, Vendor, Loot & Quests, and more.
+Improved valuation on darkmoon decks. Lower level decks will now not exceed the value of higher level decks.
 
-Pick Today, 7 Days, 30 Days, or All, and pick one character or all of them.
-Click a source to see it split by profession, or to see which items you sold on the Auction House or to vendors.
-A bar for each day shows how your income changes over time. Hover a bar to see that day.
-Auction House sales are counted on the day they sold, not the day you collected the mail. Open your mailbox often to keep it up to date.
-Gold you move between your own characters is never counted as income.
-Orders
-What your crafting orders actually earned you: the gold paid, plus the value of the rewards and any mats you got back, minus the mats you used.
+Improved valuation of profession equipment - T5 items will always hold the highest value. Anything of lesser quality will cap at 10% less per tier from the T5, so a T4 will cap at 90%, T3 will cap at 80%, etc. Blues also cap greens of the same tool type. For example, the T1 blue enchanting rod (ilvl 206) will always value higher than the green T5 enchanting rod.
 
-See it by profession, then click a profession to compare Patron, Personal, Public, and Guild orders.
-Uncheck order types to hide them. For example, uncheck everything but Patron to see which profession's patron orders pay best.
-Tracking starts when you install this update, so your history builds up from today.
+Sorted out an issue with mailbox timing and the gold tracker
+
+Fixed an issue that caused resourcefulness to sometimes not calculate on the patron order board
+
+Resolved some of the "unknown" gold sources so they track properly to their corresponding buckets

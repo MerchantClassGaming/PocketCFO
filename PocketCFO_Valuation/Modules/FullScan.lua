@@ -6,10 +6,35 @@ local PocketCFO_Valuation = _G.PocketCFO_Valuation
 
 local FullScan = PocketCFO_Valuation:NewModule("FullScan", "AceEvent-3.0")
 
+-- Rows read per frame only when debugprofilestop is unavailable; normally
+-- each frame works until CHUNK_BUDGET_MS is spent, so slower machines do
+-- fewer rows per frame instead of stuttering.
 local PROCESS_CHUNK_SIZE = 200
+local CHUNK_BUDGET_MS = 8
 local FINALIZE_CHUNK_SIZE = 100
 local YIELD_SECONDS = 0.01
-local WAIT_TIMEOUT_SECONDS = 60
+-- Blizzard takes 30-90+ seconds to send replicate data (api-findings), longer
+-- on big Auction Houses.
+local WAIT_TIMEOUT_SECONDS = 180
+-- Phase 3: rows that weren't ready in phase 2 (hasAllInfo == false) wait
+-- for the game to fill them in. Confirmed in-game 2026-10-24: a row's
+-- readiness is per row, not per item (rows stay not ready after GetItemInfo
+-- works, and reading them early gives a nil link), and it doesn't last:
+-- not-ready rows went 186k -> 318k -> 350k over ~5 minutes of idling.
+-- Theoretical: the game only keeps a limited set of item data, so asking
+-- for everything at once pushes rows out before they're read. So rows are
+-- worked through a small set of items at a time (like the original code's
+-- 200-row retry, which got the most markets), read the moment they're
+-- ready. An item not ready within WAIT_ITEM_SECONDS goes to the back of the
+-- queue; after WAIT_ITEM_MAX_TRIES it is skipped. WAIT_STALL_SECONDS with no
+-- row read, or WAIT_MAX_SECONDS overall, ends phase 3 (rest skipped).
+local WAIT_WINDOW_ITEMS = 200
+local WAIT_ITEM_SECONDS = 10
+local WAIT_ITEM_MAX_TRIES = 3
+local WAIT_REREQUEST_SECONDS = 1
+local WAIT_STALL_SECONDS = 30
+local WAIT_MAX_SECONDS = 360
+local WAIT_LOG_SECONDS = 1
 local FULL_SCAN_COOLDOWN_SECONDS = 15 * 60
 local EXPECTED_SCAN_SECONDS = 2 * 60
 
@@ -53,6 +78,52 @@ local function PackPCall(fn, ...)
     local returns = { pcall(fn, ...) }
     local ok = table.remove(returns, 1)
     return ok == true, returns
+end
+
+-- Returns a function to call after each row; it returns true once this
+-- frame's work budget is spent.
+local function NewFrameBudget()
+    local startMs = debugprofilestop and debugprofilestop() or nil
+    local count = 0
+    return function()
+        count = count + 1
+        if startMs then
+            return (debugprofilestop() - startMs) >= CHUNK_BUDGET_MS
+        end
+        return count >= PROCESS_CHUNK_SIZE
+    end
+end
+
+-- Patch compat: Blizzard removed the global item APIs; route to C_Item.
+local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+
+local function IsItemInfoLoaded(itemID)
+    if not itemID or not GetItemInfo then
+        return false
+    end
+    local ok, name = pcall(GetItemInfo, itemID)
+    return ok and name ~= nil
+end
+
+-- false only when the game says the item doesn't exist (Blizzard sometimes
+-- returns replicate rows for such items; they never load).
+local function ItemExists(itemID)
+    if not itemID then
+        return false
+    end
+    if C_Item and type(C_Item.DoesItemExistByID) == "function" then
+        local ok, exists = pcall(C_Item.DoesItemExistByID, itemID)
+        if ok and exists == false then
+            return false
+        end
+    end
+    return true
+end
+
+local function RequestItemLoad(itemID)
+    if itemID and C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+        pcall(C_Item.RequestLoadItemDataByID, itemID)
+    end
 end
 
 local function GetItemIDFromLink(itemLink)
@@ -240,7 +311,6 @@ function FullScan:ResetStatus()
     }
     self.buckets = nil
     self.nextIndex = nil
-    self.deferredIndexes = nil
     self.finalizeKeys = nil
     self.finalizeIndex = nil
     self.identityMemo = nil
@@ -272,11 +342,12 @@ function FullScan:ClearRuntimeState()
     self:CancelWaitTimeout()
     self.buckets = nil
     self.nextIndex = nil
-    self.deferredIndexes = nil
     self.finalizeKeys = nil
     self.finalizeIndex = nil
     self.identityMemo = nil
     self.scanToken = nil
+    self.timing = nil
+    self:ClearPending()
 end
 
 function FullScan:GetReplicateRowCount()
@@ -293,6 +364,12 @@ function FullScan:PassiveReplicateProbe()
         local ok, returns = PackCall(C_AuctionHouse.GetNumReplicateItems)
         rowCount = ok and tonumber(returns and returns[1]) or 0
     end
+    -- The event can fire dozens of times a second with the same count; log
+    -- only when the count changes (2026-10-24).
+    if rowCount == self.lastProbeRowCount then
+        return
+    end
+    self.lastProbeRowCount = rowCount
     local running = self.status and self.status.running == true
     PocketCFO:Debug("FullScan:PassiveProbe REPLICATE_ITEM_LIST_UPDATE t=%d rows=%d scanRunning=%s",
         GetServerTime(), rowCount, tostring(running))
@@ -338,10 +415,10 @@ function FullScan:Fail(message)
     return false, self.status.lastError
 end
 
-function FullScan:ScheduleNext(methodName)
+function FullScan:ScheduleNext(methodName, delaySeconds)
     local token = self.scanToken
     if C_Timer and C_Timer.After then
-        C_Timer.After(YIELD_SECONDS, function()
+        C_Timer.After(delaySeconds or YIELD_SECONDS, function()
             if self.status and self.status.running and self.scanToken == token then
                 self[methodName](self)
             end
@@ -410,6 +487,18 @@ function FullScan:ProcessFinalizeChunk()
         return
     end
 
+    local timing = self.timing or {}
+    local doneClock = Clock()
+    local function Span(a, b)
+        return (a and b) and (b - a) or -1
+    end
+    PocketCFO:Debug("FullScan: summary rows=%d markets=%d priced=%d | phase1=%.1fs phase2=%.1fs phase3=%.1fs phase4=%.1fs total=%.1fs | waitedRows=%d waitedItems=%d skippedWaiting=%d missingItem=%d noMarketKey=%d",
+        tonumber(self.status.rowsTotal) or 0, #keys, tonumber(self.status.marketsPriced) or 0,
+        Span(timing.start, timing.phase1End), Span(timing.phase1End, timing.phase2End),
+        Span(timing.phase2End, timing.phase3End), Span(timing.phase3End, doneClock), Span(timing.start, doneClock),
+        timing.waitedRows or 0, timing.waitedItems or 0, timing.skippedWaiting or 0,
+        timing.missingItem or 0, timing.noMarketKey or 0)
+
     self.status.running = false
     self.status.state = "complete"
     self.status.completedAt = Now()
@@ -417,9 +506,7 @@ function FullScan:ProcessFinalizeChunk()
     if self.status.startedClock then
         self.status.totalElapsedSeconds = math.max(0, self.status.completedClock - self.status.startedClock)
     end
-    if PocketCFO_Valuation.db and PocketCFO_Valuation.db.global then
-        PocketCFO_Valuation.db.global.timeOfLastReplicateScan = self.status.startedAt or self.status.completedAt
-    end
+    cache:SetLastScanTime(self.status.startedAt or self.status.completedAt)
     self.status.lastError = nil
     self.status.rejectReason = nil
     self:ClearRuntimeState()
@@ -432,6 +519,136 @@ function FullScan:ProcessFinalizeChunk()
     if siblings and siblings.Rebuild then
         siblings:Rebuild()
     end
+
+    -- Same for green/blue profession gear pairs (ProfessionGearPairs.lua,
+    -- used by the tool-tier-cap rule). Not loaded on Forever.
+    local gearPairs = PocketCFO_Valuation:GetModule("ProfessionGearPairs", true)
+    if gearPairs and gearPairs.Rebuild then
+        gearPairs:Rebuild()
+    end
+end
+
+-- Reads one replicate row into its market bucket. Returns:
+--   "ok"       read (or has no usable price, same as before)
+--   "pending"  row not ready yet; second return is the itemID
+--   "missing"  the game says the item doesn't exist; skipped
+--   "unkeyed"  row ready but no market key could be built; skipped
+function FullScan:ReadReplicateRow(index)
+    local row = GetReplicateInfo(index)
+    local itemID = row and tonumber(row.itemID or row.itemId or row.id)
+    if row and row.hasAllInfo == false then
+        if not ItemExists(itemID) then
+            return "missing"
+        end
+        return "pending", itemID
+    end
+
+    local itemLink = GetReplicateLink(index)
+    local memoKey = itemLink or ("itemID:" .. tostring(itemID or ""))
+    local identity = self.identityMemo and self.identityMemo[memoKey]
+    if identity == nil then
+        identity = BuildIdentity(row, itemLink)
+        if identity then
+            if self.identityMemo then
+                self.identityMemo[memoKey] = identity
+            end
+        elseif itemID and not IsItemInfoLoaded(itemID) then
+            -- No key only because the item's details haven't arrived yet:
+            -- wait for them instead of dropping the row.
+            if not ItemExists(itemID) then
+                return "missing"
+            end
+            return "pending", itemID
+        else
+            identity = false
+            if self.identityMemo and memoKey ~= "" then
+                self.identityMemo[memoKey] = false
+            end
+        end
+    end
+    if identity == false then
+        self:NoteUnkeyed(itemID, itemLink)
+        return "unkeyed"
+    end
+
+    local _, bucketCreated = AddObservation(self.buckets, identity, row)
+    if bucketCreated then
+        self.status.marketsBuilt = (tonumber(self.status.marketsBuilt) or 0) + 1
+    end
+    return "ok"
+end
+
+-- ─── Rows waiting to be ready (phase 3) ───────────────────────────────────
+
+function FullScan:ClearPending()
+    self.waitItems = nil
+    self.waitOrder = nil
+    self.waitCursor = nil
+    self.waitWindow = nil
+    self.waitWindowInfo = nil
+    self.waitRowCount = nil
+    self.waitStats = nil
+    self.unkeyedSample = nil
+    self.unkeyedSampleSeen = nil
+end
+
+function FullScan:InitPending()
+    self:ClearPending()
+    self.waitItems = {}       -- itemID -> { rows = { index, ... }, tries = n }
+    self.waitOrder = {}       -- queue of itemIDs (requeued items go to the back)
+    self.waitCursor = 1
+    self.waitWindow = {}      -- itemIDs being worked on now
+    self.waitWindowInfo = {}  -- itemID -> { enteredAt, lastRequest }
+    self.waitRowCount = 0
+    self.waitStats = {
+        missingItem = 0, noMarketKey = 0, rowsAtStart = 0, itemsAtStart = 0,
+        readSinceLog = 0, requeued = 0, gaveUpItems = 0, gaveUpRows = 0,
+    }
+    self.unkeyedSample = {}
+    self.unkeyedSampleSeen = {}
+end
+
+-- Up to UNKEYED_SAMPLE_SIZE distinct items that got no market key, for the
+-- debug log (to find out why).
+local UNKEYED_SAMPLE_SIZE = 25
+function FullScan:NoteUnkeyed(itemID, itemLink)
+    local seen = self.unkeyedSampleSeen
+    if not seen or #self.unkeyedSample >= UNKEYED_SAMPLE_SIZE then
+        return
+    end
+    local key = itemID or itemLink or "?"
+    if seen[key] then
+        return
+    end
+    seen[key] = true
+    self.unkeyedSample[#self.unkeyedSample + 1] = tostring(itemID) .. "=" .. tostring(itemLink)
+end
+
+function FullScan:AddWaiting(itemID, index)
+    local entry = self.waitItems[itemID]
+    if not entry then
+        entry = { rows = {}, tries = 0 }
+        self.waitItems[itemID] = entry
+        self.waitOrder[#self.waitOrder + 1] = itemID
+    end
+    entry.rows[#entry.rows + 1] = index
+    self.waitRowCount = self.waitRowCount + 1
+end
+
+-- Counts a finished row ("missing"/"unkeyed"/"ok"). Phase 2 only.
+function FullScan:HandleRowResult(index, result, itemID)
+    if result == "pending" then
+        if itemID then
+            self:AddWaiting(itemID, index)
+            return
+        end
+        result = "missing"
+    end
+    if result == "missing" then
+        self.waitStats.missingItem = self.waitStats.missingItem + 1
+    elseif result == "unkeyed" then
+        self.waitStats.noMarketKey = self.waitStats.noMarketKey + 1
+    end
 end
 
 function FullScan:ProcessChunk()
@@ -439,95 +656,183 @@ function FullScan:ProcessChunk()
         return
     end
 
+    local spent = NewFrameBudget()
     local total = self.status.rowsTotal or 0
+
+    -- Phase 2: the regular (0-based) indexes
     if (self.nextIndex or 0) < total then
         self.status.state = "processing"
-    else
-        self.status.state = "building"
-    end
-
-    -- Process the next chunk of regular (0-based) indexes
-    if (self.nextIndex or 0) < total then
-        local startIndex = self.nextIndex or 0
-        local stopIndex = math.min(startIndex + PROCESS_CHUNK_SIZE - 1, total - 1)
-        for index = startIndex, stopIndex do
-            local row = GetReplicateInfo(index)
-            local hasAllInfo = row and row.hasAllInfo
-            if hasAllInfo == false then
-                local itemID = row and tonumber(row.itemID or row.itemId or row.id)
-                if itemID and C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
-                    C_Item.RequestLoadItemDataByID(itemID)
-                end
-                self.deferredIndexes[#self.deferredIndexes + 1] = index
-            else
-                local itemLink = GetReplicateLink(index)
-                local memoKey = itemLink or ("itemID:" .. tostring(row and (row.itemID or row.itemId or row.id) or ""))
-                local identity = self.identityMemo and self.identityMemo[memoKey]
-                if identity == nil then
-                    identity = BuildIdentity(row, itemLink) or false
-                    if self.identityMemo and memoKey ~= "" then
-                        self.identityMemo[memoKey] = identity
-                    end
-                end
-                if identity == false then
-                    identity = nil
-                end
-                local _, bucketCreated = AddObservation(self.buckets, identity, row)
-                if bucketCreated then
-                    self.status.marketsBuilt = (tonumber(self.status.marketsBuilt) or 0) + 1
-                end
+        local index = self.nextIndex or 0
+        while index < total do
+            local result, itemID = self:ReadReplicateRow(index)
+            self:HandleRowResult(index, result, itemID)
+            index = index + 1
+            self.status.rowsProcessed = index
+            if spent() then
+                break
             end
-            self.status.rowsProcessed = index + 1
         end
-        self.nextIndex = stopIndex + 1
-        if self.nextIndex >= total then
+        self.nextIndex = index
+        if index >= total then
             self.status.state = "building"
+            self.timing.phase2End = Clock()
         end
         self:ScheduleNext("ProcessChunk")
         return
     end
 
-    -- All regular indexes done; retry deferred indexes
-    if #(self.deferredIndexes or {}) == 0 then
-        self:StartFinalizing()
+    self.status.state = "building"
+    self:ProcessPendingRows(spent)
+end
+
+-- Re-reads one window item's waiting rows. Returns true when the item
+-- leaves the window (all rows read, requeued, or given up).
+function FullScan:CheckWaitingItem(itemID, now)
+    local entry = self.waitItems[itemID]
+    local info = self.waitWindowInfo[itemID]
+    if not entry or not info then
+        self.waitWindowInfo[itemID] = nil
+        return true
+    end
+
+    local stats = self.waitStats
+    local remaining = {}
+    for _, index in ipairs(entry.rows) do
+        local result = self:ReadReplicateRow(index)
+        if result == "pending" then
+            remaining[#remaining + 1] = index
+        else
+            if result == "missing" then
+                stats.missingItem = stats.missingItem + 1
+            elseif result == "unkeyed" then
+                stats.noMarketKey = stats.noMarketKey + 1
+            end
+            self.waitRowCount = self.waitRowCount - 1
+            stats.readSinceLog = stats.readSinceLog + 1
+            self.waitLastProgressClock = now
+        end
+    end
+    entry.rows = remaining
+
+    if #remaining == 0 then
+        self.waitItems[itemID] = nil
+        self.waitWindowInfo[itemID] = nil
+        return true
+    end
+
+    if (now - info.enteredAt) >= WAIT_ITEM_SECONDS then
+        self.waitWindowInfo[itemID] = nil
+        entry.tries = entry.tries + 1
+        if entry.tries >= WAIT_ITEM_MAX_TRIES then
+            stats.gaveUpItems = stats.gaveUpItems + 1
+            stats.gaveUpRows = stats.gaveUpRows + #remaining
+            self.waitRowCount = self.waitRowCount - #remaining
+            self.waitItems[itemID] = nil
+        else
+            stats.requeued = stats.requeued + 1
+            self.waitOrder[#self.waitOrder + 1] = itemID
+        end
+        return true
+    end
+
+    if (now - info.lastRequest) >= WAIT_REREQUEST_SECONDS then
+        RequestItemLoad(itemID)
+        info.lastRequest = now
+    end
+    return false
+end
+
+function FullScan:FinishPending(reason)
+    local now = Clock()
+    local stats = self.waitStats
+    local timing = self.timing
+    timing.phase3End = now
+    timing.waitedRows = stats.rowsAtStart
+    timing.waitedItems = stats.itemsAtStart
+    timing.requeued = stats.requeued
+    timing.skippedWaiting = stats.gaveUpRows + (self.waitRowCount or 0)
+    timing.missingItem = stats.missingItem
+    timing.noMarketKey = stats.noMarketKey
+    PocketCFO:Debug("FullScan: phase 3 %s t=%.1fs requeued=%d gaveUpItems=%d gaveUpRows=%d leftWaiting=%d missingItem=%d noMarketKey=%d",
+        reason, now - (self.waitStartedClock or now), stats.requeued, stats.gaveUpItems, stats.gaveUpRows,
+        self.waitRowCount or 0, stats.missingItem, stats.noMarketKey)
+    if self.unkeyedSample and #self.unkeyedSample > 0 then
+        PocketCFO:Debug("FullScan: noMarketKey sample (itemID=link): %s", table.concat(self.unkeyedSample, " , "))
+    end
+    self.waitStartedClock = nil
+    self.waitLastProgressClock = nil
+    self.waitLastLogClock = nil
+    self:ClearPending()
+    self:StartFinalizing()
+end
+
+-- Phase 3: keep up to WAIT_WINDOW_ITEMS items in the window; check their
+-- rows every frame (within the frame budget) and read each row as soon as
+-- it's ready.
+function FullScan:ProcessPendingRows(spent)
+    local now = Clock()
+    local stats = self.waitStats
+    if not self.waitStartedClock then
+        self.waitStartedClock = now
+        self.waitLastProgressClock = now
+        self.waitLastLogClock = now
+        stats.rowsAtStart = self.waitRowCount
+        stats.itemsAtStart = #self.waitOrder
+        PocketCFO:Debug("FullScan: phase 3 waiting: %d rows across %d items (missingItem=%d noMarketKey=%d so far)",
+            stats.rowsAtStart, stats.itemsAtStart, stats.missingItem, stats.noMarketKey)
+    end
+
+    -- Limits first, every frame.
+    if self.waitRowCount <= 0 then
+        self:FinishPending("done")
+        return
+    end
+    if (now - self.waitStartedClock) >= WAIT_MAX_SECONDS then
+        self:FinishPending("stopped (time limit)")
+        return
+    end
+    if (now - self.waitLastProgressClock) >= WAIT_STALL_SECONDS then
+        self:FinishPending("stopped (no progress)")
         return
     end
 
-    local retry = self.deferredIndexes
-    self.deferredIndexes = {}
-    local stopAt = math.min(#retry, PROCESS_CHUNK_SIZE)
-    for i = 1, stopAt do
-        local index = retry[i]
-        local row = GetReplicateInfo(index)
-        local hasAllInfo = row and row.hasAllInfo
-        if hasAllInfo == false then
-            local itemID = row and tonumber(row.itemID or row.itemId or row.id)
-            if itemID and C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
-                C_Item.RequestLoadItemDataByID(itemID)
-            end
-            self.deferredIndexes[#self.deferredIndexes + 1] = index
-        else
-            local itemLink = GetReplicateLink(index)
-            local memoKey = itemLink or ("itemID:" .. tostring(row and (row.itemID or row.itemId or row.id) or ""))
-            local identity = self.identityMemo and self.identityMemo[memoKey]
-            if identity == nil then
-                identity = BuildIdentity(row, itemLink) or false
-                if self.identityMemo and memoKey ~= "" then
-                    self.identityMemo[memoKey] = identity
-                end
-            end
-            if identity == false then
-                identity = nil
-            end
-            local _, bucketCreated = AddObservation(self.buckets, identity, row)
-            if bucketCreated then
-                self.status.marketsBuilt = (tonumber(self.status.marketsBuilt) or 0) + 1
-            end
+    -- Fill the window from the queue.
+    local window = self.waitWindow
+    while #window < WAIT_WINDOW_ITEMS and self.waitCursor <= #self.waitOrder do
+        local itemID = self.waitOrder[self.waitCursor]
+        self.waitCursor = self.waitCursor + 1
+        if self.waitItems[itemID] and not self.waitWindowInfo[itemID] then
+            window[#window + 1] = itemID
+            self.waitWindowInfo[itemID] = { enteredAt = now, lastRequest = now }
+            RequestItemLoad(itemID)
         end
     end
-    -- Items beyond this chunk's capacity carry over to the next pass
-    for i = stopAt + 1, #retry do
-        self.deferredIndexes[#self.deferredIndexes + 1] = retry[i]
+
+    -- Check window items, rotating so none starve when the budget runs out.
+    local unvisited, visitedKept = {}, {}
+    local budgetOut = false
+    for _, itemID in ipairs(window) do
+        if budgetOut then
+            unvisited[#unvisited + 1] = itemID
+        else
+            if not self:CheckWaitingItem(itemID, now) then
+                visitedKept[#visitedKept + 1] = itemID
+            end
+            budgetOut = spent()
+        end
+    end
+    for _, itemID in ipairs(visitedKept) do
+        unvisited[#unvisited + 1] = itemID
+    end
+    self.waitWindow = unvisited
+
+    -- Timing, to tune the WAIT_* settings from real data.
+    if (now - self.waitLastLogClock) >= WAIT_LOG_SECONDS then
+        PocketCFO:Debug("FullScan: phase 3 t=%.1fs read=%d waitingRows=%d window=%d queued=%d requeued=%d gaveUpItems=%d",
+            now - self.waitStartedClock, stats.readSinceLog, self.waitRowCount, #self.waitWindow,
+            #self.waitOrder - self.waitCursor + 1, stats.requeued, stats.gaveUpItems)
+        self.waitLastLogClock = now
+        stats.readSinceLog = 0
     end
 
     self:ScheduleNext("ProcessChunk")
@@ -543,7 +848,8 @@ function FullScan:StartProcessingReplicateRows(rowCount)
     self.status.state = "processing"
     self:CancelWaitTimeout()
     self.nextIndex = 0
-    self.deferredIndexes = {}
+    self.timing.phase1End = Clock()
+    self:InitPending()
     if self.status.rowsTotal <= 0 then
         self:StartFinalizing()
         return
@@ -619,6 +925,10 @@ function FullScan:RequestReplicateScan(token)
     end
 
     local started = Now()
+    local cache = PocketCFO_Valuation:GetModule("PricingCache", true)
+    if cache and cache.SetLastRequestTime then
+        cache:SetLastRequestTime(started)
+    end
     self.status.startedAt = started
     self.status.startedClock = self.status.startedClock or Clock()
     self:StartWaitingForReplicateRows()
@@ -626,10 +936,11 @@ function FullScan:RequestReplicateScan(token)
 end
 
 function FullScan:GetCooldownRemaining()
-    local lastScan = PocketCFO_Valuation.db
-        and PocketCFO_Valuation.db.global
-        and tonumber(PocketCFO_Valuation.db.global.timeOfLastReplicateScan)
-        or nil
+    -- Counts from the last request (finished or not), like Blizzard's own
+    -- cooldown; falls back to the last finished scan for groups saved
+    -- before request times were recorded.
+    local cache = PocketCFO_Valuation:GetModule("PricingCache", true)
+    local lastScan = cache and (cache:GetLastRequestTime() or cache:GetLastScanTime()) or nil
     if not lastScan then
         return 0
     end
@@ -689,6 +1000,7 @@ function FullScan:StartFullScan()
     self.buckets = {}
     self.identityMemo = {}
     self.scanToken = {}
+    self.timing = { start = Clock() }
 
     self:UnregisterPassiveProbe()
     self:RegisterScanEvents()

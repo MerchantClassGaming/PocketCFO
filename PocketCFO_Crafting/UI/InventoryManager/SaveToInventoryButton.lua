@@ -73,7 +73,66 @@ local function CreateSaveButton()
         GameTooltip:Hide()
     end)
 
+    -- Recipe Analysis headline, one line just above the button. A child of
+    -- the button, so it shows/hides with it. Text set by SetHeadline.
+    local headlineText = saveButton:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    headlineText:SetPoint("BOTTOMLEFT", saveButton, "TOPLEFT", 2, 4)
+    headlineText:SetJustifyH("LEFT")
+    headlineText:SetWordWrap(false)
+    headlineText:Hide()
+    saveButton.headlineText = headlineText
+
     return saveButton
+end
+
+-- Same colors as RecipeAnalysisContent (COLOR_HEADER/POSITIVE/NEGATIVE/TEXT).
+local HEADLINE_LABEL_COLOR = "ffffd100"
+local HEADLINE_POSITIVE_COLOR = "ff66e666"
+local HEADLINE_NEGATIVE_COLOR = "ffff7373"
+local HEADLINE_NEUTRAL_COLOR = "ffffffff"
+
+-- Mirrors RecipeAnalysisContent: no numbers before the first price scan.
+local function NeedsFirstPriceScan()
+    local valuation = _G.PocketCFO_Valuation
+    if not valuation or not valuation.HasCompletedPriceScan then
+        return false
+    end
+    return not valuation:HasCompletedPriceScan()
+end
+
+--- Shows the Recipe Analysis headline (displayModel.headline) above the
+-- button, or hides it when headline is nil. Display only, no math.
+-- Called by CraftQueueController after every analysis evaluation.
+function SaveToInventoryButton:SetHeadline(headline)
+    local text = saveButton and saveButton.headlineText
+    if not text then return end
+
+    local content = PocketCFO_Crafting.RecipeAnalysisContent
+    if type(headline) ~= "table" or not content or not content.FormatSignedGoldSilver
+        or NeedsFirstPriceScan() then
+        text:SetText("")
+        text:Hide()
+        return
+    end
+
+    local value = tonumber(headline.value) or 0
+    local label, valueText, valueColor
+    if headline.barLabel then
+        label = headline.barLabel
+        valueText = content.FormatGoldSilver(value)
+        valueColor = HEADLINE_NEUTRAL_COLOR
+    elseif headline.style == "profit" then
+        label = "PocketCFO Profit/Loss:"
+        valueText = content.FormatSignedGoldSilver(value)
+        valueColor = value < 0 and HEADLINE_NEGATIVE_COLOR or HEADLINE_POSITIVE_COLOR
+    else
+        label = "PocketCFO Cost of Craft:"
+        valueText = content.FormatGoldSilver(value)
+        valueColor = HEADLINE_NEUTRAL_COLOR
+    end
+
+    text:SetText(string.format("|c%s%s|r |c%s%s|r", HEADLINE_LABEL_COLOR, label, valueColor, valueText))
+    text:Show()
 end
 
 local function IsGatheringProfessionContext(context)
@@ -194,6 +253,7 @@ function SaveToInventoryButton:ClearState()
     if not saveButton then return end
 
     SetSaveButtonShown(false)
+    self:SetHeadline(nil)
     saveButton:ClearAllPoints()
     saveButton:SetParent(UIParent)
     saveButton:SetFrameStrata(GetFrameStrataOrDefault(UIParent))

@@ -11,8 +11,8 @@ _G.PocketCFO_Valuation = PocketCFO_Valuation
 
 local DB_DEFAULTS = {
     global = {
-        pricingCache = {},
-        timeOfLastReplicateScan = nil,
+        -- Prices and last-scan time live per connected realm group in
+        -- global.realmGroups (see PricingCache.lua).
         vendorPriceObservations = {},
     },
 }
@@ -26,7 +26,6 @@ end
 
 function PocketCFO_Valuation:OnInitialize()
     self.db = LibStub("AceDB-3.0"):New("PocketCFO_ValuationDB", DB_DEFAULTS, true)
-    self.db.global.pricingCache = self.db.global.pricingCache or {}
     self.db.global.vendorPriceObservations = self.db.global.vendorPriceObservations or {}
     Debug("PocketCFO_Valuation initialized.")
 end
@@ -38,15 +37,16 @@ function PocketCFO_Valuation:OnDisable()
 end
 
 -- First-run guidance. Every value in the addon depends on at least one
--- finished full price scan. timeOfLastReplicateScan is only written when a
--- scan reaches the end of finalize (FullScan:ProcessFinalizeChunk), so a
--- failed or interrupted scan does not count.
+-- finished full price scan on this realm group. The last-scan time is only
+-- written when a scan reaches the end of finalize
+-- (FullScan:ProcessFinalizeChunk), so a failed or interrupted scan does not
+-- count.
 PocketCFO_Valuation.NO_SCAN_MESSAGE =
     "No prices yet. Open the Auction House, click the Pocket CFO tab, and press Scan Prices."
 
 function PocketCFO_Valuation:HasCompletedPriceScan()
-    local global = self.db and self.db.global
-    return (global and global.timeOfLastReplicateScan ~= nil) and true or false
+    local cache = self:GetModule("PricingCache", true)
+    return (cache and cache:GetLastScanTime() ~= nil) and true or false
 end
 
 function PocketCFO_Valuation:GetValue(itemLinkOrMarketKey)

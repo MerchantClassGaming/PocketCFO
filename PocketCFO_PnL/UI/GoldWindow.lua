@@ -6,6 +6,8 @@
 --   Income   - where gold came from, by period and character. Click a source
 --              to split it by profession and/or see its top items (AH sales).
 --              Bars per day show income over time.
+--   Gathering - value of what was gathered, by profession, plus recent
+--              gathering sessions (UI/GatheringTab.lua).
 -- Opened by core: /mcg gold -> GoldTracker:OpenWindow("balances").
 -- Numbers are built in full before anything is drawn (no partial redraws).
 
@@ -177,6 +179,7 @@ function GoldWindow:BuildWindow()
     local tabDefs = {
         { key = "balances", label = "Balances" },
         { key = "income",   label = "Income" },
+        { key = "gathering", label = "Gathering" },
     }
     if not IS_FOREVER then
         tabDefs[#tabDefs + 1] = { key = "orders", label = "Orders" }
@@ -201,6 +204,10 @@ function GoldWindow:BuildWindow()
     frame.incomePane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
     frame.incomePane:SetSize(INNER_WIDTH, 10)
 
+    frame.gatheringPane = CreateFrame("Frame", nil, frame)
+    frame.gatheringPane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
+    frame.gatheringPane:SetSize(INNER_WIDTH, 10)
+
     if not IS_FOREVER then
         frame.ordersPane = CreateFrame("Frame", nil, frame)
         frame.ordersPane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
@@ -214,6 +221,7 @@ function GoldWindow:BuildWindow()
     self.expanded = {}
 
     self:BuildIncomeControls()
+    self:BuildGatheringPane()
     if not IS_FOREVER then
         self:BuildOrdersPane()
     end
@@ -225,6 +233,8 @@ function GoldWindow:BuildWindow()
     self:RegisterMessage("MCG_GOLD_BALANCES_CHANGED", "OnDataChanged")
     self:RegisterMessage("MCG_GOLD_LEDGER_UPDATED", "OnDataChanged")
     self:RegisterMessage("MCG_ORDER_RESULTS_UPDATED", "OnDataChanged")
+    self:RegisterMessage("MCG_GATHERING_UPDATED", "OnDataChanged")
+    self:RegisterMessage("MCG_GATHERING_SESSION_CHANGED", "OnDataChanged")
 end
 
 function GoldWindow:OnDataChanged()
@@ -234,7 +244,7 @@ function GoldWindow:OnDataChanged()
 end
 
 function GoldWindow:ShowTab(tabKey)
-    if tabKey ~= "income" and (tabKey ~= "orders" or IS_FOREVER) then
+    if tabKey ~= "income" and tabKey ~= "gathering" and (tabKey ~= "orders" or IS_FOREVER) then
         tabKey = "balances"
     end
     self.activeTab = tabKey
@@ -267,6 +277,7 @@ function GoldWindow:Render()
         balances = self.frame.balancesPane,
         income = self.frame.incomePane,
         orders = self.frame.ordersPane,
+        gathering = self.frame.gatheringPane,
     }
     for key, pane in pairs(panes) do
         if key ~= self.activeTab then
@@ -278,6 +289,8 @@ function GoldWindow:Render()
         height = self:RenderIncome()
     elseif self.activeTab == "orders" then
         height = self:RenderOrders()
+    elseif self.activeTab == "gathering" then
+        height = self:RenderGathering()
     else
         height = self:RenderBalances()
     end

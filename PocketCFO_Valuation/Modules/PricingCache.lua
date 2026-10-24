@@ -8,19 +8,6 @@ local PricingCache = PocketCFO_Valuation:NewModule("PricingCache")
 
 local FRESH_SECONDS = 3 * 24 * 60 * 60
 
--- Temporary diagnostics for the "Prospecting Analysis needs-price delay"
--- investigation. Remove once the rerender-on-price-update fix is confirmed
--- working in-game.
-local function SessionLog(fmt, ...)
-    local core = _G.PocketCFO
-    if not core or not core.AppendSessionLog then return end
-    local msg = tostring(fmt or "")
-    if select("#", ...) > 0 then
-        msg = string.format(msg, ...)
-    end
-    core:AppendSessionLog("[MCG] " .. msg)
-end
-
 local function Now()
     if GetServerTime then
         return GetServerTime()
@@ -28,13 +15,81 @@ local function Now()
     return time()
 end
 
-local function GetCacheRoot()
+-- Prices are kept per connected realm group: realms that share one Auction
+-- House share one cache (Brian, 2026-10-24). Key = the connected realm names,
+-- sorted and joined ("Aggramar|Fizzcrank"). Confirmed in-game 2026-10-24:
+-- GetAutoCompleteRealms() on Aggramar returns { "Aggramar", "Fizzcrank" }.
+-- A realm with no connections falls back to GetNormalizedRealmName().
+-- Only worked out after login, and kept once known.
+local realmGroupKey
+
+local function GetRealmGroupKey()
+    if realmGroupKey then
+        return realmGroupKey
+    end
+    if IsLoggedIn and not IsLoggedIn() then
+        return nil
+    end
+
+    local names = {}
+    if GetAutoCompleteRealms then
+        local ok, realms = pcall(GetAutoCompleteRealms)
+        if ok and type(realms) == "table" then
+            for _, name in ipairs(realms) do
+                if type(name) == "string" and name ~= "" then
+                    names[#names + 1] = name
+                end
+            end
+        end
+    end
+    if #names == 0 then
+        local name = GetNormalizedRealmName and GetNormalizedRealmName()
+        if type(name) ~= "string" or name == "" then
+            return nil
+        end
+        names[1] = name
+    end
+
+    table.sort(names)
+    realmGroupKey = table.concat(names, "|")
+    return realmGroupKey
+end
+
+-- This realm group's saved data:
+--   { pricingCache = {}, timeOfLastReplicateScan = n, timeOfLastReplicateRequest = n }
+local function GetGroupStore()
     local db = PocketCFO_Valuation.db
     if not db or not db.global then
         return nil
     end
-    db.global.pricingCache = db.global.pricingCache or {}
-    return db.global.pricingCache
+    local key = GetRealmGroupKey()
+    if not key then
+        return nil
+    end
+
+    db.global.realmGroups = db.global.realmGroups or {}
+    local store = db.global.realmGroups[key]
+    if not store then
+        store = {}
+        -- One-time move (2026-10-24): the old account-wide cache (no realm
+        -- recorded) goes to whichever realm group is logged into first, so
+        -- players keep their prices without a rescan. Remove once testers
+        -- have updated.
+        if type(db.global.pricingCache) == "table" then
+            store.pricingCache = db.global.pricingCache
+            store.timeOfLastReplicateScan = db.global.timeOfLastReplicateScan
+            db.global.pricingCache = nil
+            db.global.timeOfLastReplicateScan = nil
+        end
+        db.global.realmGroups[key] = store
+    end
+    store.pricingCache = store.pricingCache or {}
+    return store
+end
+
+local function GetCacheRoot()
+    local store = GetGroupStore()
+    return store and store.pricingCache or nil
 end
 
 local function NormalizeValue(row)
@@ -52,6 +107,38 @@ function PricingCache:GetCache()
     return GetCacheRoot()
 end
 
+function PricingCache:GetRealmGroupKey()
+    return GetRealmGroupKey()
+end
+
+-- When this realm group last finished a full scan (server time), or nil.
+function PricingCache:GetLastScanTime()
+    local store = GetGroupStore()
+    return store and tonumber(store.timeOfLastReplicateScan) or nil
+end
+
+function PricingCache:SetLastScanTime(timestamp)
+    local store = GetGroupStore()
+    if store then
+        store.timeOfLastReplicateScan = tonumber(timestamp)
+    end
+end
+
+-- When this realm group last sent a full scan request (server time), or
+-- nil. Drives the 15-minute cooldown: Blizzard's own cooldown counts from
+-- the request, finished or not.
+function PricingCache:GetLastRequestTime()
+    local store = GetGroupStore()
+    return store and tonumber(store.timeOfLastReplicateRequest) or nil
+end
+
+function PricingCache:SetLastRequestTime(timestamp)
+    local store = GetGroupStore()
+    if store then
+        store.timeOfLastReplicateRequest = tonumber(timestamp)
+    end
+end
+
 -- Broadcast so any addon/module holding a stale "no price" result (e.g.
 -- Prospecting Analysis, evaluated before this market key ever had a price)
 -- can react and recompute instead of waiting for an unrelated trigger to
@@ -60,8 +147,6 @@ end
 -- to broadcast; consumers are expected to debounce their own reaction.
 local function BroadcastPricingUpdated(marketKey, itemID, source)
     PocketCFO_Valuation:SendMessage("PCFO_PRICING_UPDATED", marketKey, itemID, source)
-    SessionLog("PricingCache: price resolved marketKey=%s itemID=%s source=%s timestamp=%s",
-        tostring(marketKey), tostring(itemID), tostring(source), tostring(Now()))
 end
 
 function PricingCache:SetValue(marketKey, value, timestamp, source)

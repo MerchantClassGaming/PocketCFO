@@ -3,7 +3,7 @@
 ## Title: PocketCFO Crafting
 ## Notes: Crafting queue, recipe configuration, and inventory target evaluation - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.1.3
+## Version: v1.2.0
 ## SavedVariables: PocketCFO_Crafting_DB
 ## LoadOnDemand: 1
 

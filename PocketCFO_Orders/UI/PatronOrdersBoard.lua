@@ -42,16 +42,21 @@ local ORDER_RESULT_OK = (Enum and Enum.CraftingOrderResult and Enum.CraftingOrde
 local MAX_EXPANSION_BUTTONS = 3
 
 local HEADER_HEIGHT = 30
-local COLUMN_HEADER_HEIGHT = 18
+local COLUMN_HEADER_HEIGHT = 24 -- 18 -> 24 for the two-line "Conc Cost" header
 local ROW_HEIGHT = 22
 local SIDE_PAD = 10
 
 -- Column layout (x offset from row left, width). Name takes what is left.
-local COL_PROFIT_W = 110
+-- Concentration has its own column so profit (what you earn) and
+-- concentration (what you spend) are never read as one number (Brian,
+-- 2026-10-23). Its 50 + gap comes from profit (110 -> 100) and rewards
+-- (150 -> 100), so the name column keeps its width.
+local COL_PROFIT_W = 100
+local COL_CONC_W = 50
 local COL_KP_W = 60
 local COL_TIME_W = 70
 local COL_MATS_W = 60
-local COL_REWARDS_W = 150
+local COL_REWARDS_W = 100
 local COL_GAP = 10
 
 local COLOR_POSITIVE = { 0.40, 0.90, 0.40 }
@@ -227,6 +232,47 @@ end
 -- Data: one entry per patron order
 -- ---------------------------------------------------------------------------
 
+-- Your concentration right now. Read fresh on every draw/hover, never cached
+-- (it recharges). The currency ID comes from the game's own crafting answer
+-- (GetCraftingOperationInfo .concentrationCurrencyID). CONFIRMED 2026-10-23:
+-- C_CurrencyInfo.GetCurrencyInfo(3166) returns quantity and iconFileID for
+-- Jewelcrafting Concentration.
+local function GetConcentration(currencyID)
+    if not currencyID or not C_CurrencyInfo or type(C_CurrencyInfo.GetCurrencyInfo) ~= "function" then
+        return nil, nil
+    end
+    local ok, info = pcall(C_CurrencyInfo.GetCurrencyInfo, currencyID)
+    if not ok or type(info) ~= "table" then
+        return nil, nil
+    end
+    return tonumber(info.quantity), info.iconFileID
+end
+
+-- Conc column text: "<icon>257" when the chosen way uses concentration,
+-- blank when it needs none; red when you don't have that much right now.
+local function ConcentrationMarkup(entry)
+    local option = entry.chosenOption
+    local cost = option and tonumber(option.concentrationCost) or 0
+    if cost <= 0 then
+        return ""
+    end
+    local have, icon = GetConcentration(option.concentrationCurrencyID)
+    local text = icon and ("|T" .. tostring(icon) .. ":12:12|t" .. tostring(cost)) or tostring(cost)
+    if have and have < cost then
+        return "|cffff7373" .. text .. "|r"
+    end
+    return text
+end
+
+local function OptionLabel(option)
+    local label = option.key == "best" and "Best mats" or "Cheap mats"
+    local cost = tonumber(option.concentrationCost) or 0
+    if cost > 0 then
+        label = label .. " + " .. tostring(cost) .. " Concentration"
+    end
+    return label
+end
+
 local function ClassifyKnowledge(itemRewards)
     local registry = PocketCFO_Orders.KnowledgeRewardRegistry
     if not registry then
@@ -251,6 +297,17 @@ local function ClassifyKnowledge(itemRewards)
         return "KP"
     end
     return string.format("+%d KP", totalPoints)
+end
+
+-- The observation with one quality option's mats in place of the existing
+-- estimate, for EvaluateObservation. Shallow copy; the original is untouched.
+local function CopyWithCrafterRows(observation, crafterRows)
+    local copy = {}
+    for key, value in pairs(observation) do
+        copy[key] = value
+    end
+    copy.crafterProvidedReagents = crafterRows
+    return copy
 end
 
 local function BuildEntry(order)
@@ -303,6 +360,33 @@ local function BuildEntry(order)
     if not okEval or type(result) ~= "table" or result.resolved ~= true then
         entry.unresolvedReason = okEval and type(result) == "table" and result.unresolvedReason or "economicsFailed"
         return entry
+    end
+
+    -- Quality options (OrderObservationBuilder BuildQualityOptions): each way
+    -- of reaching the required quality - cheap or best mats, with
+    -- concentration when needed - is priced, and the best profit is shown;
+    -- a tie goes to the one using less concentration (Brian, 2026-10-23).
+    -- No options = the existing single estimate above stands.
+    entry.cannotReachQuality = observation.qualityUnreachable == true
+    if type(observation.qualityOptions) == "table" and #observation.qualityOptions > 0 then
+        local bestOption, bestResult, bestNet
+        entry.optionResults = {}
+        for _, option in ipairs(observation.qualityOptions) do
+            local optionObservation = CopyWithCrafterRows(observation, option.crafterProvidedReagents)
+            local okOption, optionResult = pcall(economicsService.EvaluateObservation, economicsService, optionObservation)
+            if okOption and type(optionResult) == "table" and optionResult.resolved == true then
+                local net = tonumber(optionResult.economics.estimatedNetValue)
+                entry.optionResults[#entry.optionResults + 1] = { option = option, net = net }
+                if net and (bestNet == nil or net > bestNet
+                    or (net == bestNet and (option.concentrationCost or 0) < (bestOption.concentrationCost or 0))) then
+                    bestOption, bestResult, bestNet = option, optionResult, net
+                end
+            end
+        end
+        if bestOption then
+            result = bestResult
+            entry.chosenOption = bestOption
+        end
     end
 
     local economics = result.economics
@@ -393,6 +477,9 @@ function PatronOrdersBoard:LayoutColumns(frame, isHeader)
     end
     Place(frame.mats, COL_MATS_W)
     Place(frame.time, COL_TIME_W)
+    -- Left to right: Order, Rewards, Profit, Knowledge (what you get), then
+    -- Conc Cost (what you spend), Time Left, Mats Given (Brian, 2026-10-23).
+    Place(frame.conc, COL_CONC_W)
     Place(frame.kp, COL_KP_W)
     Place(frame.profit, COL_PROFIT_W)
     Place(frame.rewards, COL_REWARDS_W)
@@ -450,6 +537,7 @@ function PatronOrdersBoard:BuildFrames(orderList)
     columns:SetHeight(COLUMN_HEADER_HEIGHT)
     columns.name = CreateText(columns, "GameFontNormalSmall")
     columns.profit = CreateText(columns, "GameFontNormalSmall", "RIGHT")
+    columns.conc = CreateText(columns, "GameFontNormalSmall", "CENTER")
     columns.kp = CreateText(columns, "GameFontNormalSmall", "CENTER")
     columns.time = CreateText(columns, "GameFontNormalSmall", "RIGHT")
     columns.mats = CreateText(columns, "GameFontNormalSmall", "CENTER")
@@ -457,10 +545,14 @@ function PatronOrdersBoard:BuildFrames(orderList)
     columns.rewards:SetText("Rewards")
     columns.name:SetText("Order")
     columns.profit:SetText("Est. Profit")
+    -- Two-line header so the column stays narrow. Theoretical: that the
+    -- explicit line break renders with word wrap on (CreateText turns it off).
+    columns.conc:SetWordWrap(true)
+    columns.conc:SetText("Conc\nCost")
     columns.kp:SetText("Knowledge")
     columns.time:SetText("Time Left")
     columns.mats:SetText("Mats Given")
-    for _, key in ipairs({ "name", "rewards", "profit", "kp", "time", "mats" }) do
+    for _, key in ipairs({ "name", "rewards", "profit", "conc", "kp", "time", "mats" }) do
         SetColor(columns[key], COLOR_HEADER)
     end
     overlay.columns = columns
@@ -524,6 +616,7 @@ function PatronOrdersBoard:GetRow(index)
 
     row.name = CreateText(row, "GameFontHighlight")
     row.profit = CreateText(row, "GameFontHighlight", "RIGHT")
+    row.conc = CreateText(row, "GameFontHighlightSmall", "CENTER")
     row.kp = CreateText(row, "GameFontHighlightSmall", "CENTER")
     row.time = CreateText(row, "GameFontHighlightSmall", "RIGHT")
     row.mats = CreateText(row, "GameFontHighlightSmall", "CENTER")
@@ -570,6 +663,11 @@ function PatronOrdersBoard:ShowRowTooltip(row)
     if entry.recipeKnown == false then
         GameTooltip:AddLine("You don't know this recipe on this character.", 1, 0.45, 0.45, true)
     end
+    if entry.cannotReachQuality then
+        GameTooltip:AddLine("Your skill can't reach the quality this order needs, even with concentration.", 1, 0.45, 0.45, true)
+        GameTooltip:Show()
+        return
+    end
     local economics = entry.economics
     if not economics then
         GameTooltip:AddLine("Couldn't estimate this order (" .. tostring(entry.unresolvedReason) .. ").", 1, 0.45, 0.45, true)
@@ -601,6 +699,26 @@ function PatronOrdersBoard:ShowRowTooltip(row)
     AddValueLine("Estimated Profit", entry.estimatedNet, true)
     if entry.hasUnvalued then
         GameTooltip:AddLine("* One of your mats has no price, so actual profit may be lower.", 0.7, 0.7, 0.7, true)
+    end
+    local chosen = entry.chosenOption
+    if chosen then
+        GameTooltip:AddLine("Made with: " .. OptionLabel(chosen), 1, 1, 1, true)
+        local cost = tonumber(chosen.concentrationCost) or 0
+        local have = cost > 0 and GetConcentration(chosen.concentrationCurrencyID) or nil
+        if have and have < cost then
+            GameTooltip:AddLine(string.format("You only have %d Concentration right now.", have), 1, 0.45, 0.45, true)
+        end
+        local shownOther = false
+        for _, optionResult in ipairs(entry.optionResults or {}) do
+            if optionResult.option ~= chosen then
+                if not shownOther then
+                    GameTooltip:AddLine(" ")
+                    GameTooltip:AddLine("Other way to make it:", 0.7, 0.7, 0.7)
+                    shownOther = true
+                end
+                AddValueLine(OptionLabel(optionResult.option), optionResult.net, true)
+            end
+        end
     end
     GameTooltip:AddLine("Estimate: your mats are priced at an estimated quality. Click the order for the exact number.", 0.7, 0.7, 0.7, true)
     GameTooltip:Show()
@@ -900,6 +1018,16 @@ function PatronOrdersBoard:NoteBoardChange()
     self.lastChangeAt = GetTime()
 end
 
+-- Resourcefulness % counts as settled only once it's a number above 0.
+-- Seen in-game (Brian, 2026-10-23, Silvermoon Spire Fountain): the first
+-- calculation got 0%, the cache kept it, and leaving the expansion and coming
+-- back showed 20%. Theoretical: that 0 means the skill line's data hadn't
+-- finished loading yet.
+local function ResourcefulnessSettled(entry)
+    local pct = tonumber(entry and entry.resourcefulnessPct)
+    return pct ~= nil and pct > 0
+end
+
 -- Everything the board would show for these entries, as one string, so a
 -- redraw can tell whether anything visible actually changed.
 local function BoardSignature(entries)
@@ -910,6 +1038,10 @@ local function BoardSignature(entries)
             tostring(entry.estimatedNet),
             tostring(entry.hasUnvalued),
             tostring(entry.recipeKnown),
+            tostring(entry.resourcefulnessPct),
+            tostring(entry.cannotReachQuality),
+            tostring(entry.chosenOption and entry.chosenOption.key),
+            tostring(entry.chosenOption and entry.chosenOption.concentrationCost),
             tostring(ItemName(entry.itemID) ~= nil),
         }, ":")
     end
@@ -1046,7 +1178,9 @@ function PatronOrdersBoard:GetEntry(order)
     end
     local entry = BuildEntry(order)
     entry.fingerprint = fingerprint
-    if orderID and entry.economics then
+    -- Not cached until Resourcefulness % has settled, so a 0% first read
+    -- gets recalculated on the next redraw (see ResourcefulnessSettled).
+    if orderID and entry.economics and ResourcefulnessSettled(entry) then
         self.entryCache[orderID] = entry
     end
     return entry
@@ -1159,9 +1293,12 @@ function PatronOrdersBoard:Refresh(forcedOrderType)
     self:PruneEntryCache(patronOrders)
     table.sort(entries, function(a, b)
         -- Orders you can't craft go to the bottom whatever they'd pay -
-        -- you can't complete them (Brian, 2026-10-16).
-        if a.recipeKnown ~= b.recipeKnown then
-            return a.recipeKnown == true
+        -- you can't complete them (Brian, 2026-10-16). Same for orders
+        -- whose required quality you can't reach (Brian, 2026-10-23).
+        local aCanMake = a.recipeKnown == true and not a.cannotReachQuality
+        local bCanMake = b.recipeKnown == true and not b.cannotReachQuality
+        if aCanMake ~= bCanMake then
+            return aCanMake
         end
         local av, bv = a.estimatedNet, b.estimatedNet
         if av ~= nil and bv ~= nil then
@@ -1263,15 +1400,22 @@ function PatronOrdersBoard:RenderEntries(entries, scheduleFollowUps)
         row.name:SetText((ItemName(entry.itemID) or ("Item " .. tostring(entry.itemID)))
             .. (qualityMarkup and (" " .. qualityMarkup) or ""))
         row.rewards:SetText(RewardIconsMarkup(entry.rewardIcons))
-        SetColor(row.name, entry.recipeKnown == false and COLOR_NEGATIVE or COLOR_TEXT)
+        SetColor(row.name, (entry.recipeKnown == false or entry.cannotReachQuality) and COLOR_NEGATIVE or COLOR_TEXT)
 
-        if entry.estimatedNet ~= nil then
+        if entry.cannotReachQuality then
+            -- Same treatment as an unknown recipe: red name, no profit
+            -- (Brian, 2026-10-23). Full reason is in the tooltip.
+            row.profit:SetText("Can't make")
+            SetColor(row.profit, COLOR_NEGATIVE)
+        elseif entry.estimatedNet ~= nil then
             row.profit:SetText(FormatGold(entry.estimatedNet, true) .. (entry.hasUnvalued and "*" or ""))
             SetColor(row.profit, entry.estimatedNet < 0 and COLOR_NEGATIVE or COLOR_POSITIVE)
         else
             row.profit:SetText("?")
             SetColor(row.profit, COLOR_MUTED)
         end
+
+        row.conc:SetText(entry.cannotReachQuality and "" or ConcentrationMarkup(entry))
 
         row.kp:SetText(entry.knowledge or "")
         SetColor(row.kp, COLOR_KP)
@@ -1328,6 +1472,11 @@ function PatronOrdersBoard:ScheduleUnpricedRecheck(entries)
     local unpriced = {}
     local recheckOrderIDs = {}
     for _, entry in ipairs(entries or {}) do
+        -- Same bounded recheck for a Resourcefulness % that hasn't settled.
+        if entry.economics and entry.orderID and not ResourcefulnessSettled(entry) then
+            recheckOrderIDs[entry.orderID] = true
+            unpriced[#unpriced + 1] = string.format("rf(%s)=%s", tostring(entry.orderID), tostring(entry.resourcefulnessPct))
+        end
         local economics = entry.economics or {}
         for _, rows in ipairs({ economics.crafterMaterialRows, economics.finishingReagentRows }) do
             for _, row in ipairs(type(rows) == "table" and rows or {}) do

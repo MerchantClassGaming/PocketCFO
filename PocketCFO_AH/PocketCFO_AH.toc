@@ -2,7 +2,7 @@
 ## Title: PocketCFO AH
 ## Notes: Auction House scanner and listing reconciler - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.1.3
+## Version: v1.2.0
 ## SavedVariables: PocketCFO_AH_DB
 ## LoadOnDemand: 1
 ## LoadWith: Blizzard_AuctionHouseUI
