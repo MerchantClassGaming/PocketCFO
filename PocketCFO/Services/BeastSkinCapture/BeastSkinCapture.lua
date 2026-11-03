@@ -24,6 +24,17 @@
 -- A plain event frame is used instead of AceEvent because CraftSim's bundled
 -- AceEvent can dispatch PocketCFO callbacks with shifted arguments.
 --
+-- Loot reading (migrated to the loot reader 2026-10-30, claude/
+-- Ledger_Rebuild_Checklist.md item 7): this module no longer reads loot
+-- windows. It handles MCG_LOOT_WINDOW from LootReader: a window is a skin
+-- window when its attached cast is Skinning (the loot reader attaches a cast
+-- to the first window after it only; before the migration a second window
+-- within 3s of a skin cast also counted as a skin, which was drift). Beast
+-- slots = slots with a Creature / Vehicle source whose npcID is a great beast;
+-- base, received and source count from the record, same rules as before.
+-- Kept here (not loot): the cast-start snapshot (buffs, Finesse /
+-- Perception) and lure use.
+--
 -- Rules (decided with Brian 2026-10-16):
 --   - Only the beast's own corpse counts. Nearby trash mobs are ignored.
 --   - Kill loot counts toward the return, but is only saved together with
@@ -70,8 +81,6 @@ local AVERAGE_WINDOW = 100
 -- Averages below this are dropped so items that stop dropping (e.g. T1 once
 -- a skinner gets T2) don't sit in the row forever.
 local AVERAGE_FLOOR = 0.0005
--- Observed 0.0-0.1s between the Skinning cast and its loot window.
-local SKIN_CAST_TO_LOOT_SECONDS = 3
 local POOR_QUALITY = 0
 
 local RECIPE_LEATHER = 1225901 -- Void-Tempered Leather (gathering recipe)
@@ -87,11 +96,39 @@ local BEASTS = {
 }
 
 local eventFrame = CreateFrame("Frame")
+local messenger = LibStub and LibStub("AceEvent-3.0", true) and LibStub("AceEvent-3.0"):Embed({}) or nil
+
+-- Lure use (2026-10-27): using a lure casts the lure item's spell. The spell
+-- ID is read from the item (C_Item.GetItemSpell) rather than hard-coded.
+-- Theoretical until a lure run confirms it: each match writes a session log
+-- line ("lure use seen").
+local lureSpellToItem = {}   -- [spellID] = lureItemID
+local lureSpellsResolved = false
+
+local function ResolveLureSpells()
+    if lureSpellsResolved then
+        return
+    end
+    local getItemSpell = (C_Item and C_Item.GetItemSpell) or GetItemSpell
+    if not getItemSpell then
+        return
+    end
+    local missing = false
+    for _, beast in pairs(BEASTS) do
+        local ok, _, spellID = pcall(getItemSpell, beast.lureItemID)
+        spellID = ok and tonumber(spellID) or nil
+        if spellID then
+            lureSpellToItem[spellID] = beast.lureItemID
+        else
+            -- Item not cached yet: ask again on the next cast.
+            missing = true
+        end
+    end
+    lureSpellsResolved = not missing
+end
 
 -- Session state (not saved).
-local lastSkinCastAt = nil
 local skinCastSnapshot = nil   -- { at, buffs, stats = { [recipeID] = {...} } }
-local currentWindow = nil      -- { isSkin, slots, locked } latest reading of the open window
 local pendingKill = {}         -- [corpseGUID] = { [itemID] = qty }
 local seenKillWindow = {}      -- [corpseGUID] = true
 local seenSkinWindow = {}      -- [corpseGUID] = true
@@ -108,24 +145,6 @@ local function Debug(msg, ...)
     if PocketCFO.Debug then
         PocketCFO:Debug("BeastSkinCapture: " .. tostring(msg), ...)
     end
-end
-
-local function NpcIDFromGUID(guid)
-    if type(guid) ~= "string" then
-        return nil
-    end
-    local ok, unitType, _, _, _, _, npcID = pcall(strsplit, "-", guid)
-    if not ok or (unitType ~= "Creature" and unitType ~= "Vehicle") then
-        return nil
-    end
-    return tonumber(npcID)
-end
-
-local function ItemIDFromLink(link)
-    if type(link) ~= "string" then
-        return nil
-    end
-    return tonumber(link:match("item:(%d+)"))
 end
 
 local function CaptureDB()
@@ -273,41 +292,28 @@ end
 -- Loot window reading
 -- ---------------------------------------------------------------------------
 
--- Returns slots that have at least one beast corpse as a source:
+-- Beast slots of a loot reader window record: slots with at least one beast
+-- corpse as a source:
 -- { itemID, quantity, quality, beastSources = { { guid, npcID, qty } }, sourceCount }
-local function ReadLootWindow()
+local function BeastSlots(window)
     local slots = {}
-    local okCount, numItems = pcall(GetNumLootItems)
-    numItems = okCount and tonumber(numItems) or 0
-
-    for slot = 1, numItems do
-        local okLink, link = pcall(GetLootSlotLink, slot)
-        local itemID = okLink and ItemIDFromLink(link) or nil
-        if itemID then
-            local okInfo, _, _, quantity, _, quality = pcall(GetLootSlotInfo, slot)
-            local sources = { pcall(GetLootSourceInfo, slot) }
-            if okInfo and sources[1] then
-                local beastSources = {}
-                local sourceCount = 0
-                local i = 2
-                while i <= #sources do
-                    local guid, qty = sources[i], tonumber(sources[i + 1])
-                    sourceCount = sourceCount + 1
-                    local npcID = NpcIDFromGUID(guid)
-                    if npcID and BEASTS[npcID] then
-                        beastSources[#beastSources + 1] = { guid = guid, npcID = npcID, qty = qty or 0 }
-                    end
-                    i = i + 2
+    for _, slot in ipairs(window.slots or {}) do
+        if slot.itemID then
+            local beastSources = {}
+            local sources = slot.sources or {}
+            for _, source in ipairs(sources) do
+                if (source.type == "Creature" or source.type == "Vehicle") and source.id and BEASTS[source.id] then
+                    beastSources[#beastSources + 1] = { guid = source.guid, npcID = source.id, qty = tonumber(source.qty) or 0 }
                 end
-                if #beastSources > 0 then
-                    slots[#slots + 1] = {
-                        itemID = itemID,
-                        quantity = tonumber(quantity) or 0,
-                        quality = tonumber(quality),
-                        beastSources = beastSources,
-                        sourceCount = sourceCount,
-                    }
-                end
+            end
+            if #beastSources > 0 then
+                slots[#slots + 1] = {
+                    itemID = slot.itemID,
+                    quantity = tonumber(slot.quantity) or 0,
+                    quality = tonumber(slot.quality),
+                    beastSources = beastSources,
+                    sourceCount = #sources,
+                }
             end
         end
     end
@@ -424,6 +430,13 @@ local function CommitSkin(guid, corpse)
     }
     local beast = ApplyRecord(characterEntry, corpse.npcID, record)
 
+    -- Gold per Hour: adds this beast's kill loot (and, until lure use has been
+    -- seen, the lure) to the beast run (ActivityRuns, 2026-10-26 / 10-27).
+    local activityRuns = PocketCFO:GetModule("ActivityRuns", true)
+    if activityRuns then
+        activityRuns:AddBeastExtras(corpse.npcID, kill, beastInfo.lureItemID)
+    end
+
     Debug("skin of %s saved (skins=%d)", beastInfo.name, beast.skins)
 end
 
@@ -436,14 +449,16 @@ local function HandleSkinWindow(corpses)
     end
 end
 
-local function OnLootClosed()
-    local window = currentWindow
-    currentWindow = nil
-    if not window or #window.slots == 0 then
+function BeastSkinCapture:OnLootWindow(window)
+    if type(window) ~= "table" then
         return
     end
-    local corpses = GroupByCorpse(window.slots)
-    if window.isSkin then
+    local slots = BeastSlots(window)
+    if #slots == 0 then
+        return
+    end
+    local corpses = GroupByCorpse(slots)
+    if window.cast and window.cast.spellID == SKINNING_SPELL_ID then
         HandleSkinWindow(corpses)
     else
         HandleKillWindow(corpses)
@@ -455,40 +470,35 @@ end
 -- ---------------------------------------------------------------------------
 
 eventFrame:SetScript("OnEvent", function(_, event, ...)
-    if event == "LOOT_READY" or event == "LOOT_OPENED" then
-        if not currentWindow then
-            local isSkin = lastSkinCastAt ~= nil and (GetTime() - lastSkinCastAt) <= SKIN_CAST_TO_LOOT_SECONDS
-            currentWindow = { isSkin = isSkin, slots = {} }
-        end
-        -- Keep the latest reading; area loot can fill in across events.
-        -- Stop re-reading once items start leaving the window.
-        if not currentWindow.locked then
-            currentWindow.slots = ReadLootWindow()
-        end
-    elseif event == "LOOT_SLOT_CLEARED" then
-        if currentWindow then
-            currentWindow.locked = true
-        end
-    elseif event == "LOOT_CLOSED" then
-        OnLootClosed()
-    elseif event == "UNIT_SPELLCAST_START" then
+    if event == "UNIT_SPELLCAST_START" then
         local unit, _, spellID = ...
         if unit == "player" and spellID == SKINNING_SPELL_ID then
             SnapshotAtSkinCastStart()
         end
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local unit, _, spellID = ...
-        if unit == "player" and spellID == SKINNING_SPELL_ID then
-            lastSkinCastAt = GetTime()
+        if unit == "player" and spellID and spellID ~= SKINNING_SPELL_ID then
+            ResolveLureSpells()
+            local lureItemID = lureSpellToItem[spellID]
+            if lureItemID then
+                PocketCFO:AppendSessionLog(string.format(
+                    "[MCG] BeastSkinCapture: lure use seen spellID=%d lure=%d", spellID, lureItemID))
+                local activityRuns = PocketCFO:GetModule("ActivityRuns", true)
+                if activityRuns and activityRuns.AddLureUse then
+                    activityRuns:AddLureUse(lureItemID)
+                end
+            end
         end
     end
 end)
 
+if messenger then
+    messenger:RegisterMessage("MCG_LOOT_WINDOW", function(_, window)
+        BeastSkinCapture:OnLootWindow(window)
+    end)
+end
+
 function BeastSkinCapture:OnEnable()
-    eventFrame:RegisterEvent("LOOT_READY")
-    eventFrame:RegisterEvent("LOOT_OPENED")
-    eventFrame:RegisterEvent("LOOT_SLOT_CLEARED")
-    eventFrame:RegisterEvent("LOOT_CLOSED")
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_START", "player")
     eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 end

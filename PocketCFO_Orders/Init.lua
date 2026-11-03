@@ -1,5 +1,5 @@
 -- PocketCFO_Orders/Init.lua
--- Sibling addon for order tracking, bag opens, knowledge points, and Moxie.
+-- Sibling addon for order tracking, knowledge points, and Moxie.
 
 local ADDON_NAME, _ = ...
 local PocketCFO = _G.PocketCFO
@@ -10,16 +10,17 @@ _G.PocketCFO_Orders = PocketCFO_Orders
 local DB_DEFAULTS = {
     global = {
         orders          = {},
-        bagOpens        = {},
-        bagOpensAggregated = { bags = 0 },  -- aggregated totals: bags count + itemID totals
-        knowledgePoints = {},
-        moxieEvents     = {},
         orderResults    = { days = {} },  -- OrdersLedger: daily totals of completed orders
     },
 }
 
 function PocketCFO_Orders:OnInitialize()
     self.db = LibStub("AceDB-3.0"):New("PocketCFO_Orders_DB", DB_DEFAULTS, true)
+    -- BagOpens.lua was retired 2026-10-30 (container openings now come from
+    -- core LootReader). Clears its saved data; delete these lines in a later
+    -- release.
+    self.db.global.bagOpens = nil
+    self.db.global.bagOpensAggregated = nil
 end
 
 function PocketCFO_Orders:OnEnable()

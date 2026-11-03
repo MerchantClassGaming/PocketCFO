@@ -8,9 +8,9 @@
 ## X-Curse-Project-ID: 1575653
 ## X-Wago-ID: 4N2k0W6L
 ## X-WoWI-ID: 27267
-## Version: v1.2.0
+## Version: v1.2.1
 ## Category-enUS: Auctions
-## IconTexture: Interface\Icons\INV_Misc_Coin_01
+## IconTexture: Interface\AddOns\PocketCFO\Media\PocketCFO_Icon.tga
 ## AddonCompartmentFunc: PocketCFO_OnAddonCompartmentClick
 ## AddonCompartmentFuncOnEnter: PocketCFO_OnAddonCompartmentEnter
 ## AddonCompartmentFuncOnLeave: PocketCFO_OnAddonCompartmentLeave
@@ -26,6 +26,8 @@ Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
 Libs\AceAddon-3.0\AceAddon-3.0.lua
 Libs\AceEvent-3.0\AceEvent-3.0.lua
 Libs\AceDB-3.0\AceDB-3.0.lua
+Libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
+Libs\LibDBIcon-1.0\LibDBIcon-1.0.lua
 
 ## Core
 Core.lua
@@ -52,6 +54,9 @@ Services\ItemIdentityService\AuctionPathResolver.lua
 Services\ItemIdentityService\IdentityAdapters.lua
 Services\ItemIdentityService\ItemIdentityService.lua
 Services\ReagentSlotService\ReagentSlotService.lua
+Services\LootMessages\LootMessages.lua
+Services\ItemLedger\ItemLedger.lua
+Services\LootReader\LootReader.lua
 Services\ContainerOutcomeService\ContainerOutcomeSeedData.lua
 Services\ContainerOutcomeService\ContainerOutcomeService.lua
 Services\OperationDefinitionService\OperationDefinitionService.lua
@@ -70,7 +75,11 @@ Services\InventoryStateService\CraftInventoryAdapter.lua
 Services\InventoryFilterService\InventoryFilterService.lua
 Services\AuctionListingStateService\AuctionListingStateService.lua
 Services\BeastSkinCapture\BeastSkinCapture.lua
+Services\ActivityRuns\ActivityRuns.lua
 Services\GatheringCapture\GatheringCapture.lua
+Services\DisenchantCapture\DisenchantCapture.lua
+Services\ActivitySessions\ActivitySessions.lua
+Services\ActivityControl\ActivityControl.lua
 
 ## Reconciliation
 Reconciliation\AHMailboxReconciler.lua
@@ -82,4 +91,5 @@ Scanners\MailboxScanner.lua
 
 ## lazy-load coordinator
 Infrastructure\AddonLoader.lua
+Infrastructure\MinimapButton.lua
 

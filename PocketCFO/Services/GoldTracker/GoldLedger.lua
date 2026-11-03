@@ -4,9 +4,10 @@
 -- change in gold; anything not recognized lands in "other".
 -- Design: project doc claude/Gold_Sources_Design.md
 --
--- Storage: PocketCFO_DB.global.goldLedger.days[dayKey][characterGUID][category][professionKey]
---   = { income = copper, spend = copper, count = n,
---       items = { [itemName] = { copper, quantity } } }   -- items: AH and vendor sales
+-- Storage: the Item Ledger (2026-10-30, see "Storage" below): one gold entry
+-- per change with category, profession, item detail (name + quantity for AH
+-- and vendor sales, purchases, training, deposits) and the earned time.
+-- (Until 2026-10-30: goldLedger.days[dayKey][characterGUID][category][professionKey].)
 -- AH and vendor sales are credited to a profession by item (see ProfessionForItem).
 -- AH sales are dated to the day they sold (mail is held 30 days from the
 -- sale), not the day the gold was collected.
@@ -25,13 +26,35 @@
 --   3b. Gold gained within MAIL_MATCH_AFTER_CLOSE of a mailbox visit is also
 --      matched against the waiting list (mail gold can arrive late).
 --   4. Then a window rule: gold IN only by merchant or trade (the only ways
---      gold goes up there); gold OUT by merchant, trade, AH or mail.
+--      gold goes up there); gold OUT by trainer, flight master, merchant
+--      (repair mode first), AH, mail, trade, bank / barber / transmog, guild bank.
 --   5. Otherwise "other" (shown as Unknown) and logged in goldLedger.unknownLog
 --      (/mcg goldunknown) so each gap can be found and given a real rule.
 -- Rule: a category is only assigned for a specific reason, never as a guess.
 --
 -- Sends AceEvent message "MCG_GOLD_LEDGER_UPDATED" after each batch is saved.
--- The Income view in PocketCFO_PnL reads GetDays().
+-- Storage (2026-10-30, claude/Ledger_Rebuild_Checklist.md item 8): every
+-- recorded change is written into the Item Ledger as kind "gold" (category,
+-- profession, item detail, sale date); the Income and Spending views read it
+-- from there. The old goldLedger.days history is moved into the ledger once
+-- (MoveDaysToItemLedger) and deleted when the totals match. goldLedger keeps
+-- only its matching state: mail waiting list, mail log, unknown log.
+-- Container gold: claimed from LootReader's MCG_CONTAINER_CLICK (one
+-- container detector); the bag hook here is only for vendor sales.
+--
+-- Spending detail (2026-10-27, Flavor: Both). Claims made at the moment of the
+-- action, so the gold drop that follows is tagged with what was bought:
+--   - BuyMerchantItem / BuybackItem: vendor purchases, item + quantity.
+--   - RepairAllItems: repair cost read before the click (cached on merchant
+--     open/update and durability change). Single-item repairs: merchant open +
+--     InRepairMode() at the gold change.
+--   - BuyTrainerService: training, service name as the item.
+--   - C_AuctionHouse.PlaceBid / ConfirmCommoditiesPurchase: AH purchases.
+--   - C_AuctionHouse.PostItem / PostCommodity: AH deposits.
+--   - Flight paths, bank slots, barber, transmog, guild bank: window rules.
+--   Claims marked "loose" carry an expected amount but also match by
+--   direction, so a rounding difference never loses the item detail.
+--   All Theoretical until seen in-game; each claim writes a session log line.
 --
 -- Theoretical until seen in-game (verify via the session log with /mcg debug on):
 --   - hooksecurefunc on C_CraftingOrders.FulfillOrder fires on order completion
@@ -45,10 +68,11 @@ local PocketCFO = _G.PocketCFO
 
 local GoldLedger = PocketCFO:NewModule("GoldLedger", "AceEvent-3.0")
 
--- Forever: "You loot X" (CHAT_MSG_MONEY) arrived ~1.0s after PLAYER_MONEY on
--- the beta (event capture 2026-10-20), so 0.5s filed looted gold as Unknown.
--- Retail keeps 0.5. PocketCFO.flavor is set by Flavor_Forever.lua (Forever TOC only).
-local FLUSH_DELAY = (PocketCFO.flavor == "forever") and 2 or 0.5
+-- "You loot X" (CHAT_MSG_MONEY) arrives after PLAYER_MONEY: ~1.0s on the
+-- Forever beta (event capture 2026-10-20) and 0.93s on retail (event capture
+-- 2026-10-27), so a 0.5s wait filed looted coin as Unknown. Both flavors wait
+-- 2s (retail changed from 0.5 on 2026-10-27).
+local FLUSH_DELAY = 2
 local CLAIM_TTL = 5
 local ORDER_CLAIM_TTL = 10
 local WINDOW_GRACE = 2
@@ -70,13 +94,24 @@ local INCOME_WINDOW_CATEGORY = {
     { window = "merchant", category = "vendor" },
     { window = "trade",    category = "trade" },
 }
+-- Order matters: the first open window wins. Repair mode at a merchant is
+-- checked before these (see Classify).
 local SPEND_WINDOW_CATEGORY = {
-    { window = "merchant", category = "vendor" },
-    { window = "trade",    category = "trade" },
-    { window = "auction",  category = "auction" },
-    { window = "mail",     category = "mail" },
+    { window = "trainer",   category = "training" },
+    { window = "taxi",      category = "flight" },
+    { window = "merchant",  category = "vendor" },
+    -- AH spending no hook explained counts as a purchase and is logged to
+    -- /mcg goldunknown (2026-11-01). "auction" is AH sales only.
+    { window = "auction",   category = "auction_buy" },
+    { window = "mail",      category = "mail" },
+    { window = "trade",     category = "trade" },
+    { window = "guildbank", category = "guild_bank" },
+    { window = "bank",      category = "services" },
+    { window = "barber",    category = "services" },
+    { window = "transmog",  category = "services" },
 }
-local TRACKED_WINDOWS = { "merchant", "trade", "auction", "mail", "bank" }
+local TRACKED_WINDOWS = { "merchant", "trade", "auction", "mail", "bank",
+    "trainer", "taxi", "guildbank", "barber", "transmog" }
 
 local WINDOW_EVENTS = {
     MERCHANT_SHOW       = { "merchant", true },
@@ -91,6 +126,24 @@ local WINDOW_EVENTS = {
     BANKFRAME_CLOSED    = { "bank", false },
 }
 
+-- Window events added for spending (2026-10-27). Registered inside pcall: an
+-- event a flavor doesn't have must not stop the rest from registering.
+local OPTIONAL_WINDOW_EVENTS = {
+    TRAINER_SHOW          = { "trainer", true },
+    TRAINER_CLOSED        = { "trainer", false },
+    TAXIMAP_OPENED        = { "taxi", true },
+    TAXIMAP_CLOSED        = { "taxi", false },
+    GUILDBANKFRAME_OPENED = { "guildbank", true },
+    GUILDBANKFRAME_CLOSED = { "guildbank", false },
+    BARBER_SHOP_OPEN      = { "barber", true },
+    BARBER_SHOP_CLOSE     = { "barber", false },
+    TRANSMOGRIFY_OPEN     = { "transmog", true },
+    TRANSMOGRIFY_CLOSE    = { "transmog", false },
+}
+
+local LOOSE_CLAIM_TTL = 5
+local AH_BUY_CLAIM_TTL = 10
+
 -- Interaction types (PLAYER_INTERACTION_MANAGER_FRAME_SHOW/HIDE arg1).
 -- MailInfo = 17 confirmed in-game 2026-10-19. Merchant / Auctioneer / Banker
 -- are read from Enum.PlayerInteractionType (Theoretical until seen).
@@ -102,6 +155,13 @@ do
     if types.Auctioneer then INTERACTION_WINDOWS[types.Auctioneer] = "auction" end
     if types.Banker then INTERACTION_WINDOWS[types.Banker] = "bank" end
     if types.AccountBanker then INTERACTION_WINDOWS[types.AccountBanker] = "bank" end
+    -- Spending windows (2026-10-27). Read by name only; a type a flavor
+    -- doesn't have is simply absent. Theoretical until seen.
+    if types.Trainer then INTERACTION_WINDOWS[types.Trainer] = "trainer" end
+    if types.TaxiNode then INTERACTION_WINDOWS[types.TaxiNode] = "taxi" end
+    if types.GuildBanker then INTERACTION_WINDOWS[types.GuildBanker] = "guildbank" end
+    if types.Barber then INTERACTION_WINDOWS[types.Barber] = "barber" end
+    if types.Transmogrifier then INTERACTION_WINDOWS[types.Transmogrifier] = "transmog" end
 end
 
 local MAIL_MATCH_AFTER_CLOSE = 300  -- seconds after a mailbox visit that late mail gold still matches
@@ -129,7 +189,6 @@ local function LedgerDB()
         return nil
     end
     globalDB.goldLedger = globalDB.goldLedger or {}
-    globalDB.goldLedger.days = globalDB.goldLedger.days or {}
     return globalDB.goldLedger
 end
 
@@ -152,20 +211,11 @@ local function StripRealm(name)
     return (string.match(tostring(name), "^([^%-]+)")) or tostring(name)
 end
 
--- True when the name matches one of this account's characters known to GoldTracker.
+-- True when the name is one of this account's characters (the one check,
+-- in ItemLedger since 2026-10-30).
 local function IsOwnCharacter(name)
-    local bare = StripRealm(name)
-    local goldDB = PocketCFO.db and PocketCFO.db.global and PocketCFO.db.global.gold
-    if not bare or not goldDB or not goldDB.characters then
-        return false
-    end
-    bare = string.lower(bare)
-    for _, entry in pairs(goldDB.characters) do
-        if entry.name and string.lower(tostring(entry.name)) == bare then
-            return true
-        end
-    end
-    return false
+    local itemLedger = PocketCFO.ItemLedger
+    return itemLedger ~= nil and itemLedger:IsOwnCharacter(name) or false
 end
 
 -- Gathered mats by trade goods subclass -> gathering profession.
@@ -260,10 +310,13 @@ end
 -- character) and loot messages do not close it.
 -- Theoretical: whether taking mail gold also fires CHAT_MSG_MONEY; loot is
 -- excluded until confirmed so it can never end a real mailbox session.
+-- Loot-money, container and quest claims never end a mailbox session.
+local KEEPS_MAILBOX_OPEN = { looted = true, quest = true }
+
 function GoldLedger:AddClaim(claim)
     claim.expiresAt = GetTime() + (claim.ttl or CLAIM_TTL)
     self.claims[#self.claims + 1] = claim
-    if not claim.atMailbox and claim.category ~= "loot_quest" then
+    if not claim.atMailbox and not KEEPS_MAILBOX_OPEN[claim.category] then
         self:LeaveMailbox("evidence:" .. tostring(claim.category))
     end
 end
@@ -291,7 +344,7 @@ function GoldLedger:TakeClaim(delta, exactOnly)
     end
     local direction = delta > 0 and 1 or -1
     for index, claim in ipairs(self.claims) do
-        if claim.amount == nil and claim.direction == direction then
+        if (claim.amount == nil or claim.loose) and claim.direction == direction then
             table.remove(self.claims, index)
             return claim
         end
@@ -304,44 +357,202 @@ end
 -- ---------------------------------------------------------------------------
 
 -- item (optional) = { name, quantity }: per-item detail kept on the row as
--- row.items[name] = { copper, quantity }. Income only.
+-- row.items[name] (income) or row.spendItems[name] (spending) = { copper, quantity }.
 function GoldLedger:Record(delta, category, professionKey, reason, timestamp, item)
-    local ledger = LedgerDB()
     local guid = UnitGUID and UnitGUID("player")
-    if not ledger or not guid or delta == 0 then
+    if not guid or delta == 0 then
         return
     end
     professionKey = professionKey or "none"
-    local dayKey = DayKey(timestamp)
-
-    local day = ledger.days[dayKey] or {}
-    ledger.days[dayKey] = day
-    local character = day[guid] or {}
-    day[guid] = character
-    local byCategory = character[category] or {}
-    character[category] = byCategory
-    local row = byCategory[professionKey] or { income = 0, spend = 0, count = 0 }
-    byCategory[professionKey] = row
-
-    if delta > 0 then
-        row.income = row.income + delta
-    else
-        row.spend = row.spend + (-delta)
+    local itemLedger = PocketCFO.ItemLedger
+    if itemLedger then
+        itemLedger:Write({
+            dir = delta > 0 and "in" or "out",
+            cat = category,
+            prof = professionKey ~= "none" and professionKey or nil,
+            kind = "gold",
+            qty = math.abs(delta),
+            src = item and item.name or nil,
+            iid = item and tonumber(item.itemID) or nil,   -- container gold: the container (2026-10-30)
+            units = item and (tonumber(item.quantity) or 1) or nil,
+            at = timestamp,
+        })
     end
-    row.count = row.count + 1
 
     local itemText = ""
-    if item and item.name and delta > 0 then
-        row.items = row.items or {}
-        local detail = row.items[item.name] or { copper = 0, quantity = 0 }
-        row.items[item.name] = detail
-        detail.copper = detail.copper + delta
-        detail.quantity = detail.quantity + (tonumber(item.quantity) or 1)
+    if item and item.name then
         itemText = string.format(" item=%s x%d", tostring(item.name), tonumber(item.quantity) or 1)
     end
-
     SessionLog("%s category=%s profession=%s day=%s reason=%s%s",
-        FormatCopper(delta), category, professionKey, dayKey, tostring(reason), itemText)
+        FormatCopper(delta), category, professionKey, DayKey(timestamp), tostring(reason), itemText)
+end
+
+-- One-time move of the old day history into the Item Ledger (2026-10-30).
+-- Every day x character x category x profession row goes in as gold rows:
+-- one per item sold / bought (by name, with quantity) and one for the rest.
+-- The old history is deleted only when the ledger's gold totals rose by
+-- exactly the amounts moved; otherwise it is kept and the mismatch logged.
+local MOVE_FLAG = "goldDaysToItemLedger1"
+
+function GoldLedger:MoveDaysToItemLedger()
+    local globalDB = PocketCFO.db and PocketCFO.db.global
+    local itemLedger = PocketCFO.ItemLedger
+    local goldLedger = globalDB and globalDB.goldLedger
+    if not goldLedger or not itemLedger or type(goldLedger.days) ~= "table" then
+        return
+    end
+    globalDB.migrations = globalDB.migrations or {}
+    if globalDB.migrations[MOVE_FLAG] then
+        return
+    end
+    globalDB.migrations[MOVE_FLAG] = time()
+    local characters = globalDB.gold and globalDB.gold.characters or {}
+    local before = { ["in"] = itemLedger:GetTotals({ kind = "gold", dir = "in" }).qty,
+        out = itemLedger:GetTotals({ kind = "gold", dir = "out" }).qty }
+    local moved = { ["in"] = 0, out = 0 }
+    local rows = 0
+    for dayKey, day in pairs(goldLedger.days) do
+        for guid, categories in pairs(day) do
+            local character = characters[guid]
+            for category, professions in pairs(categories) do
+                for professionKey, row in pairs(professions) do
+                    local count = tonumber(row.count) or 0
+                    for _, side in ipairs({ { "in", row.income, row.items }, { "out", row.spend, row.spendItems } }) do
+                        local dir, amount, items = side[1], tonumber(side[2]) or 0, side[3]
+                        if amount > 0 then
+                            moved[dir] = moved[dir] + amount
+                            local base = { characterGUID = guid, name = character and character.name or nil,
+                                realm = character and character.realm or nil, dir = dir, cat = category,
+                                prof = professionKey ~= "none" and professionKey or nil, kind = "gold" }
+                            local itemCopper = 0
+                            for itemName, detail in pairs(type(items) == "table" and items or {}) do
+                                local copper = tonumber(detail.copper) or 0
+                                if copper > 0 then
+                                    local fields = {}
+                                    for k, v in pairs(base) do fields[k] = v end
+                                    fields.src, fields.qty, fields.value, fields.valuedQty = itemName, copper, copper, copper
+                                    fields.units = tonumber(detail.quantity)
+                                    itemLedger:AddHistoryRow(dayKey, fields)
+                                    itemCopper = itemCopper + copper
+                                    rows = rows + 1
+                                end
+                            end
+                            local rest = amount - itemCopper
+                            if rest > 0 then
+                                local fields = {}
+                                for k, v in pairs(base) do fields[k] = v end
+                                fields.qty, fields.value, fields.valuedQty, fields.n = rest, rest, rest, count
+                                count = 0
+                                itemLedger:AddHistoryRow(dayKey, fields)
+                                rows = rows + 1
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local after = { ["in"] = itemLedger:GetTotals({ kind = "gold", dir = "in" }).qty,
+        out = itemLedger:GetTotals({ kind = "gold", dir = "out" }).qty }
+    if after["in"] - before["in"] == moved["in"] and after.out - before.out == moved.out then
+        goldLedger.days = nil
+        PocketCFO:AppendSessionLog(string.format(
+            "[MCG] GoldLedger: moved gold history into the Item Ledger (%d rows, in %d, out %d); old history removed",
+            rows, moved["in"], moved.out))
+    else
+        PocketCFO:AppendSessionLog(string.format(
+            "[MCG] GoldLedger: gold history move MISMATCH (in moved %d ledger +%d, out moved %d ledger +%d); old history kept",
+            moved["in"], after["in"] - before["in"], moved.out, after.out - before.out))
+    end
+end
+
+-- One-time merge (2026-11-01, Brian): AH spending from before the buy and
+-- deposit hooks (2026-10-27) was filed as "auction" by the window rule and
+-- showed as a second "Auction House" row on the Spending tab. It moves into
+-- "auction_buy". Deposits from that time can't be told apart and go with it.
+-- Result (OK or MISMATCH) goes to the session log.
+local MERGE_AH_SPEND_FLAG = "ahSpendIntoPurchases1"
+
+function GoldLedger:MergeAuctionSpending()
+    local globalDB = PocketCFO.db and PocketCFO.db.global
+    local itemLedger = PocketCFO.ItemLedger
+    if not globalDB or not itemLedger or type(itemLedger.MoveCategory) ~= "function" then
+        return
+    end
+    globalDB.migrations = globalDB.migrations or {}
+    if globalDB.migrations[MERGE_AH_SPEND_FLAG] then
+        return
+    end
+    globalDB.migrations[MERGE_AH_SPEND_FLAG] = time()
+    local function Spent(cat)
+        return itemLedger:GetTotals({ kind = "gold", dir = "out", cat = cat }).qty
+    end
+    local spentBefore, buyBefore = Spent(nil), Spent("auction_buy")
+    local moved, rows, entries = itemLedger:MoveCategory("auction", "auction_buy", "out", "gold")
+    local spentAfter, buyAfter, left = Spent(nil), Spent("auction_buy"), Spent("auction")
+    if spentAfter == spentBefore and buyAfter - buyBefore == moved and left == 0 then
+        PocketCFO:AppendSessionLog(string.format(
+            "[MCG] GoldLedger: merged AH spending into AH Purchases (%d rows, %d entries, %d copper)",
+            rows, entries, moved))
+    else
+        PocketCFO:AppendSessionLog(string.format(
+            "[MCG] GoldLedger: AH spending merge MISMATCH (spent %d -> %d, purchases +%d, moved %d, left %d)",
+            spentBefore, spentAfter, buyAfter - buyBefore, moved, left))
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Personal spending (2026-11-02, Brian): spending the player marks as
+-- personal (a mount, a toy) is left out of the business numbers. Its category
+-- becomes "personal:<original>" (e.g. "personal:vendor"), so marking it back
+-- restores the original category. The gold amount never changes.
+-- Flavor: Both.
+-- ---------------------------------------------------------------------------
+
+GoldLedger.PERSONAL_PREFIX = "personal:"
+
+--- Original category of a personal category, or nil when it isn't personal.
+function GoldLedger:PersonalOriginal(category)
+    if type(category) ~= "string" then
+        return nil
+    end
+    local prefix = GoldLedger.PERSONAL_PREFIX
+    if string.sub(category, 1, #prefix) == prefix then
+        return string.sub(category, #prefix + 1)
+    end
+    return nil
+end
+
+--- Marks spending on one item personal (isPersonal true) or back to business.
+-- category = the category it is in now ("vendor", or "personal:vendor" to
+-- move back). from / to = "YYYY-MM-DD" (nil = no limit); characterGUIDs =
+-- { [guid] = true } (nil = every character). Returns copper moved.
+function GoldLedger:SetPersonal(itemName, category, from, to, characterGUIDs, isPersonal)
+    local itemLedger = PocketCFO.ItemLedger
+    if not itemLedger or type(itemLedger.MoveRows) ~= "function" or not itemName or not category then
+        return 0
+    end
+    local toCat
+    if isPersonal then
+        if self:PersonalOriginal(category) then
+            return 0
+        end
+        toCat = GoldLedger.PERSONAL_PREFIX .. category
+    else
+        toCat = self:PersonalOriginal(category)
+        if not toCat then
+            return 0
+        end
+    end
+    local moved, rows, entries = itemLedger:MoveRows({
+        cat = category, dir = "out", kind = "gold", src = itemName,
+        from = from, to = to, characterGUIDs = characterGUIDs,
+    }, toCat)
+    SessionLog("%s %s -> %s (%s, %d rows, %d entries, range %s..%s)",
+        isPersonal and "personal:" or "business:", tostring(itemName), toCat, FormatCopper(moved),
+        rows, entries, tostring(from or "start"), tostring(to or "now"))
+    self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
+    return moved
 end
 
 -- Returns category, professionKey, reason, timestamp override, item.
@@ -360,6 +571,9 @@ function GoldLedger:Classify(entry)
     end
     if entry.delta > 0 and entry.mailRecent and self:MatchWaitingMail(entry.delta, false) then
         return "mail_matched"
+    end
+    if entry.delta < 0 and entry.repairMode and entry.windows.merchant then
+        return "repair", nil, "window:merchant repair-mode"
     end
     local rules = entry.delta > 0 and INCOME_WINDOW_CATEGORY or SPEND_WINDOW_CATEGORY
     for _, windowEntry in ipairs(rules) do
@@ -413,6 +627,10 @@ function GoldLedger:Flush()
                 if entry.delta > 0 and (entry.mailOpen or entry.mailRecent) then
                     self:MailLog("miss", entry.delta, reason)
                 end
+            elseif reason == "window:auction" then
+                -- Fell through to the AH window rule: recorded as a purchase
+                -- with no item, logged so the gap can be traced (2026-11-01).
+                self:LogUnknown(entry.delta, reason, entry.windows, entry.timestamp)
             end
             self:Record(entry.delta, category, professionKey, reason, timestamp or entry.timestamp, item)
         end
@@ -421,13 +639,6 @@ function GoldLedger:Flush()
     if changed then
         self:SendMessage("MCG_GOLD_LEDGER_UPDATED")
     end
-end
-
--- Read-only view for display code (PocketCFO_PnL). Callers must not modify it.
--- days[dayKey][characterGUID][category][professionKey] = { income, spend, count }
-function GoldLedger:GetDays()
-    local ledger = LedgerDB()
-    return ledger and ledger.days or {}
 end
 
 function GoldLedger:ScheduleFlush()
@@ -464,6 +675,7 @@ function GoldLedger:OnPlayerMoney()
         windows = self:SnapshotWindows(),
         mailOpen = self.windowOpen.mail and true or false,
         mailRecent = self:WasMailboxRecent(),
+        repairMode = delta < 0 and type(InRepairMode) == "function" and InRepairMode() or false,
     }
     self:ScheduleFlush()
 end
@@ -508,6 +720,12 @@ function GoldLedger:SetWindow(window, isOpen, source)
     if not isOpen then
         self.windowClosedAt[window] = GetTime()
     end
+    if window == "merchant" and isOpen then
+        self:CacheRepairCost()
+    end
+    if window ~= "mail" then
+        SessionLog("window %s %s source=%s", window, isOpen and "opened" or "closed", tostring(source))
+    end
     if window == "mail" then
         SessionLog("mailbox %s source=%s", isOpen and "opened" or "closed", tostring(source))
         if isOpen then
@@ -517,7 +735,7 @@ function GoldLedger:SetWindow(window, isOpen, source)
 end
 
 function GoldLedger:OnWindowEvent(event)
-    local mapping = WINDOW_EVENTS[event]
+    local mapping = WINDOW_EVENTS[event] or OPTIONAL_WINDOW_EVENTS[event]
     if mapping then
         self:SetWindow(mapping[1], mapping[2], event)
     end
@@ -554,7 +772,7 @@ end
 -- Theoretical: CHAT_MSG_MONEY fires for every money loot, auto-loot included.
 function GoldLedger:OnLootMoney()
     self:AddClaim({
-        category = "loot_quest",
+        category = "looted",
         direction = 1,
         reason = "loot-money",
         ttl = LOOT_CLAIM_TTL,
@@ -565,7 +783,7 @@ function GoldLedger:OnQuestTurnedIn(_, questID, xpReward, moneyReward)
     moneyReward = tonumber(moneyReward)
     if moneyReward and moneyReward > 0 then
         self:AddClaim({
-            category = "loot_quest",
+            category = "quest",
             amount = moneyReward,
             reason = "quest:" .. tostring(questID),
         })
@@ -882,7 +1100,97 @@ function GoldLedger:SaleItem(itemName, count, subject)
     if not itemName or itemName == "" then
         return nil
     end
-    return { name = itemName, quantity = quantity or 1 }
+    -- Item ID saved on the row (iid) so the Income tab can group the sale by
+    -- item type (2026-10-31; ResolveItemID).
+    return { name = itemName, quantity = quantity or 1, itemID = self:ResolveItemID(itemName) }
+end
+
+-- ---------------------------------------------------------------------------
+-- Item ID by name (2026-10-31). AH sale mail gives only the item's name, and
+-- the game only answers name lookups for items it has loaded recently
+-- (/mcg ahgroups showed 63 of 80 sold items unknown by name). Tried in order:
+--   1. IDs already found (goldLedger.itemIDs[name], saved for good)
+--   2. GetItemInfo(name), then GetItemInfoInstant(name) (answered for more)
+--   3. RecipeRegistry: a recipe one of your characters knows that makes it
+--   4. Item Ledger: an item that came into your bags with that name (names
+--      the game doesn't have loaded yet are requested for next time)
+-- Returns the itemID or nil.
+-- ---------------------------------------------------------------------------
+local ledgerNames = nil      -- [name] = itemID, from Item Ledger item rows (this session)
+local ledgerNamesAt = 0
+local LEDGER_NAMES_SECONDS = 60
+
+local function LinkItemID(link)
+    return type(link) == "string" and tonumber(link:match("item:(%d+)")) or nil
+end
+
+local function LedgerNameIndex()
+    local now = GetTime and GetTime() or 0
+    if ledgerNames and (now - ledgerNamesAt) < LEDGER_NAMES_SECONDS then
+        return ledgerNames
+    end
+    ledgerNames, ledgerNamesAt = {}, now
+    local itemLedger = PocketCFO.ItemLedger
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    if not itemLedger or not getInfo then
+        return ledgerNames
+    end
+    local seen = {}
+    for _, found in ipairs(itemLedger:GetRows({ kind = "item" })) do
+        local itemID = tonumber(found.row.iid)
+        if itemID and not seen[itemID] then
+            seen[itemID] = true
+            local ok, name = pcall(getInfo, itemID)
+            if ok and name then
+                ledgerNames[name] = ledgerNames[name] or itemID
+            elseif C_Item and C_Item.RequestLoadItemDataByID then
+                pcall(C_Item.RequestLoadItemDataByID, itemID)
+            end
+        end
+    end
+    return ledgerNames
+end
+
+function GoldLedger:ResolveItemID(itemName)
+    if not itemName or itemName == "" then
+        return nil
+    end
+    local db = LedgerDB()
+    if db then
+        db.itemIDs = db.itemIDs or {}
+        if db.itemIDs[itemName] then
+            return db.itemIDs[itemName]
+        end
+    end
+    local itemID
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    if getInfo then
+        local ok, _, link = pcall(getInfo, itemName)
+        itemID = ok and LinkItemID(link) or nil
+    end
+    local getInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+    if not itemID and getInstant then
+        local ok, instantID = pcall(getInstant, itemName)
+        itemID = ok and tonumber(instantID) or nil
+    end
+    local recipeRegistry = PocketCFO:GetModule("RecipeRegistry", true)
+    if not itemID and recipeRegistry and recipeRegistry.GetRecipeIDsForOutput then
+        local ok, recipeIDs = pcall(recipeRegistry.GetRecipeIDsForOutput, recipeRegistry, nil, itemName)
+        for _, recipeID in ipairs(ok and type(recipeIDs) == "table" and recipeIDs or {}) do
+            local record = recipeRegistry:GetRecipeRecord(recipeID)
+            itemID = record and tonumber(record.outputItemID) or nil
+            if itemID then
+                break
+            end
+        end
+    end
+    if not itemID then
+        itemID = LedgerNameIndex()[itemName]
+    end
+    if itemID and db then
+        db.itemIDs[itemName] = itemID
+    end
+    return itemID
 end
 
 -- Selling to a vendor: read the item at the sell click (post-hook of
@@ -904,8 +1212,6 @@ function GoldLedger:OnUseContainerItem(bag, slot)
     end
     if self.windowOpen.merchant then
         self:ClaimVendorSale(info)
-    elseif info.hasLoot then
-        self:ClaimContainerOpen(info)
     end
 end
 
@@ -932,19 +1238,19 @@ function GoldLedger:ClaimVendorSale(info)
 end
 
 -- Opening a container from your bags (cache, trove, reward bag): gold that
--- arrives within CONTAINER_CLAIM_TTL is credited to Loot & Quests with the
+-- arrives within CONTAINER_CLAIM_TTL is credited to Looted Gold with the
 -- container's name as the item. Seen 2026-10-23: an Overflowing Silvermoon
 -- Trove and an Apex chest paid gold with no loot-money claim, so it went to
--- Unknown. Theoretical: info.hasLoot is true for these containers and the
--- slot still holds the item when this post-hook runs.
-function GoldLedger:ClaimContainerOpen(info)
+-- Unknown. Since 2026-10-30 the click comes from LootReader
+-- (MCG_CONTAINER_CLICK: item has loot, no merchant open).
+function GoldLedger:ClaimContainerOpen(click)
     local getInfo = C_Item and C_Item.GetItemInfo or GetItemInfo
-    local itemName = (getInfo(info.hyperlink)) or info.itemName
+    local itemName = (click.link and getInfo(click.link)) or click.name
     SessionLog("container opened: %s", tostring(itemName))
     self:AddClaim({
-        category = "loot_quest",
+        category = "looted",
         direction = 1,
-        item = itemName and { name = itemName, quantity = 1 } or nil,
+        item = itemName and { name = itemName, quantity = 1, itemID = tonumber(click.itemID) } or nil,
         reason = "container:" .. tostring(itemName),
         ttl = CONTAINER_CLAIM_TTL,
     })
@@ -990,6 +1296,246 @@ function GoldLedger:OnFulfillOrder(orderID, _, professionEnum)
     })
 end
 
+-- ---------------------------------------------------------------------------
+-- Spending claims (2026-10-27). Flavor: Both. All Theoretical until seen.
+-- ---------------------------------------------------------------------------
+
+local function ItemNameOf(linkOrID)
+    if not linkOrID then
+        return nil
+    end
+    local getInfo = C_Item and C_Item.GetItemInfo or GetItemInfo
+    local ok, name = pcall(getInfo, linkOrID)
+    return ok and name or nil
+end
+
+-- Merchant item: name, link, price, stackCount. C_MerchantFrame.GetItemInfo
+-- (table) when present, else the global GetMerchantItemInfo.
+local function MerchantItem(index)
+    local name, price, stackCount
+    if C_MerchantFrame and type(C_MerchantFrame.GetItemInfo) == "function" then
+        local ok, info = pcall(C_MerchantFrame.GetItemInfo, index)
+        if ok and type(info) == "table" then
+            name, price, stackCount = info.name, info.price, info.stackCount
+        end
+    end
+    if not name and type(GetMerchantItemInfo) == "function" then
+        local ok, n, _, p, s = pcall(GetMerchantItemInfo, index)
+        if ok then
+            name, price, stackCount = n, p, s
+        end
+    end
+    local link
+    if type(GetMerchantItemLink) == "function" then
+        local ok, l = pcall(GetMerchantItemLink, index)
+        link = ok and l or nil
+    end
+    return ItemNameOf(link) or name, tonumber(price), tonumber(stackCount) or 1
+end
+
+function GoldLedger:OnBuyMerchantItem(index, quantity)
+    local name, price, stackCount = MerchantItem(index)
+    quantity = tonumber(quantity) or stackCount
+    if not price or price <= 0 then
+        SessionLog("vendor buy: no gold price index=%s (currency item?)", tostring(index))
+        return
+    end
+    local amount = math.floor(price * quantity / math.max(1, stackCount) + 0.5)
+    SessionLog("vendor buy claim %s x%d expected=%s", tostring(name), quantity, FormatCopper(-amount))
+    self:AddClaim({
+        category = "vendor",
+        amount = -amount,
+        loose = true,
+        direction = -1,
+        item = name and { name = name, quantity = quantity } or nil,
+        reason = "vendor:buy",
+        ttl = LOOSE_CLAIM_TTL,
+    })
+end
+
+function GoldLedger:OnBuybackItem(index)
+    if type(GetBuybackItemInfo) ~= "function" then
+        return
+    end
+    local ok, name, _, price, quantity = pcall(GetBuybackItemInfo, index)
+    price = ok and tonumber(price) or nil
+    if not price or price <= 0 then
+        return
+    end
+    SessionLog("vendor buyback claim %s x%s expected=%s", tostring(name), tostring(quantity), FormatCopper(-price))
+    self:AddClaim({
+        category = "vendor",
+        amount = -price,
+        loose = true,
+        direction = -1,
+        item = name and { name = name, quantity = tonumber(quantity) or 1 } or nil,
+        reason = "vendor:buyback",
+        ttl = LOOSE_CLAIM_TTL,
+    })
+end
+
+-- Repair All: the cost is gone once the repair is done, so it is cached while
+-- the merchant is open (merchant show/update, durability change).
+function GoldLedger:CacheRepairCost()
+    if not self.windowOpen.merchant or type(GetRepairAllCost) ~= "function" then
+        return
+    end
+    local ok, cost, canRepair = pcall(GetRepairAllCost)
+    if ok then
+        self.repairAllCost = canRepair and tonumber(cost) or 0
+    end
+end
+
+function GoldLedger:OnRepairAllItems(guildBankRepair)
+    if guildBankRepair then
+        SessionLog("repair all: paid by guild bank, not counted")
+        return
+    end
+    local cost = tonumber(self.repairAllCost) or 0
+    SessionLog("repair all claim expected=%s", FormatCopper(-cost))
+    self:AddClaim({
+        category = "repair",
+        amount = cost > 0 and -cost or nil,
+        loose = true,
+        direction = -1,
+        reason = "repair:all",
+        ttl = LOOSE_CLAIM_TTL,
+    })
+    self.repairAllCost = 0
+end
+
+function GoldLedger:OnBuyTrainerService(index)
+    local name, cost
+    if type(GetTrainerServiceInfo) == "function" then
+        local ok, n = pcall(GetTrainerServiceInfo, index)
+        name = ok and n or nil
+    end
+    if type(GetTrainerServiceCost) == "function" then
+        local ok, c = pcall(GetTrainerServiceCost, index)
+        cost = ok and tonumber(c) or nil
+    end
+    SessionLog("trainer claim %s expected=%s", tostring(name), cost and FormatCopper(-cost) or "?")
+    self:AddClaim({
+        category = "training",
+        amount = (cost and cost > 0) and -cost or nil,
+        loose = true,
+        direction = -1,
+        item = name and { name = name, quantity = 1 } or nil,
+        reason = "trainer:" .. tostring(name),
+        ttl = LOOSE_CLAIM_TTL,
+    })
+end
+
+-- AH purchases. Item auctions: PlaceBid(auctionID, bidAmount) charges the bid
+-- at once; the item is the one last searched (ITEM_SEARCH_RESULTS_UPDATED).
+-- Commodities: the total comes from COMMODITY_PRICE_UPDATED after
+-- StartCommoditiesPurchase, charged at ConfirmCommoditiesPurchase.
+function GoldLedger:OnItemSearchResults(_, itemKey)
+    self.lastSearchItemKey = itemKey
+end
+
+function GoldLedger:OnCommodityPriceUpdated(_, unitPrice, totalPrice)
+    self.commodityQuote = self.commodityQuote or {}
+    self.commodityQuote.total = tonumber(totalPrice)
+end
+
+function GoldLedger:OnStartCommoditiesPurchase(itemID, quantity)
+    self.commodityQuote = { itemID = itemID, quantity = tonumber(quantity) }
+end
+
+function GoldLedger:OnConfirmCommoditiesPurchase(itemID, quantity)
+    local quote = self.commodityQuote or {}
+    local total = quote.itemID == itemID and tonumber(quote.total) or nil
+    quantity = tonumber(quantity) or quote.quantity or 1
+    local name = ItemNameOf(itemID)
+    SessionLog("AH commodity buy claim %s x%d expected=%s", tostring(name), quantity, total and FormatCopper(-total) or "?")
+    self:AddClaim({
+        category = "auction_buy",
+        amount = total and -total or nil,
+        loose = true,
+        direction = -1,
+        item = name and { name = name, quantity = quantity } or nil,
+        reason = "ah:buy-commodity",
+        ttl = AH_BUY_CLAIM_TTL,
+    })
+    self.commodityQuote = nil
+end
+
+function GoldLedger:OnPlaceBid(auctionID, bidAmount)
+    bidAmount = tonumber(bidAmount)
+    local name
+    local itemKey = self.lastSearchItemKey
+    if itemKey and C_AuctionHouse and type(C_AuctionHouse.GetItemKeyInfo) == "function" then
+        local ok, info = pcall(C_AuctionHouse.GetItemKeyInfo, itemKey)
+        name = ok and type(info) == "table" and info.itemName or nil
+    end
+    SessionLog("AH bid/buyout claim %s auctionID=%s expected=%s", tostring(name), tostring(auctionID),
+        bidAmount and FormatCopper(-bidAmount) or "?")
+    self:AddClaim({
+        category = "auction_buy",
+        amount = bidAmount and -bidAmount or nil,
+        loose = true,
+        direction = -1,
+        item = name and { name = name, quantity = 1 } or nil,
+        reason = "ah:bid",
+        ttl = AH_BUY_CLAIM_TTL,
+    })
+end
+
+-- AH deposits. The item may already be gone from the bag when the post-hook
+-- runs, so the name is best effort.
+function GoldLedger:OnPostAuction(kind, itemLocation, quantity)
+    local name
+    if itemLocation and C_Item and type(C_Item.GetItemName) == "function" then
+        local ok, n = pcall(C_Item.GetItemName, itemLocation)
+        name = ok and n or nil
+    end
+    SessionLog("AH deposit claim (%s) %s x%s", kind, tostring(name), tostring(quantity))
+    self:AddClaim({
+        category = "auction_deposit",
+        direction = -1,
+        item = name and { name = name, quantity = tonumber(quantity) or 1 } or nil,
+        reason = "ah:post-" .. kind,
+        ttl = LOOSE_CLAIM_TTL,
+    })
+end
+
+function GoldLedger:OnRepairCostEvent()
+    self:CacheRepairCost()
+end
+
+local function HookGlobal(name, fn)
+    if type(_G[name]) == "function" then
+        hooksecurefunc(name, fn)
+    end
+end
+
+local function HookTable(tbl, name, fn)
+    if tbl and type(tbl[name]) == "function" then
+        hooksecurefunc(tbl, name, fn)
+    end
+end
+
+function GoldLedger:InstallSpendingHooks()
+    HookGlobal("BuyMerchantItem", function(index, quantity) GoldLedger:OnBuyMerchantItem(index, quantity) end)
+    HookGlobal("BuybackItem", function(index) GoldLedger:OnBuybackItem(index) end)
+    HookGlobal("RepairAllItems", function(guildBankRepair) GoldLedger:OnRepairAllItems(guildBankRepair) end)
+    HookGlobal("BuyTrainerService", function(index) GoldLedger:OnBuyTrainerService(index) end)
+    local ah = C_AuctionHouse
+    HookTable(ah, "PlaceBid", function(auctionID, bidAmount) GoldLedger:OnPlaceBid(auctionID, bidAmount) end)
+    HookTable(ah, "StartCommoditiesPurchase", function(itemID, quantity) GoldLedger:OnStartCommoditiesPurchase(itemID, quantity) end)
+    HookTable(ah, "ConfirmCommoditiesPurchase", function(itemID, quantity) GoldLedger:OnConfirmCommoditiesPurchase(itemID, quantity) end)
+    HookTable(ah, "PostItem", function(item, _, quantity) GoldLedger:OnPostAuction("item", item, quantity) end)
+    HookTable(ah, "PostCommodity", function(item, _, quantity) GoldLedger:OnPostAuction("commodity", item, quantity) end)
+end
+
+function GoldLedger:RegisterOptionalEvent(event, method)
+    local ok = pcall(self.RegisterEvent, self, event, method)
+    if not ok then
+        SessionLog("event not available on this client: %s", event)
+    end
+end
+
 function GoldLedger:InstallHooks()
     if self.hooksInstalled then
         return
@@ -1004,6 +1550,7 @@ function GoldLedger:InstallHooks()
     if C_CraftingOrders and type(C_CraftingOrders.FulfillOrder) == "function" then
         hooksecurefunc(C_CraftingOrders, "FulfillOrder", function(...) GoldLedger:OnFulfillOrder(...) end)
     end
+    self:InstallSpendingHooks()
 end
 
 -- ---------------------------------------------------------------------------
@@ -1018,7 +1565,18 @@ function GoldLedger:OnEnteringWorld()
     self.lastAccountMoney = self:ReadAccountMoney() or self.lastAccountMoney
 end
 
+local messenger = LibStub and LibStub("AceEvent-3.0", true) and LibStub("AceEvent-3.0"):Embed({}) or nil
+if messenger then
+    messenger:RegisterMessage("MCG_CONTAINER_CLICK", function(_, click)
+        if type(click) == "table" then
+            GoldLedger:ClaimContainerOpen(click)
+        end
+    end)
+end
+
 function GoldLedger:OnEnable()
+    pcall(self.MoveDaysToItemLedger, self)
+    pcall(self.MergeAuctionSpending, self)   -- after the history move (2026-11-01)
     self:InstallHooks()
     self:RegisterEvent("PLAYER_ENTERING_WORLD", "OnEnteringWorld")
     self:RegisterEvent("PLAYER_MONEY", "OnPlayerMoney")
@@ -1031,6 +1589,14 @@ function GoldLedger:OnEnable()
     end
     self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", "OnInteraction")
     self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE", "OnInteraction")
+    -- Spending (2026-10-27): optional events, pcall-registered.
+    for event in pairs(OPTIONAL_WINDOW_EVENTS) do
+        self:RegisterOptionalEvent(event, "OnWindowEvent")
+    end
+    self:RegisterOptionalEvent("MERCHANT_UPDATE", "OnRepairCostEvent")
+    self:RegisterOptionalEvent("UPDATE_INVENTORY_DURABILITY", "OnRepairCostEvent")
+    self:RegisterOptionalEvent("COMMODITY_PRICE_UPDATED", "OnCommodityPriceUpdated")
+    self:RegisterOptionalEvent("ITEM_SEARCH_RESULTS_UPDATED", "OnItemSearchResults")
     self:OnEnteringWorld()
 end
 
@@ -1040,36 +1606,37 @@ end
 
 function GoldLedger:BuildReport(days)
     days = math.max(1, math.floor(tonumber(days) or 7))
-    local ledger = LedgerDB()
-    local goldDB = PocketCFO.db and PocketCFO.db.global and PocketCFO.db.global.gold
-    local characters = goldDB and goldDB.characters or {}
-    local lines = {}
-    if not ledger then
-        return "No gold ledger data."
+    local itemLedger = PocketCFO.ItemLedger
+    if not itemLedger then
+        return "No ledger."
     end
     local registry = PocketCFO.ProfessionRegistry
-    local now = time()
-    for offset = 0, days - 1 do
-        local dayKey = DayKey(now - offset * 86400)
-        local day = ledger.days[dayKey]
-        if day then
-            lines[#lines + 1] = dayKey
-            for guid, byCategory in pairs(day) do
-                local who = characters[guid] and characters[guid].name or guid
-                for category, byProfession in pairs(byCategory) do
-                    for professionKey, row in pairs(byProfession) do
-                        local config = registry and registry.GetProfessionConfig
-                            and registry:GetProfessionConfig(tonumber(professionKey))
-                        lines[#lines + 1] = string.format("  %s  %s  %s  in=%s  out=%s  n=%d",
-                            tostring(who), category, config and config.name or professionKey,
-                            FormatCopper(row.income), FormatCopper(-row.spend), row.count or 0)
-                    end
-                end
-            end
+    local from = DayKey(time() - (days - 1) * 86400)
+    local found = itemLedger:GetRows({ kind = "gold", from = from })
+    table.sort(found, function(a, b)
+        if a.period ~= b.period then
+            return a.period > b.period
         end
+        return (a.row.cat or "") < (b.row.cat or "")
+    end)
+    local lines = {}
+    local lastPeriod = nil
+    for _, item in ipairs(found) do
+        local row = item.row
+        if item.period ~= lastPeriod then
+            lines[#lines + 1] = item.period
+            lastPeriod = item.period
+        end
+        local character = itemLedger:GetCharacter(row.c)
+        local config = registry and registry.GetProfessionConfig and row.prof
+            and registry:GetProfessionConfig(tonumber(row.prof))
+        lines[#lines + 1] = string.format("  %s  %s  %s  %s %s  n=%d%s",
+            tostring(character and character.name or row.c), row.cat, config and config.name or tostring(row.prof or "none"),
+            row.dir, FormatCopper(row.dir == "in" and row.qty or -row.qty), row.n or 0,
+            row.src and string.format("  item=%s x%d", tostring(row.src), row.units or 0) or "")
     end
     if #lines == 0 then
-        return string.format("No gold ledger data in the last %d day(s).", days)
+        return string.format("No gold recorded in the last %d day(s).", days)
     end
     return table.concat(lines, "\n")
 end
@@ -1083,6 +1650,28 @@ if diagnostics and diagnostics.RegisterCommand then
         category = "General",
     }, function(rest)
         diagnostics:ShowDump("Gold Sources", GoldLedger:BuildReport(rest))
+    end)
+end
+
+-- ---------------------------------------------------------------------------
+-- Diagnostics: /mcg ahgroups - why each Auction House sale lands in its
+-- Income group (2026-10-31; report lives in PocketCFO_PnL, loaded here).
+-- ---------------------------------------------------------------------------
+if diagnostics and diagnostics.RegisterCommand then
+    diagnostics:RegisterCommand("ahgroups", {
+        name = "ahgroups",
+        description = "List every item sold on the Auction House and why it is in its Income group.",
+        usage = "/mcg ahgroups",
+        category = "General",
+    }, function()
+        local loader = PocketCFO:GetModule("AddonLoader", true)
+        local pnl = loader and loader:SafeLoad("PocketCFO_PnL") and _G.PocketCFO_PnL
+        local report = pnl and pnl.IncomeReport
+        if not report or not report.BuildAuctionGroupsReport then
+            PocketCFO:Print("Could not load the Income report.")
+            return
+        end
+        diagnostics:ShowDump("AH Groups", report:BuildAuctionGroupsReport())
     end)
 end
 
@@ -1145,82 +1734,5 @@ if diagnostics and diagnostics.RegisterCommand then
                 FormatCopper(entry.copper or 0), tostring(entry.detail))
         end
         diagnostics:ShowDump("Gold Mail Log", table.concat(lines, "\n"))
-    end)
-end
-
--- ---------------------------------------------------------------------------
--- ONE-TIME FIX (2026-10-23): /mcg containerfix
--- Matatodos container opens on 2026-10-23 went to Unknown before containers
--- were recognized. Moves each one still in Unknown (matched by its exact
--- amount in the Unknown log) to Loot & Quests with the container name.
--- Safe to run more than once. No window needed. Delete after it has been run.
--- ---------------------------------------------------------------------------
-if diagnostics and diagnostics.RegisterCommand then
-    diagnostics:RegisterCommand("containerfix", {
-        name = "containerfix",
-        description = "One-time: move 2026-10-23 Matatodos container opens from Unknown to Loot & Quests.",
-        usage = "/mcg containerfix",
-        category = "General",
-    }, function()
-        local ok, err = pcall(function()
-            local DAY = "2026-10-23"
-            local OPENS = {
-                { copper = 20437618, name = "Overflowing Silvermoon Trove" },
-                { copper = 19583515, name = "Apex Chest" },
-                { copper = 10675723, name = "Aqir Research Satchel" },
-            }
-            local ledger = LedgerDB()
-            local characters = PocketCFO.db.global.gold and PocketCFO.db.global.gold.characters or {}
-            local guid
-            for characterGUID, entry in pairs(characters) do
-                if entry.name == "Matatodos" then
-                    guid = characterGUID
-                end
-            end
-            local character = guid and ledger and ledger.days[DAY] and ledger.days[DAY][guid]
-            if not character then
-                PocketCFO:Print("containerfix: no data for Matatodos on %s, nothing changed.", DAY)
-                return
-            end
-            local moved = 0
-            for _, open in ipairs(OPENS) do
-                local logIndex
-                for index, entry in ipairs(ledger.unknownLog or {}) do
-                    if entry.character == "Matatodos" and entry.copper == open.copper then
-                        logIndex = index
-                        break
-                    end
-                end
-                local unknownRow = character.other and character.other.none
-                if logIndex and unknownRow and (unknownRow.income or 0) >= open.copper then
-                    table.remove(ledger.unknownLog, logIndex)
-                    unknownRow.income = unknownRow.income - open.copper
-                    unknownRow.count = math.max(0, (unknownRow.count or 0) - 1)
-                    if unknownRow.income == 0 and (unknownRow.spend or 0) == 0 then
-                        character.other.none = nil
-                        if next(character.other) == nil then
-                            character.other = nil
-                        end
-                    end
-                    character.loot_quest = character.loot_quest or {}
-                    local row = character.loot_quest.none or { income = 0, spend = 0, count = 0 }
-                    character.loot_quest.none = row
-                    row.items = row.items or {}
-                    row.income = row.income + open.copper
-                    row.count = row.count + 1
-                    local detail = row.items[open.name] or { copper = 0, quantity = 0 }
-                    row.items[open.name] = detail
-                    detail.copper = detail.copper + open.copper
-                    detail.quantity = detail.quantity + 1
-                    moved = moved + 1
-                    PocketCFO:Print("containerfix: %s %s -> Loot & Quests", open.name, FormatCopper(open.copper))
-                end
-            end
-            PocketCFO:Print("containerfix: moved %d of %d.", moved, #OPENS)
-            GoldLedger:SendMessage("MCG_GOLD_LEDGER_UPDATED")
-        end)
-        if not ok then
-            PocketCFO:Print("containerfix error: " .. tostring(err))
-        end
     end)
 end

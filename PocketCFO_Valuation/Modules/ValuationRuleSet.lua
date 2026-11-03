@@ -73,6 +73,31 @@ Rules:Add({
     market = { depth = 5 },
 })
 
+-- ─── Gray items: vendor price only (Brian, 2026-10-28) ─────────────────────
+-- Grays have no purpose except selling to a vendor, so their value is the
+-- vendor sell price, never an AH price (Vibrant Wings had AH listings at
+-- 39g and counted as 39g of beast kill loot). A gray a vendor won't buy is
+-- worth 0. Rarity 0 = Poor (ValuationRules.RARITY has no Poor entry).
+-- Needs item data loaded; on a cold item cache the rule is skipped
+-- (rulesPending) like every rarity rule.
+
+local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+
+Rules:Add({
+    id = "gray-vendor-only",
+    note = "Gray items: vendor sell price only",
+    match = { rarity = 0 },
+    value = function(context)
+        local ref = context.itemLink or context.itemID
+        local ok, name, _, _, _, _, _, _, _, _, _, sellPrice = pcall(GetItemInfo, ref)
+        if not ok or not name then
+            return { unresolved = true, unresolvedReason = "itemDataPending" }
+        end
+        local copper = math.max(0, tonumber(sellPrice) or 0)
+        return { value = copper, valuePerUnit = copper, valuationBasis = "fixed" }
+    end,
+})
+
 -- ─── Quality siblings (Brian, 2026-10-16) ─────────────────────────────────
 -- A lower crafting quality is never worth more than a higher quality of the
 -- same item: you're never punished for using a higher-quality mat, so

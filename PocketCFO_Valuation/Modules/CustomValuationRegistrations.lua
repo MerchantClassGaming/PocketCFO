@@ -8,7 +8,9 @@
 --   1. Register a container-outcome valuation strategy for every seeded
 --      container itemID (PocketCFO.ContainerOutcomeService:GetSeedContainerItemIDs()
 --      is the single source of truth for which 13 itemIDs those are - not
---      hardcoded a second time here).
+--      hardcoded a second time here), and for every container the player has
+--      opened (GetObservedContainerItemIDs; new ones arrive by
+--      MCG_CONTAINER_OPENED, 2026-10-26). Gold per opening counts in the value.
 --   2. Register the 11 profession Moxie currency valuations (600 Moxie = 1
 --      corresponding profession surplus bag).
 --
@@ -51,6 +53,13 @@ end
 -- Alchemist Surplus opens added 11,111g to every bag, at roughly 1 in 100 in
 -- Brian's experience), and their price often rests on one listing. They're a
 -- bonus, not what the bag is worth.
+-- Exception (Brian, 2026-10-26): when one-off items are ALL a container has
+-- ever given (Thalassian Recipe in a Bottle: one recipe per opening), they are
+-- what it's worth, so they count like any other output.
+--
+-- An output with no market value (bound gear: Deepvine Shroud from the Apex
+-- Cache) counts at its vendor sell price (Brian, 2026-10-27). No disenchant
+-- comparison. Outputs with no market value and no sell price stay unvalued.
 --
 -- An output whose item data isn't loaded yet can't be classified, so it is
 -- left out too and the result is flagged itemDataPending (never cached), so
@@ -71,6 +80,22 @@ local function IsStackableItem(itemID)
     return maxStack > 1
 end
 
+-- What a merchant pays for one (GetItemInfo's 11th return), or nil when it
+-- pays nothing. Container-only fallback for outputs with no market value
+-- (Brian, 2026-10-27): ValuationService stays "worth to other players" and
+-- never uses sell prices.
+local function VendorSellPrice(itemID)
+    if not itemID or not GetItemInfo then
+        return nil
+    end
+    local ok, name, _, _, _, _, _, _, _, _, _, sellPrice = pcall(GetItemInfo, itemID)
+    sellPrice = ok and name and tonumber(sellPrice) or nil
+    if sellPrice and sellPrice > 0 then
+        return sellPrice
+    end
+    return nil
+end
+
 local function ComputeContainerValue(context)
     local containerOutcomeService = GetContainerOutcomeService()
     if not containerOutcomeService or type(containerOutcomeService.GetExpectedContents) ~= "function" then
@@ -85,15 +110,31 @@ local function ComputeContainerValue(context)
         }
     end
 
-    local total = 0
-    local anyValued = false
+    -- Gold that comes out of the container (local openings only).
+    local expectedCopper = tonumber(expected.expectedCopper) or 0
+    local total = expectedCopper
+    local anyValued = expectedCopper > 0
     local unvaluedDependencies = {}
     local possibleDrops = {}
+    local vendorSellOutputs = {}
     local itemDataPending = false
     local openCount = tonumber(expected.effectiveOpenCount) or 0
 
+    -- One-offs count when every output is a one-off (no stackable output and
+    -- none still loading).
+    local onlyOneOffs = #(expected.expectedContents or {}) > 0
+    for _, row in ipairs(expected.expectedContents or {}) do
+        if IsStackableItem(row.itemID) ~= false then
+            onlyOneOffs = false
+            break
+        end
+    end
+
     for _, row in ipairs(expected.expectedContents or {}) do
         local stackable = IsStackableItem(row.itemID)
+        if onlyOneOffs then
+            stackable = true
+        end
         if stackable == nil then
             itemDataPending = true
             unvaluedDependencies[#unvaluedDependencies + 1] = {
@@ -114,9 +155,23 @@ local function ComputeContainerValue(context)
             }
         else
             local priced = context.valuationService:GetItemValue({ itemID = row.itemID, configKey = row.configKey })
+            local sellPrice = nil
+            if not (priced and not priced.unresolved and priced.valuePerUnit ~= nil) then
+                sellPrice = VendorSellPrice(row.itemID)
+            end
             if priced and not priced.unresolved and priced.valuePerUnit ~= nil then
                 total = total + priced.valuePerUnit * row.expectedQuantity
                 anyValued = true
+            elseif sellPrice then
+                -- No market value (e.g. bound gear): counted at what a
+                -- merchant pays for it (Brian, 2026-10-27).
+                total = total + sellPrice * row.expectedQuantity
+                anyValued = true
+                vendorSellOutputs[#vendorSellOutputs + 1] = {
+                    itemID = row.itemID,
+                    expectedQuantity = row.expectedQuantity,
+                    sellPrice = sellPrice,
+                }
             else
                 unvaluedDependencies[#unvaluedDependencies + 1] = {
                     itemID = row.itemID,
@@ -146,6 +201,7 @@ local function ComputeContainerValue(context)
         valuationBasis = "modeled",
         unvaluedDependencies = unvaluedDependencies,
         possibleDrops = possibleDrops,
+        vendorSellOutputs = vendorSellOutputs,
         itemDataPending = itemDataPending,
     }
 end
@@ -196,6 +252,21 @@ end
 local cacheListener = LibStub("AceEvent-3.0"):Embed({})
 cacheListener:RegisterMessage("PCFO_PRICING_UPDATED", ClearContainerValueCache)
 
+local registeredContainers = {}
+
+local function RegisterContainer(valuationService, itemID)
+    itemID = tonumber(itemID)
+    if not itemID or registeredContainers[itemID] then
+        return
+    end
+    registeredContainers[itemID] = true
+    valuationService:RegisterCustomItemValuation({
+        itemID = itemID,
+        strategyKey = "containerOutcome",
+        evaluate = EvaluateContainerValue,
+    })
+end
+
 local function RegisterContainerStrategies()
     local valuationService = GetValuationService()
     local containerOutcomeService = GetContainerOutcomeService()
@@ -203,15 +274,25 @@ local function RegisterContainerStrategies()
         return
     end
 
-    local containerItemIDs = containerOutcomeService:GetSeedContainerItemIDs()
-    for _, itemID in ipairs(containerItemIDs) do
-        valuationService:RegisterCustomItemValuation({
-            itemID = itemID,
-            strategyKey = "containerOutcome",
-            evaluate = EvaluateContainerValue,
-        })
+    for _, itemID in ipairs(containerOutcomeService:GetSeedContainerItemIDs()) do
+        RegisterContainer(valuationService, itemID)
+    end
+    if type(containerOutcomeService.GetObservedContainerItemIDs) == "function" then
+        for _, itemID in ipairs(containerOutcomeService:GetObservedContainerItemIDs()) do
+            RegisterContainer(valuationService, itemID)
+        end
     end
 end
+
+-- A container was just opened: value it from now on, and drop cached values
+-- so its new average is used.
+cacheListener:RegisterMessage("MCG_CONTAINER_OPENED", function(_, itemID)
+    local valuationService = GetValuationService()
+    if valuationService then
+        pcall(RegisterContainer, valuationService, itemID)
+    end
+    ClearContainerValueCache()
+end)
 
 -- ─── Moxie currency valuation ───────────────────────────────────────────────
 -- 600 profession Moxie -> 1 corresponding profession surplus bag, so the unit

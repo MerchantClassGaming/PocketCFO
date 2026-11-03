@@ -62,7 +62,7 @@ function OrderReport:Build(periodKey, characterGUID, hiddenTypes)
         local day = ledgerDays[dayKey]
         if day then
             for guid, professions in pairs(day) do
-                if not characterGUID or guid == characterGUID then
+                if PocketCFO_PnL.IncomeReport:IncludesCharacter(guid, characterGUID) then
                     for professionKey, types in pairs(professions) do
                         for typeKey, row in pairs(types) do
                             if not hiddenTypes[typeKey] then

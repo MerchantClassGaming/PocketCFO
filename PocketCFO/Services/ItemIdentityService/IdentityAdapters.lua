@@ -708,6 +708,19 @@ local function FromRow(row, source)
         identity.itemID = ItemIDFromLink(identity.itemLink)
     end
 
+    -- Name (+ crafting quality) but no itemID: look the item up by name
+    -- (ItemIdentityService:FindItemIDByName, 2026-11-01).
+    if not identity.itemID and identity.itemName then
+        local service = GetIdentityService()
+        if service and type(service.FindItemIDByName) == "function" then
+            local nameItemID = service:FindItemIDByName(identity.itemName, identity.craftingQuality)
+            if nameItemID then
+                identity.itemID = nameItemID
+                identity.itemIDSource = "nameLookup"
+            end
+        end
+    end
+
     return FillItemInfo(identity)
 end
 

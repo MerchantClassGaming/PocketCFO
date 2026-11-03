@@ -86,6 +86,56 @@ local function RowName(row, itemID)
     return nil
 end
 
+-- Name index for ItemIdentityService name lookup (2026-11-01, Brian: enchant
+-- recipes resolve to the scroll with the recipe's name). Built in the same
+-- walk as the sibling groups.
+--   PocketCFO_ValuationDB.global.itemNameIndex[itemName][qualityTier] = itemID
+--   false = two different itemIDs share that name and quality (skipped).
+-- Retail: only items with a crafting quality (tier > 0), which keeps the
+-- saved list small. Forever has no crafting qualities, so there every named
+-- item is indexed under tier 0.
+local function IsForever()
+    local core = _G.PocketCFO
+    return core and core.flavor == "forever"
+end
+
+local function AddToNameIndex(nameIndex, row, itemID, tier)
+    if not itemID then
+        return
+    end
+    local tierKey
+    if tier and tier > 0 then
+        tierKey = tier
+    elseif IsForever() then
+        tierKey = 0
+    else
+        return
+    end
+    local name = RowName(row, itemID)
+    if not name then
+        return
+    end
+    local entry = nameIndex[name]
+    if not entry then
+        entry = {}
+        nameIndex[name] = entry
+    end
+    local previous = entry[tierKey]
+    if previous == nil then
+        entry[tierKey] = itemID
+    elseif previous ~= itemID then
+        entry[tierKey] = false
+    end
+end
+
+local function RegisterNameIndexWithIdentity(nameIndex)
+    local core = _G.PocketCFO
+    local identity = core and core.ItemIdentityService or _G.ItemIdentityService
+    if type(nameIndex) == "table" and identity and type(identity.RegisterNameIndex) == "function" then
+        identity:RegisterNameIndex(nameIndex)
+    end
+end
+
 -- True when two saved lists hold exactly the same groups.
 local function SameStore(a, b)
     if type(a) ~= "table" or type(b) ~= "table" then
@@ -155,6 +205,7 @@ function QualitySiblings:Rebuild()
 
     local token = (self.rebuildToken or 0) + 1
     self.rebuildToken = token
+    local nameIndex = {}
     local groups = {}
     local marketKeys = {}
     local lastKey = nil
@@ -172,6 +223,7 @@ function QualitySiblings:Rebuild()
                 if type(row) == "table" then
                     local itemID = tonumber(row.itemID)
                     local tier = tonumber(row.qualityTier)
+                    AddToNameIndex(nameIndex, row, itemID, tier)
                     if itemID and tier and tier > 0 then
                         local name = RowName(row, itemID)
                         if name then
@@ -219,7 +271,9 @@ function QualitySiblings:Rebuild()
         local db = PocketCFO_Valuation.db
         if db and db.global then
             db.global.qualitySiblings = store
+            db.global.itemNameIndex = nameIndex
         end
+        RegisterNameIndexWithIdentity(nameIndex)
         SessionLog("QualitySiblings: rebuilt - %d sibling groups (%s)", groupCount, changed and "changed" or "unchanged")
         -- Values only change if the list did; an unchanged list (the usual
         -- case on login) must not make every open screen recalculate
@@ -234,6 +288,10 @@ end
 
 function QualitySiblings:OnEnable()
     GetStore()
+    -- Hand the saved name index to the identity service right away, so a
+    -- recipe clicked before the delayed rebuild finishes still resolves.
+    local db = PocketCFO_Valuation.db
+    RegisterNameIndexWithIdentity(db and db.global and db.global.itemNameIndex)
     if C_Timer and C_Timer.After then
         C_Timer.After(REBUILD_DELAY_AFTER_LOAD_SECONDS, function()
             self:Rebuild()

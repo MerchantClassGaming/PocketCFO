@@ -526,24 +526,74 @@ end
 
 -- Same pick ProcessingAnalysisController's FindSelectedInput makes, falling
 -- back to the profile-driving input (Milling/Prospecting's herb/ore slot).
+-- Second return: every live input in the window (gem AND stone for
+-- Crushing), so the headline can price exactly what is slotted.
 local function FindSlottedProcessingInput(recipeID)
     local capture = PocketCFO_Crafting:GetModule("CraftEventCapture", true)
     if not recipeID or not capture or not capture.GetLiveProcessingInputs then
-        return nil
+        return nil, nil
     end
     local inputs = capture:GetLiveProcessingInputs(recipeID, "RecipeHeadline")
+    inputs = type(inputs) == "table" and inputs or nil
     local driver
-    for _, input in ipairs(type(inputs) == "table" and inputs or {}) do
+    for _, input in ipairs(inputs or {}) do
         if type(input) == "table" and input.itemID then
             if input.statisticalProfile == true or input.selectedCostInput == true then
-                return input
+                return input, inputs
             end
             if not driver and input.profileDriver == true then
                 driver = input
             end
         end
     end
-    return driver
+    return driver, inputs
+end
+
+-- Never force-loads PocketCFO_Valuation (same pattern as RecipeEconomicsService).
+local function GetHeadlineValuationService()
+    local loaded = (C_AddOns and C_AddOns.IsAddOnLoaded and C_AddOns.IsAddOnLoaded("PocketCFO_Valuation"))
+        or (IsAddOnLoaded and IsAddOnLoaded("PocketCFO_Valuation"))
+    if not loaded then return nil end
+    local valuation = _G.PocketCFO_Valuation
+    local service = valuation and valuation.GetModule and valuation:GetModule("ValuationService", true)
+    return (service and type(service.GetItemValue) == "function") and service or nil
+end
+
+-- Current value per unit, or nil when there is no price (never guessed).
+local function PriceHeadlineUnit(valuationService, itemID, configKey)
+    if not valuationService or not itemID then return nil end
+    local ok, priced = pcall(function()
+        return valuationService:GetItemValue({ itemID = itemID, configKey = configKey })
+    end)
+    if not ok or type(priced) ~= "table" or priced.unresolved then return nil end
+    return tonumber(priced.valuePerUnit)
+end
+
+-- The quality tier the crafting window says this craft will make (the
+-- expected quality bar), or nil when the recipe has no qualities. Same read
+-- RecipeStateCapture/IdentityAdapters use for ordinary recipes:
+-- SchematicForm:GetRecipeOperationInfo().craftingQuality, normalized to a
+-- tier. Theoretical for Crushing: Brian confirmed the window shows the same
+-- quality bar as every other recipe; not yet dumped in-game.
+local function GetWindowExpectedQualityTier(recipeID)
+    local sf = ProfessionsFrame and ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
+    if not sf or type(sf.GetRecipeOperationInfo) ~= "function" then return nil end
+    local okInfo, opInfo = pcall(sf.GetRecipeOperationInfo, sf)
+    if not okInfo or type(opInfo) ~= "table" then return nil end
+    local adapters = PocketCFO and PocketCFO.ItemIdentityAdapters or _G.PocketCFO_ItemIdentityAdapters
+    if not adapters or not adapters.NormalizeCraftingQualityTier
+        or not C_TradeSkillUI or not C_TradeSkillUI.GetRecipeInfo then
+        return nil
+    end
+    local okRecipe, recipeInfo = pcall(C_TradeSkillUI.GetRecipeInfo, recipeID)
+    if not okRecipe or type(recipeInfo) ~= "table" then return nil end
+    return adapters:NormalizeCraftingQualityTier(recipeInfo, opInfo.craftingQuality)
+end
+
+local function ItemNameOf(itemID)
+    if not itemID or not GetItemInfo then return nil end
+    local ok, name = pcall(GetItemInfo, itemID)
+    return ok and name or nil
 end
 
 -- Matches by configKey (exact quality); itemID only when the row has none.
@@ -573,13 +623,120 @@ local function HeadlineFromAnalysisRow(row)
     return { value = row.expectedPerCraft, style = "profit" }
 end
 
+-- Processing headline read from the crafting window, not the Analysis list
+-- (Brian, 2026-10-30). The Analysis list assumes matching quality inputs;
+-- the headline must describe the craft actually loaded.
+--   Cost: every slotted input (Crushing: 3 gems + the stone) at its own
+--     quality, priced now.
+--   Output: what the slotted item makes at the quality the window expects.
+--     Normally the slotted item's own Analysis row. When the window expects
+--     a different quality (e.g. high quality gem + low quality stone makes
+--     low quality), the same item's row at that quality. Quality changes
+--     only output quality, never counts (Brian), so that row's quantities
+--     hold. Quality variants share a name, so the match is by name + tier.
+--   Resourcefulness: the row's return quantities, priced as the slotted
+--     version of each returned item.
+--   No history for that item at that quality: Cost of Craft only.
+--   Any slotted input without a price: nothing shown (no partial numbers).
+local function BuildLiveProcessingHeadline(result)
+    local selected, inputs = FindSlottedProcessingInput(result.recipeID)
+    if not selected then
+        return nil
+    end
+
+    local row = FindRowForItem(result.rows, selected.configKey, selected.itemID)
+    local expectedTier = GetWindowExpectedQualityTier(result.recipeID)
+    local selectedTier = tonumber(selected.craftingQuality)
+    local selectedName = ItemNameOf(selected.itemID) or selected.itemName
+    if expectedTier and selectedTier and expectedTier ~= selectedTier then
+        row = nil
+        for _, candidate in ipairs(type(result.rows) == "table" and result.rows or {}) do
+            if tonumber(candidate.quality) == expectedTier and selectedName
+                and ItemNameOf(candidate.itemID) == selectedName then
+                row = candidate
+                break
+            end
+        end
+    end
+
+    -- Cost-style rows (Alchemy Recycling's Cost / Derivate) keep their own
+    -- headline unchanged.
+    if type(row) == "table" and row.analysisMode == "unitAcquisitionCost" then
+        return HeadlineFromAnalysisRow(row)
+    end
+
+    local summary = type(row) == "table" and type(row.summary) == "table" and row.summary or nil
+
+    local valuationService = GetHeadlineValuationService()
+    local liveInputCount = 0
+    local liveCost = 0
+    local livePriceByName = {}
+    for _, input in ipairs(inputs or {}) do
+        if type(input) == "table" and input.itemID then
+            local unit = PriceHeadlineUnit(valuationService, input.itemID, input.configKey)
+            if not unit then
+                SessionLog("RecipeHeadline: processing live recipeID=%s hidden reason=unpricedInput itemID=%s configKey=%s",
+                    tostring(result.recipeID), tostring(input.itemID), tostring(input.configKey))
+                return nil
+            end
+            liveInputCount = liveInputCount + 1
+            liveCost = liveCost + unit * (tonumber(input.quantity) or 0)
+            local name = ItemNameOf(input.itemID) or input.itemName
+            if name then
+                livePriceByName[name] = unit
+            end
+        end
+    end
+    -- Guard: a slot the live read missed (e.g. the stone) would undercount
+    -- cost, so every input role the registry defines for this recipe must be
+    -- slotted. Counted against the recipe's roles, never the history row's
+    -- input list: history can hold both qualities of the same stone across
+    -- runs, which made a fully slotted window look incomplete.
+    local registry = PocketCFO and PocketCFO.ProcessingOperationRegistry or _G.PocketCFO_ProcessingOperationRegistry
+    local entry = registry and registry.GetEntry and registry:GetEntry(result.recipeID)
+    local requiredInputCount = (type(entry) == "table" and type(entry.inputRoles) == "table") and #entry.inputRoles or 1
+    if liveInputCount == 0 or liveInputCount < requiredInputCount then
+        SessionLog("RecipeHeadline: processing live recipeID=%s hidden reason=missingSlottedInput live=%d required=%d",
+            tostring(result.recipeID), liveInputCount, requiredInputCount)
+        return nil
+    end
+
+    if not summary or summary.expectedOutputValue == nil then
+        return { value = liveCost, style = "neutral" }
+    end
+
+    local resourcefulnessValue = 0
+    for _, returned in ipairs(type(summary.resourcefulnessValueRows) == "table" and summary.resourcefulnessValueRows or {}) do
+        local quantity = tonumber(returned.quantityPerRun) or 0
+        local name = ItemNameOf(returned.itemID) or returned.itemName
+        local unit = name and livePriceByName[name] or nil
+        if unit then
+            resourcefulnessValue = resourcefulnessValue + unit * quantity
+        elseif returned.lineValue ~= nil then
+            resourcefulnessValue = resourcefulnessValue + returned.lineValue
+        elseif not returned.countedAsFree then
+            return { value = liveCost, style = "neutral" }
+        end
+    end
+
+    local net = summary.expectedOutputValue + resourcefulnessValue - liveCost
+    SessionLog("RecipeHeadline: processing live recipeID=%s selected=%s selectedTier=%s expectedTier=%s outputRowItemID=%s outputValue=%s resourcefulness=%s liveCost=%s net=%s",
+        tostring(result.recipeID), tostring(selected.itemID), tostring(selectedTier), tostring(expectedTier),
+        tostring(row and row.itemID), tostring(summary.expectedOutputValue), tostring(resourcefulnessValue),
+        tostring(liveCost), tostring(net))
+    return { value = net, style = "profit" }
+end
+
 function CraftQueueController:UpdateRecipeHeadline()
     local button = PocketCFO_Crafting:GetModule("SaveToInventoryButton", true)
     if not button or not button.SetHeadline then return end
 
     local result = type(self.lastAnalysisResult) == "table" and self.lastAnalysisResult or nil
     local headline
-    if result and not self.analysisInitialLoadInProgress then
+    -- Hidden while waiting on item details for a price (GetActiveItemDataHold),
+    -- so "Cost of Craft" never flashes before "Profit/Loss" (Brian, 2026-11-01).
+    if result and not self.analysisInitialLoadInProgress
+        and not self:GetActiveItemDataHold("headline") then
         if self.analysisMode == "liveRecipe" then
             local model = result.displayModel
             if type(model) == "table" and model.state == "resolved" then
@@ -590,10 +747,7 @@ function CraftQueueController:UpdateRecipeHeadline()
                 headline = HeadlineFromAnalysisRow(FindRowForItem(result.rows, result.currentOutputConfigKey, nil))
             end
         elseif self.analysisMode == "processing" then
-            local input = FindSlottedProcessingInput(result.recipeID)
-            if input then
-                headline = HeadlineFromAnalysisRow(FindRowForItem(result.rows, input.configKey, input.itemID))
-            end
+            headline = BuildLiveProcessingHeadline(result)
         end
     end
     button:SetHeadline(headline)
@@ -622,6 +776,148 @@ function CraftQueueController:UpdateAnalysisResultsToggleUI()
     if visible then
         window:SetAnalysisResultsToggleMode(self.analysisShowAllResults == true)
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Item data hold (2026-11-01, Brian): when an analysis is missing a price
+-- only because the game hasn't sent an item's details yet, draw nothing
+-- until they arrive, then draw the finished result once - never "cost only"
+-- flipping to profit a moment later. Blank for the first second, then
+-- "Loading analysis...", and after 3 seconds whatever we have, so nothing
+-- hangs. Items whose details are loaded and still have no price (bound
+-- items, nothing listed) are never waited on, so cost-only recipes show
+-- right away as before.
+-- ---------------------------------------------------------------------------
+
+local ITEM_DATA_HOLD_MESSAGE_SECONDS = 1.0
+local ITEM_DATA_HOLD_MAX_SECONDS     = 3.0
+
+local function IsItemDataLoaded(itemID)
+    local ok, name = pcall(GetItemInfo, itemID)
+    return ok and name ~= nil
+end
+
+-- Items the current result is waiting on.
+--   Live recipe: the output the display model flagged as unpriced with
+--     details not loaded at evaluation time (outputPendingItemID). Read
+--     from the result, not live, so a result built before the load is
+--     never drawn; the load re-runs the analysis (ScheduleRecipeNameRefresh).
+--   Processing / Craft Analysis: the same "needs price" rows
+--     ScheduleAnalysisItemDataRefresh watches, still unloaded or with a
+--     load callback outstanding.
+function CraftQueueController:CollectPendingPriceItemIDs(result)
+    local itemIDs = {}
+    if type(result) ~= "table" then
+        return itemIDs
+    end
+    if self.analysisMode == "liveRecipe" then
+        local displayModel = type(result.displayModel) == "table" and result.displayModel or nil
+        local itemID = displayModel and tonumber(displayModel.outputPendingItemID)
+        if itemID then
+            itemIDs[1] = itemID
+        end
+        return itemIDs
+    end
+
+    local rows = type(result.rows) == "table" and result.rows or nil
+    if not rows then
+        return itemIDs
+    end
+    local builder = GetDisplayModelBuilder()
+    local needsPriceReason = (builder and builder.VALUE_UNAVAILABLE_NEEDS_PRICE) or "needsPrice"
+    local outstanding = self.pendingAnalysisItemLoads or {}
+    local seen = {}
+    local function Consider(itemID)
+        itemID = tonumber(itemID)
+        if not itemID or seen[itemID] then return end
+        seen[itemID] = true
+        if outstanding[itemID] or not IsItemDataLoaded(itemID) then
+            itemIDs[#itemIDs + 1] = itemID
+        end
+    end
+    for _, row in ipairs(rows) do
+        if row.valueUnavailableReason == needsPriceReason then
+            Consider(row.itemID)
+            local missing = type(row.summary) == "table" and row.summary.missingValues or nil
+            for _, missingValue in ipairs(type(missing) == "table" and missing or {}) do
+                Consider(type(missingValue) == "table" and missingValue.itemID or nil)
+            end
+        end
+    end
+    return itemIDs
+end
+
+-- Shared check (analysis panel AND the headline by "Save to Inv. Manager"):
+-- returns the active hold while the current result is waiting on item
+-- details, nil when there is nothing to wait for or the 3s limit ran out.
+-- Starts the hold and its timers the first time it sees a recipe waiting,
+-- and makes sure the item loads are watched so the analysis re-runs.
+function CraftQueueController:GetActiveItemDataHold(reason)
+    local result = self.lastAnalysisResult
+    local pending = self:CollectPendingPriceItemIDs(result)
+    local hold = self.itemDataHold
+    local key = tostring(self.lastEvaluatedRecipeID) .. "|" .. tostring(self.analysisMode)
+
+    -- A processing re-run already queued by a load (OnPricingUpdated
+    -- debounce) means the result on hand is about to be replaced: keep
+    -- holding rather than draw it.
+    local rerunQueued = hold ~= nil and hold.key == key and self.analysisMode ~= "liveRecipe" and pricingRefreshPending
+
+    if #pending == 0 and not rerunQueued then
+        self.itemDataHold = nil
+        return nil
+    end
+    if hold and hold.key == key and hold.expired then
+        return nil
+    end
+
+    if not hold or hold.key ~= key then
+        hold = { key = key }
+        self.itemDataHold = hold
+        SessionLog("CraftQueueController: holding analysis for item data key=%s pending=%d reason=%s",
+            key, #pending, tostring(reason or "unspecified"))
+        if C_Timer and C_Timer.After then
+            C_Timer.After(ITEM_DATA_HOLD_MESSAGE_SECONDS, function()
+                if self.itemDataHold == hold and not hold.expired then
+                    hold.showMessage = true
+                    self:DoRender("itemDataHoldMessage")
+                end
+            end)
+            C_Timer.After(ITEM_DATA_HOLD_MAX_SECONDS, function()
+                if self.itemDataHold == hold then
+                    hold.expired = true
+                    SessionLog("CraftQueueController: item data hold expired key=%s", key)
+                    -- Draw whatever we have in both places, even if the
+                    -- analysis window is closed, so nothing stays hidden.
+                    self:UpdateRecipeHeadline()
+                    self:DoRender("itemDataHoldExpired")
+                end
+            end)
+        else
+            hold.expired = true
+            return nil
+        end
+    end
+
+    -- Make sure the loads are watched (the normal render path does this
+    -- after drawing; while holding we skip the draw).
+    if self.analysisMode == "liveRecipe" then
+        self:ScheduleRecipeNameRefresh(result)
+    else
+        self:ScheduleAnalysisItemDataRefresh(result)
+    end
+    return hold
+end
+
+-- Analysis panel: returns true when it drew the hold (blank, or the loading
+-- message after 1s) and the caller must not draw the result.
+function CraftQueueController:ApplyItemDataHold(window, reason)
+    local hold = self:GetActiveItemDataHold(reason)
+    if not hold then
+        return false
+    end
+    window:RenderAnalysisLoading(self.lastAnalysisResult, not hold.showMessage)
+    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -666,6 +962,15 @@ function CraftQueueController:DoRender(reason)
             window:RenderAnalysisLoading(self.lastAnalysisResult)
             LogTiming("CraftQueueController:DoRender", startedAt, string.format(
                 "mode=analysisLoading reason=%s", tostring(reason or "unspecified")
+            ))
+            return
+        end
+
+        -- Waiting on item details for a price: draw nothing yet (see
+        -- ApplyItemDataHold).
+        if self.lastAnalysisResult and self:ApplyItemDataHold(window, reason) then
+            LogTiming("CraftQueueController:DoRender", startedAt, string.format(
+                "mode=itemDataHold reason=%s", tostring(reason or "unspecified")
             ))
             return
         end

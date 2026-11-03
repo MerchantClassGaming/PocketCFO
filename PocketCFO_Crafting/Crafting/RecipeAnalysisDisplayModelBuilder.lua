@@ -268,6 +268,17 @@ function RecipeAnalysisDisplayModelBuilder:Build(economicsResult)
         }
         model.outputRows = outputRows
         model.outputSectionTitle = "Sells For"
+    elseif economics.outputItemID and SafeGetItemInfo(economics.outputItemID) == nil then
+        -- The game hasn't sent this item's details yet (e.g. an enchant's
+        -- scroll, which Blizzard's UI never shows, so it is never preloaded),
+        -- so it can't be priced yet. Confirmed in-game 2026-11-01: priced one
+        -- second later, but nothing redrew. CollectPendingItemIDs watches it;
+        -- CraftQueueController:ScheduleRecipeNameRefresh re-runs the analysis
+        -- when it loads. CraftQueueController:ApplyItemDataHold draws nothing
+        -- while this is set, so the player never sees an answer flip
+        -- (Brian); the note below only shows if the 3s hold runs out.
+        model.outputPendingItemID = economics.outputItemID
+        model.noPriceNote = "No auction price for this item."
     else
         model.noPriceNote = "No auction price for this item."
     end
@@ -299,6 +310,10 @@ function RecipeAnalysisDisplayModelBuilder:Build(economicsResult)
     for _, row in ipairs(BuildItemRows(economics.finishingReagentRows, "Unknown reagent")) do
         costs[#costs + 1] = row
     end
+    -- Enchanting Vellum on enchant recipes priced as scrolls (2026-11-01).
+    for _, row in ipairs(BuildItemRows(economics.vellumRows, "Enchanting Vellum")) do
+        costs[#costs + 1] = row
+    end
     model.costs = costs
 
     return model
@@ -323,6 +338,12 @@ function RecipeAnalysisDisplayModelBuilder:CollectPendingItemIDs(displayModel)
             seen[itemID] = true
             itemIDs[#itemIDs + 1] = itemID
         end
+    end
+    -- Unpriced output whose item details haven't loaded yet (see Build).
+    local outputItemID = displayModel.outputPendingItemID
+    if outputItemID and not seen[outputItemID] then
+        seen[outputItemID] = true
+        itemIDs[#itemIDs + 1] = outputItemID
     end
     return itemIDs
 end

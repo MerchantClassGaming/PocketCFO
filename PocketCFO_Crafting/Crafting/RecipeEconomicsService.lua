@@ -295,7 +295,10 @@ function RecipeEconomicsService:EvaluateObservation(observation)
 
     local materialCost, materialRows = PriceCostRows(valuationService, observation.reagents, diagnostics)
     local finishingCost, finishingRows = PriceCostRows(valuationService, observation.finishingReagents, diagnostics)
-    local totalCost = materialCost + finishingCost
+    -- Enchant recipes priced as scrolls: the vellum the scroll is made on
+    -- (RecipeObservationBuilder vellumRows). nil list = no rows, cost 0.
+    local vellumCost, vellumRows = PriceCostRows(valuationService, observation.vellumRows, diagnostics)
+    local totalCost = materialCost + finishingCost + vellumCost
 
     local resourcefulnessValue, resourcefulnessRows = ValueResourcefulness(valuationService, observation, diagnostics)
 
@@ -426,6 +429,7 @@ function RecipeEconomicsService:EvaluateObservation(observation)
             resourcefulnessRows = resourcefulnessRows,
             materialRows = materialRows,
             finishingReagentRows = finishingRows,
+            vellumRows = vellumRows,
         },
         diagnostics = diagnostics,
     }

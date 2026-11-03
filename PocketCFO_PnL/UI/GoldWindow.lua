@@ -1,14 +1,24 @@
 -- PocketCFO_PnL/UI/GoldWindow.lua
--- The Gold window: two tabs.
+-- The Gold window. Tabs:
+--   Gold per Hour - sessions and runs ranked by gold per hour, Start / Stop /
+--              Pause, per-run detail (UI/GoldPerHourTab.lua; 2026-10-31, was
+--              its own window, which is now the small tracker window).
 --   Balances - current gold per character, warband bank, account total
 --              (moved here from core GoldTracker; data still owned by core).
---   Orders   - what completed crafting orders earned (UI/OrdersTab.lua).
 --   Income   - where gold came from, by period and character. Click a source
---              to split it by profession and/or see its top items (AH sales).
---              Bars per day show income over time.
---   Gathering - value of what was gathered, by profession, plus recent
---              gathering sessions (UI/GatheringTab.lua).
--- Opened by core: /mcg gold -> GoldTracker:OpenWindow("balances").
+--              to split it by profession and/or see its top items. Auction
+--              House sales are grouped by what was sold (Gear, Crafting
+--              materials, ...; IncomeReport). Bars per day show income over time.
+--   Spending - where gold went (2026-10-27). Same layout and pane as Income.
+--              Both show earned / spent / net for the period (Income since 2026-10-31).
+--   Orders   - what completed crafting orders earned (UI/OrdersTab.lua).
+-- The Gathering tab was removed 2026-10-31 (Gold per Hour answers the same
+-- question; the capture behind it is unchanged).
+-- The window opens on the last tab used (saved in core settings,
+-- goldWindowTab; Gold per Hour the first time). The gear button opens the
+-- Pocket CFO settings page.
+-- Opened by core: minimap left-click -> GoldTracker:OpenWindow() (last tab);
+-- /mcg gold -> GoldTracker:OpenWindow("balances").
 -- Numbers are built in full before anything is drawn (no partial redraws).
 
 local PocketCFO = _G.PocketCFO
@@ -32,8 +42,8 @@ local CHART_GAP = 2
 local MAX_BAR_WIDTH = 24
 local MAX_ITEM_LINES = 10
 
-local COL_LABEL = 120
-local COL_BAR = 140
+local COL_LABEL = 140
+local COL_BAR = 120
 local COL_AMOUNT = 104
 local COL_SHARE = 40
 
@@ -122,12 +132,97 @@ local function GetBalances()
     return tracker and tracker:GetBalances() or { characters = {} }
 end
 
-local function SortedCharacters(characters)
+-- Characters still shown in the Gold window (hidden ones left out).
+local function SortedCharacters(characters, hidden)
     local list = {}
     for guid, entry in pairs(characters or {}) do
-        list[#list + 1] = { guid = guid, entry = entry }
+        if not (hidden and hidden[guid]) then
+            list[#list + 1] = { guid = guid, entry = entry }
+        end
     end
     return list
+end
+
+local function Tracker()
+    return PocketCFO:GetModule("GoldTracker", true)
+end
+
+-- Core settings table (the last tab used is kept there; PnL has no saved data).
+local function SettingsTable()
+    local globalDB = PocketCFO.db and PocketCFO.db.global
+    if not globalDB then
+        return {}
+    end
+    globalDB.settings = globalDB.settings or {}
+    return globalDB.settings
+end
+
+local VALID_TABS = { gph = true, balances = true, income = true, spending = true, orders = true }
+
+local function SavedTab()
+    local tab = SettingsTable().goldWindowTab
+    if not VALID_TABS[tab] or (tab == "orders" and IS_FOREVER) then
+        return "gph"
+    end
+    return tab
+end
+
+-- Character list behind the people button (top right, next to the X).
+-- Built with Blizzard's DropdownButton menu (same approach WeeklyRewards
+-- uses in Midnight). Click a name to check/uncheck it; Ctrl-click to remove.
+local function BuildCharacterMenu(_, rootDescription)
+    local tracker = Tracker()
+    local balances = GetBalances()
+    local hidden = balances.hidden or {}
+    local list = {}
+    local shown = 0
+    for guid, entry in pairs(balances.characters or {}) do
+        list[#list + 1] = { guid = guid, entry = entry }
+        if not hidden[guid] then
+            shown = shown + 1
+        end
+    end
+    table.sort(list, function(a, b)
+        local nameA, nameB = tostring(a.entry.name or ""), tostring(b.entry.name or "")
+        if nameA ~= nameB then
+            return nameA < nameB
+        end
+        return tostring(a.entry.realm or "") < tostring(b.entry.realm or "")
+    end)
+
+    rootDescription:CreateTitle(string.format("|cffffffffCharacters (%d/%d)|r", shown, #list))
+    for _, item in ipairs(list) do
+        -- Always show the server: same name on two servers is common.
+        local guid, nameText = item.guid, ClassColoredName(item.entry)
+        if item.entry.realm then
+            nameText = nameText .. "|cff888888-" .. tostring(item.entry.realm) .. "|r"
+        end
+        local checkbox = rootDescription:CreateCheckbox(nameText, function()
+            return not hidden[guid]
+        end)
+        checkbox:SetResponder(function()
+            if not tracker then
+                return MenuResponse.Refresh
+            end
+            if IsControlKeyDown() then
+                if guid == (UnitGUID and UnitGUID("player")) then
+                    PocketCFO:Print("You can't remove the character you are playing.")
+                else
+                    StaticPopup_ShowGenericConfirmation(
+                        string.format("Remove %s from the list?\nThey come back if you log in on them.", nameText),
+                        function()
+                            tracker:RemoveCharacter(guid)
+                        end)
+                end
+            else
+                tracker:SetHidden(guid, not hidden[guid])
+                hidden = GetBalances().hidden or {}
+            end
+            return MenuResponse.Refresh
+        end)
+    end
+    rootDescription:CreateSpacer()
+    rootDescription:CreateTitle("|cff20ff20Uncheck to hide. Ctrl-click to remove.|r")
 end
 
 -- ---------------------------------------------------------------------------
@@ -175,24 +270,75 @@ function GoldWindow:BuildWindow()
     local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
 
+    -- People button: pick which characters show (gap so it isn't the X).
+    local people = CreateFrame("DropdownButton", nil, frame)
+    people:SetSize(24, 24)
+    people:SetPoint("RIGHT", close, "LEFT", -10, 0)
+    people.icon = people:CreateTexture(nil, "ARTWORK")
+    people.icon:SetAtlas("squad_size_trios")
+    people.icon:SetSize(18, 18)
+    people.icon:SetPoint("CENTER")
+    people.icon:SetVertexColor(0.7, 0.7, 0.7, 1)
+    people:SetScript("OnEnter", function(self)
+        self.icon:SetVertexColor(1, 1, 1, 1)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Characters", 1, 1, 1)
+        GameTooltip:AddLine("Pick which characters show here.", nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    people:SetScript("OnLeave", function(self)
+        self.icon:SetVertexColor(0.7, 0.7, 0.7, 1)
+        GameTooltip:Hide()
+    end)
+    people:SetupMenu(BuildCharacterMenu)
+    frame.peopleButton = people
+
+    -- Settings: opens the Pocket CFO settings page (2026-10-31). The Gold
+    -- window closes first so the settings page isn't hidden behind it.
+    local gear = CreateFrame("Button", nil, frame)
+    gear:SetSize(18, 18)
+    gear:SetPoint("RIGHT", people, "LEFT", -6, 0)
+    gear:SetNormalTexture("Interface\\Buttons\\UI-OptionsButton")
+    gear:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+    gear:SetScript("OnClick", function()
+        local beta = PocketCFO:GetModule("BetaFeatures", true)
+        frame:Hide()
+        if beta and beta.OpenSettings then
+            beta:OpenSettings()
+        end
+    end)
+    gear:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Settings", 1, 1, 1)
+        GameTooltip:AddLine("Open the Pocket CFO settings.", nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    gear:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    frame.settingsButton = gear
+
     frame.tabs = {}
     local tabDefs = {
-        { key = "balances", label = "Balances" },
-        { key = "income",   label = "Income" },
-        { key = "gathering", label = "Gathering" },
+        { key = "gph",      label = "Gold per Hour", width = 96 },
+        { key = "balances", label = "Balances", width = 76 },
+        { key = "income",   label = "Income", width = 70 },
+        { key = "spending", label = "Spending", width = 76 },
     }
     if not IS_FOREVER then
-        tabDefs[#tabDefs + 1] = { key = "orders", label = "Orders" }
+        tabDefs[#tabDefs + 1] = { key = "orders", label = "Orders", width = 70 }
     end
-    for index, def in ipairs(tabDefs) do
+    local x = 12
+    for _, def in ipairs(tabDefs) do
         local tab = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-        tab:SetSize(90, 22)
-        tab:SetPoint("TOPLEFT", frame, "TOPLEFT", 12 + (index - 1) * 94, -30)
+        tab:SetSize(def.width, 22)
+        tab:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -30)
         tab:SetText(def.label)
         tab:SetScript("OnClick", function()
             GoldWindow:ShowTab(def.key)
         end)
         frame.tabs[def.key] = tab
+        x = x + def.width + 4
     end
 
     frame.balancesPane = CreateFrame("Frame", nil, frame)
@@ -204,9 +350,9 @@ function GoldWindow:BuildWindow()
     frame.incomePane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
     frame.incomePane:SetSize(INNER_WIDTH, 10)
 
-    frame.gatheringPane = CreateFrame("Frame", nil, frame)
-    frame.gatheringPane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
-    frame.gatheringPane:SetSize(INNER_WIDTH, 10)
+    frame.gphPane = CreateFrame("Frame", nil, frame)
+    frame.gphPane:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -60)
+    frame.gphPane:SetSize(INNER_WIDTH, 10)
 
     if not IS_FOREVER then
         frame.ordersPane = CreateFrame("Frame", nil, frame)
@@ -215,13 +361,13 @@ function GoldWindow:BuildWindow()
     end
 
     self.frame = frame
-    self.activeTab = "balances"
+    self.activeTab = SavedTab()
     self.periodKey = PocketCFO_PnL.IncomeReport.DEFAULT_PERIOD
     self.characterGUID = nil
     self.expanded = {}
 
     self:BuildIncomeControls()
-    self:BuildGatheringPane()
+    self:BuildGoldPerHourPane()
     if not IS_FOREVER then
         self:BuildOrdersPane()
     end
@@ -233,8 +379,6 @@ function GoldWindow:BuildWindow()
     self:RegisterMessage("MCG_GOLD_BALANCES_CHANGED", "OnDataChanged")
     self:RegisterMessage("MCG_GOLD_LEDGER_UPDATED", "OnDataChanged")
     self:RegisterMessage("MCG_ORDER_RESULTS_UPDATED", "OnDataChanged")
-    self:RegisterMessage("MCG_GATHERING_UPDATED", "OnDataChanged")
-    self:RegisterMessage("MCG_GATHERING_SESSION_CHANGED", "OnDataChanged")
 end
 
 function GoldWindow:OnDataChanged()
@@ -244,10 +388,11 @@ function GoldWindow:OnDataChanged()
 end
 
 function GoldWindow:ShowTab(tabKey)
-    if tabKey ~= "income" and tabKey ~= "gathering" and (tabKey ~= "orders" or IS_FOREVER) then
-        tabKey = "balances"
+    if not VALID_TABS[tabKey] or (tabKey == "orders" and IS_FOREVER) then
+        tabKey = "gph"
     end
     self.activeTab = tabKey
+    SettingsTable().goldWindowTab = tabKey
     for key, tab in pairs(self.frame.tabs) do
         if key == self.activeTab then
             tab:LockHighlight()
@@ -258,6 +403,7 @@ function GoldWindow:ShowTab(tabKey)
     self:Render()
 end
 
+-- tabKey nil = the last tab used.
 function GoldWindow:Toggle(tabKey)
     self:BuildWindow()
     tabKey = tabKey or self.activeTab
@@ -273,24 +419,30 @@ function GoldWindow:Render()
     if not self.frame then
         return
     end
+    -- The picked toon was unchecked or removed: go back to all toons.
+    local tracker = Tracker()
+    if self.characterGUID and tracker and tracker.IsShown and not tracker:IsShown(self.characterGUID) then
+        self.characterGUID = nil
+    end
     local panes = {
         balances = self.frame.balancesPane,
         income = self.frame.incomePane,
+        spending = self.frame.incomePane,  -- Spending shares the Income pane
         orders = self.frame.ordersPane,
-        gathering = self.frame.gatheringPane,
+        gph = self.frame.gphPane,
     }
     for key, pane in pairs(panes) do
-        if key ~= self.activeTab then
+        if pane ~= panes[self.activeTab] then
             pane:Hide()
         end
     end
     local height
-    if self.activeTab == "income" then
+    if self.activeTab == "income" or self.activeTab == "spending" then
         height = self:RenderIncome()
     elseif self.activeTab == "orders" then
         height = self:RenderOrders()
-    elseif self.activeTab == "gathering" then
-        height = self:RenderGathering()
+    elseif self.activeTab == "gph" then
+        height = self:RenderGoldPerHour()
     else
         height = self:RenderBalances()
     end
@@ -327,14 +479,14 @@ end
 
 function GoldWindow:RenderBalances()
     local balances = GetBalances()
-    local characters = {}
+    local characters = SortedCharacters(balances.characters, balances.hidden)
+    local anyHidden = next(balances.hidden or {}) ~= nil
     local characterTotal = 0
-    for _, item in ipairs(SortedCharacters(balances.characters)) do
-        characters[#characters + 1] = item.entry
+    for _, item in ipairs(characters) do
         characterTotal = characterTotal + (tonumber(item.entry.copper) or 0)
     end
     table.sort(characters, function(a, b)
-        return (tonumber(a.copper) or 0) > (tonumber(b.copper) or 0)
+        return (tonumber(a.entry.copper) or 0) > (tonumber(b.entry.copper) or 0)
     end)
 
     local warband = balances.warband
@@ -347,6 +499,9 @@ function GoldWindow:RenderBalances()
         name = "|cffffd100Account Total|r",
         money = FormatMoneyExact(characterTotal + (warbandCopper or 0)),
     }
+    if anyHidden then
+        lines[#lines + 1] = { name = "|cff888888Unchecked characters not included|r" }
+    end
     if not IS_FOREVER then
         lines[#lines + 1] = {
             name = "Warband Bank",
@@ -356,16 +511,20 @@ function GoldWindow:RenderBalances()
     end
     lines[#lines + 1] = {}
     local currentRealm = GetRealmName and GetRealmName()
-    for _, entry in ipairs(characters) do
-        if #lines >= MAX_BALANCE_ROWS then
-            break
-        end
+    local function NameWithRealm(entry)
         local name = ClassColoredName(entry)
         if entry.realm and entry.realm ~= currentRealm then
             name = name .. "|cff888888-" .. tostring(entry.realm) .. "|r"
         end
+        return name
+    end
+    for _, item in ipairs(characters) do
+        if #lines >= MAX_BALANCE_ROWS then
+            break
+        end
+        local entry = item.entry
         lines[#lines + 1] = {
-            name = name,
+            name = NameWithRealm(entry),
             money = FormatMoneyExact(entry.copper),
             age = FormatAge(entry.updatedAt),
         }
@@ -422,7 +581,8 @@ function GoldWindow:BuildFilterControls(pane, dropdownName)
         end
         UIDropDownMenu_AddButton(info)
 
-        local list = SortedCharacters(GetBalances().characters)
+        local balances = GetBalances()
+        local list = SortedCharacters(balances.characters, balances.hidden)
         table.sort(list, function(a, b)
             return tostring(a.entry.name or "") < tostring(b.entry.name or "")
         end)
@@ -464,6 +624,11 @@ function GoldWindow:BuildIncomeControls()
     pane.total:SetPoint("TOPLEFT", pane, "TOPLEFT", 0, -32)
     pane.total:SetWidth(INNER_WIDTH)
 
+    -- Earned / spent / net for the period (Income and Spending).
+    pane.net = CreateText(pane, "GameFontHighlightSmall")
+    pane.net:SetPoint("TOPLEFT", pane, "TOPLEFT", 0, -50)
+    pane.net:SetWidth(INNER_WIDTH)
+
     pane.empty = CreateText(pane, "GameFontDisableSmall")
     pane.empty:SetWordWrap(true)
     pane.empty:SetWidth(INNER_WIDTH)
@@ -479,7 +644,6 @@ function GoldWindow:BuildIncomeControls()
     pane.footer = CreateText(pane, "GameFontDisableSmall")
     pane.footer:SetWordWrap(true)
     pane.footer:SetWidth(INNER_WIDTH)
-    pane.footer:SetText("Open your mailbox to include your latest Auction House sales.")
 end
 
 function GoldWindow:GetSourceRow(index)
@@ -511,9 +675,19 @@ function GoldWindow:GetSourceRow(index)
     row.share:SetPoint("RIGHT", row, "RIGHT", 0, 0)
     row.share:SetWidth(COL_SHARE)
 
-    row:SetScript("OnClick", function(self)
-        if self.sourceKey and self.expandable then
-            GoldWindow.expanded[self.sourceKey] = not GoldWindow.expanded[self.sourceKey] or nil
+    -- Right-click: personal spending menu (2026-11-02; Theoretical until seen).
+    row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    row:SetScript("OnClick", function(self, button)
+        if button == "RightButton" then
+            if self.menuItem then
+                GoldWindow:ShowPersonalMenu(self)
+            end
+            return
+        end
+        -- Income and Spending share category keys; each line carries its own
+        -- expand key (source, AH group, AH second level).
+        if self.expandKey then
+            GoldWindow.expanded[self.expandKey] = not GoldWindow.expanded[self.expandKey] or nil
             GoldWindow:Render()
         end
     end)
@@ -522,6 +696,12 @@ function GoldWindow:GetSourceRow(index)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:AddLine("Unknown")
             GameTooltip:AddLine("Gold PocketCFO couldn't trace to a source.", 1, 1, 1, true)
+            GameTooltip:Show()
+        elseif self.menuItem then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(self.menuItem.name)
+            GameTooltip:AddLine(self.menuItem.personal and "Right-click: this was for the business"
+                or "Right-click: this was personal", 0.7, 0.7, 0.7, true)
             GameTooltip:Show()
         end
     end)
@@ -578,8 +758,29 @@ function GoldWindow:ShowBarTooltip(bar)
     GameTooltip:Show()
 end
 
+-- Right-click menu on a spending item or a personal item (2026-11-02).
+-- Applies to what the row shows: the period and the characters in view.
+-- MenuUtil.CreateContextMenu: Theoretical until seen in-game here.
+function GoldWindow:ShowPersonalMenu(row)
+    local item = row.menuItem
+    if not item or not (MenuUtil and MenuUtil.CreateContextMenu) then
+        return
+    end
+    local periodKey, characterGUID = self.periodKey, self.characterGUID
+    MenuUtil.CreateContextMenu(row, function(_, rootDescription)
+        rootDescription:CreateTitle(item.name)
+        rootDescription:CreateButton(item.personal and "This was for the business" or "This was personal", function()
+            GameTooltip:Hide()
+            PocketCFO_PnL.IncomeReport:SetPersonal(item.name, item.category, periodKey, characterGUID,
+                not item.personal)
+        end)
+    end)
+end
+
 -- Adds up to MAX_ITEM_LINES item lines (plus one "N more items" line).
-local function AddItemLines(lines, items, indent)
+-- menuCategory (Spending only, 2026-11-02): named item lines get a
+-- right-click "This was personal" for that category.
+local function AddItemLines(lines, items, indent, menuCategory)
     for index, item in ipairs(items or {}) do
         if index > MAX_ITEM_LINES then
             local restCopper = 0
@@ -599,6 +800,8 @@ local function AddItemLines(lines, items, indent)
             copper = item.copper,
             sub = true,
             wide = true,
+            menuItem = (menuCategory and item.label ~= "Unknown item")
+                and { name = item.label, category = menuCategory, personal = false } or nil,
         }
     end
 end
@@ -606,28 +809,69 @@ end
 function GoldWindow:RenderIncome()
     local pane = self.frame.incomePane
     local report = PocketCFO_PnL.IncomeReport
-    local model = report:Build(self.periodKey, self.characterGUID)
+    local isSpending = self.activeTab == "spending"
+    local model = report:Build(self.periodKey, self.characterGUID, isSpending and "spend" or nil)
+    -- The other side, for the earned / spent / net line.
+    local otherModel = report:Build(self.periodKey, self.characterGUID, (not isSpending) and "spend" or nil)
+    local other = otherModel.total or 0
+    local earned = isSpending and other or model.total
+    local spent = isSpending and model.total or other
+    -- Personal spending (2026-11-02): not in any number above; its own line.
+    local personal = (isSpending and model.personal or otherModel.personal) or { total = 0, items = {} }
+    local hasPersonal = (personal.total or 0) > 0
 
     self:UpdateFilterControls(pane, model.period.key)
+
+    local function Marker(isOpen)
+        return isOpen and "- " or "+ "
+    end
 
     -- Build the row list in full before drawing.
     local lines = {}
     for _, source in ipairs(model.sources) do
-        local isOpen = source.expandable and self.expanded[source.key]
-        local marker = ""
-        if source.expandable then
-            marker = isOpen and "- " or "+ "
-        end
+        local sourceExpandKey = self.activeTab .. ":" .. source.key
+        local isOpen = source.expandable and self.expanded[sourceExpandKey]
         lines[#lines + 1] = {
             sourceKey = source.key,
-            expandable = source.expandable,
-            label = marker .. source.label,
+            expandKey = source.expandable and sourceExpandKey or nil,
+            label = (source.expandable and Marker(isOpen) or "") .. source.label,
             copper = source.copper,
             share = source.share,
             barShare = source.share,
             color = BAR_COLOR,
         }
-        if isOpen and source.showProfessions then
+        if isOpen and source.groups then
+            -- Auction House: what was sold, then a second level, then items.
+            for _, group in ipairs(source.groups) do
+                local groupKey = sourceExpandKey .. ":g:" .. group.key
+                local groupOpen = self.expanded[groupKey]
+                lines[#lines + 1] = {
+                    expandKey = groupKey,
+                    label = "    " .. Marker(groupOpen) .. "|cffdddddd" .. group.label .. "|r",
+                    copper = group.copper,
+                    barShare = model.total > 0 and (group.copper / model.total) or 0,
+                    color = SUB_BAR_COLOR,
+                    sub = true,
+                }
+                if groupOpen then
+                    AddItemLines(lines, group.items, "        ")
+                    for _, sub in ipairs(group.subs) do
+                        local subKey = groupKey .. ":s:" .. sub.key
+                        local subOpen = self.expanded[subKey]
+                        lines[#lines + 1] = {
+                            expandKey = subKey,
+                            label = "        " .. Marker(subOpen) .. "|cffbbbbbb" .. sub.label .. "|r",
+                            copper = sub.copper,
+                            sub = true,
+                            wide = true,
+                        }
+                        if subOpen then
+                            AddItemLines(lines, sub.items, "            ")
+                        end
+                    end
+                end
+            end
+        elseif isOpen and source.showProfessions then
             for _, profession in ipairs(source.professions) do
                 lines[#lines + 1] = {
                     label = "    |cffbbbbbb" .. profession.label .. "|r",
@@ -637,35 +881,82 @@ function GoldWindow:RenderIncome()
                     sub = true,
                 }
                 -- That profession's items, one level deeper.
-                AddItemLines(lines, profession.items, "        ")
+                AddItemLines(lines, profession.items, "        ", isSpending and source.key or nil)
             end
         elseif isOpen then
-            AddItemLines(lines, source.items, "    ")
+            AddItemLines(lines, source.items, "    ", isSpending and source.key or nil)
+        end
+    end
+
+    -- Personal spending (2026-11-02): one line right under earned / spent /
+    -- net, on Income and Spending, only when the period has any. Click to
+    -- list the items; right-click an item to put it back in business spending.
+    if hasPersonal then
+        local personalOpen = self.expanded.personal
+        local personalLines = {
+            {
+                expandKey = "personal",
+                label = "|cff999999" .. Marker(personalOpen) .. "Personal spending (not counted above)|r",
+                copper = personal.total,
+                sub = true,
+                wide = true,
+            },
+        }
+        if personalOpen then
+            for _, item in ipairs(personal.items) do
+                personalLines[#personalLines + 1] = {
+                    label = string.format("    |cff999999%s|r |cff777777x%d|r", item.name, item.quantity or 0),
+                    copper = item.copper,
+                    sub = true,
+                    wide = true,
+                    menuItem = { name = item.name, category = item.category, personal = true },
+                }
+            end
+        end
+        personalLines[#personalLines].gapAfter = 6
+        for index = #personalLines, 1, -1 do
+            table.insert(lines, 1, personalLines[index])
         end
     end
 
     -- Draw.
     local y = -32
-    if model.total > 0 then
-        pane.total:SetText("Total earned: " .. FormatIncome(model.total))
+    if model.total > 0 or hasPersonal then
+        pane.total:SetText((isSpending and "Total spent: " or "Total earned: ") .. FormatIncome(model.total))
         pane.total:Show()
         pane.empty:Hide()
         y = y - 22
+        local net = earned - spent
+        local netText = (net >= 0) and ("|cff33ff33+" .. FormatIncome(net) .. "|r")
+            or ("|cffff4444-" .. FormatIncome(-net) .. "|r")
+        pane.net:SetText("Earned " .. FormatIncome(earned) .. "   Spent " .. FormatIncome(spent)
+            .. "   Net " .. netText)
+        pane.net:Show()
+        y = y - 20
     else
         pane.total:Hide()
+        pane.net:Hide()
         pane.empty:ClearAllPoints()
         pane.empty:SetPoint("TOPLEFT", pane, "TOPLEFT", 0, y)
-        pane.empty:SetText("No income recorded for this period yet. Gold is counted from the day PocketCFO was installed.")
+        pane.empty:SetText(isSpending
+            and "No spending recorded for this period yet. Spending is counted from the day PocketCFO was installed."
+            or "No income recorded for this period yet. Gold is counted from the day PocketCFO was installed.")
         pane.empty:Show()
         y = y - 32
     end
+    pane.chartCaption:SetText(isSpending and "Gold spent per day (hover a bar for details)"
+        or "Gold earned per day (hover a bar for details)")
+    pane.footer:SetText(isSpending
+        and "Gold moved between your own characters is not counted."
+        or "Open your mailbox to include your latest Auction House sales.")
 
     for index, line in ipairs(lines) do
         local row = self:GetSourceRow(index)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", pane, "TOPLEFT", 0, y)
         row.sourceKey = line.sourceKey
-        row.expandable = line.expandable
+        row.expandKey = line.expandKey
+        row.menuItem = line.menuItem
         row.label:SetText(line.label)
         row.label:SetWidth(line.wide and (COL_LABEL + 4 + COL_BAR) or COL_LABEL)
         row.amount:SetText(FormatIncome(line.copper))
@@ -679,7 +970,7 @@ function GoldWindow:RenderIncome()
             row.bar:Hide()
         end
         row:Show()
-        y = y - ROW_HEIGHT
+        y = y - ROW_HEIGHT - (line.gapAfter or 0)
     end
     for index = #lines + 1, #pane.sourceRows do
         pane.sourceRows[index]:Hide()

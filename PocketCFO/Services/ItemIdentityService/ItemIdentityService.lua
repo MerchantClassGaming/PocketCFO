@@ -337,6 +337,52 @@ function ItemIdentityService:Matches(leftIdentity, rightIdentity)
         "configKeyEquality"
 end
 
+-- ---------------------------------------------------------------------------
+-- Name lookup (2026-11-01, Brian): evidence with an item name (and crafting
+-- quality when the item has qualities) but no itemID resolves to the itemID
+-- here. First use: enchant recipes, whose spell has no output item; the
+-- scroll made on a vellum has the recipe's name (confirmed in-game:
+-- "Enchant Boots - Shaladrassil's Roots", Q1 = 243982, Q2 = 243983).
+--
+-- The names come from PocketCFO_Valuation's AH scan data. Core never calls
+-- Tier 2, so Valuation hands its index over with RegisterNameIndex:
+--   index[itemName][qualityTier] = itemID, or false when two different
+--   itemIDs share that name and quality (never guessed). Quality tier 0 =
+--   item without crafting qualities (Forever only).
+-- In memory only; Valuation keeps the saved copy.
+-- ---------------------------------------------------------------------------
+function ItemIdentityService:RegisterNameIndex(index)
+    if type(index) == "table" then
+        self.nameIndex = index
+    end
+end
+
+--- itemID for this name and crafting quality, or nil. Without a quality,
+-- only a name that maps to exactly one item resolves.
+function ItemIdentityService:FindItemIDByName(itemName, craftingQuality)
+    local index = self.nameIndex
+    if type(index) ~= "table" or type(itemName) ~= "string" or itemName == "" then
+        return nil
+    end
+    local entry = index[itemName]
+    if type(entry) ~= "table" then
+        return nil
+    end
+    local tier = tonumber(craftingQuality)
+    if tier then
+        return tonumber(entry[tier]) or nil
+    end
+    local onlyItemID, count = nil, 0
+    for _, itemID in pairs(entry) do
+        count = count + 1
+        onlyItemID = itemID
+    end
+    if count == 1 then
+        return tonumber(onlyItemID) or nil
+    end
+    return nil
+end
+
 function ItemIdentityService:ResolveConfigKey(configKey)
     return nil, "configKeyReverseLookupUnsupported"
 end

@@ -145,9 +145,26 @@ local function FormatLastScanAge(timestamp)
     return ColorAgeText(ageText, ageSeconds)
 end
 
+local function LinkItemID(link)
+    return type(link) == "string" and tonumber(link:match("item:(%d+)")) or nil
+end
+
+-- Recipes (confirmed in-game 2026-10-26, /mcgd tipcalls on Plans: Amani
+-- Forgemaster's Decorative Spear): data.id is the recipe, but data.hyperlink
+-- is the CRAFTED item's link, so the value line priced the crafted item.
+-- tooltip:GetItem() returns the recipe's own link. When data.hyperlink's item
+-- doesn't match data.id, the tooltip's own link is used instead.
 local function ExtractItemLink(tooltip, data)
     if data and type(data) == "table" then
         if data.hyperlink then
+            local dataID = tonumber(data.id)
+            local linkID = LinkItemID(data.hyperlink)
+            if dataID and linkID and linkID ~= dataID and tooltip and tooltip.GetItem then
+                local ok, _, ownLink = pcall(tooltip.GetItem, tooltip)
+                if ok and LinkItemID(ownLink) == dataID then
+                    return ownLink
+                end
+            end
             return data.hyperlink
         end
         if data.itemLink then
@@ -377,7 +394,7 @@ local function AddValuationLine(tooltip, data)
     end
     marketKey = marketKey or ("itemID:" .. tostring(itemID))
     if TooltipAlreadyHasLine(tooltip, itemLink, marketKey, lineText) then
-        return
+        return value, lineText
     end
 
     tooltip:AddLine(lineText, 0.2, 0.9, 0.8)
@@ -387,6 +404,105 @@ local function AddValuationLine(tooltip, data)
         pcall(tooltip.Show, tooltip)
     end
     SetLastLookup(itemLink, identity, marketKey, exact, value, freshness, nil, "Value: " .. tostring(result.source))
+    -- Returned for AddDisenchantAndVendorLines (highest-value highlight).
+    return value, lineText
+end
+
+-- Disenchant and vendor lines (Brian, 2026-10-25). Values only, no advice:
+--   Disenchant (Estimated): average gold per disenchant (DisenchantValue)
+--   Vendor: what a merchant pays per item; no line when it pays nothing
+-- When two or more of PocketCFO Value / Disenchant / Vendor are shown, the
+-- highest is green and the others white. With one value, colors are
+-- unchanged.
+-- Flavor: Both. DisenchantValue is looked up silently, so a flavor without
+-- it (or with no disenchant data yet) shows only the vendor line.
+-- Theoretical: GetItemInfo sellPrice is 0 for items a merchant won't buy;
+-- the line is skipped for 0 or nil either way.
+-- No tooltip:Show() here (Midnight finding: never call it in a tooltip
+-- hook). AddValuationLine still calls it as before; unchanged.
+local HIGHEST_COLOR = { 0.1, 1.0, 0.1 }
+local OTHER_COLOR = { 1.0, 1.0, 1.0 }
+local VALUE_COLOR = { 0.2, 0.9, 0.8 }
+
+local function FindLeftLine(tooltip, lineText)
+    if not tooltip or not lineText or not tooltip.GetName then
+        return nil
+    end
+    local name = tooltip:GetName()
+    if not name then
+        return nil
+    end
+    local lineCount = tooltip.NumLines and tooltip:NumLines() or 0
+    for i = 1, lineCount do
+        local line = _G[name .. "TextLeft" .. i]
+        if line and line.GetText and line:GetText() == lineText then
+            return line
+        end
+    end
+    return nil
+end
+
+local function AddLineOnce(tooltip, lineText)
+    if not TooltipHasLine(tooltip, lineText) then
+        tooltip:AddLine(lineText, VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3])
+    end
+end
+
+local function AddDisenchantAndVendorLines(tooltip, data, pocketValue, pocketLine)
+    if not tooltip then
+        return
+    end
+    if IsQualityReagentSlotTooltip(tooltip) then
+        return
+    end
+    local itemLink = ExtractItemLink(tooltip, data)
+    if not itemLink then
+        return
+    end
+
+    local shown = {}
+    if tonumber(pocketValue) and pocketLine then
+        shown[#shown + 1] = { value = tonumber(pocketValue), text = pocketLine }
+    end
+
+    local disenchantValue = PocketCFO_Valuation:GetModule("DisenchantValue", true)
+    if disenchantValue then
+        local ok, estimate = pcall(disenchantValue.GetEstimate, disenchantValue, itemLink)
+        local formatted = ok and FormatCopper(estimate) or nil
+        if formatted then
+            local text = "Disenchant (Estimated): " .. formatted
+            AddLineOnce(tooltip, text)
+            shown[#shown + 1] = { value = tonumber(estimate), text = text }
+        end
+    end
+
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    if getInfo then
+        local ok, sellPrice = pcall(function() return select(11, getInfo(itemLink)) end)
+        sellPrice = ok and tonumber(sellPrice) or nil
+        if sellPrice and sellPrice > 0 then
+            local text = "Vendor: " .. FormatCopper(sellPrice)
+            AddLineOnce(tooltip, text)
+            shown[#shown + 1] = { value = sellPrice, text = text }
+        end
+    end
+
+    if #shown < 2 then
+        return
+    end
+    local highest = shown[1].value
+    for _, entry in ipairs(shown) do
+        if entry.value > highest then
+            highest = entry.value
+        end
+    end
+    for _, entry in ipairs(shown) do
+        local line = FindLeftLine(tooltip, entry.text)
+        if line and line.SetTextColor then
+            local color = (entry.value == highest) and HIGHEST_COLOR or OTHER_COLOR
+            line:SetTextColor(color[1], color[2], color[3])
+        end
+    end
 end
 
 local function QualityIconMarkup(itemID, fallbackTier)
@@ -530,7 +646,8 @@ function Tooltip:OnEnable()
     if hasTooltipDataProcessor then
         if not TOOLTIP_DATA_HOOKED then
             TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, function(tooltip, data)
-                AddValuationLine(tooltip, data)
+                local pocketValue, pocketLine = AddValuationLine(tooltip, data)
+                pcall(AddDisenchantAndVendorLines, tooltip, data, pocketValue, pocketLine)
             end)
             TOOLTIP_DATA_HOOKED = true
         end

@@ -165,6 +165,31 @@ local function ResolveSchematicForm()
     return craftingPage and craftingPage.SchematicForm or nil
 end
 
+-- Predicted quality tier (1, 2, ...) for a recipe with no output item.
+-- GetOutputOverrideQualityID is the form's current predicted quality,
+-- Concentration included (see ResolveOutputItemLink); the operation's
+-- craftingQuality is the fallback. Both go through the identity adapters'
+-- NormalizeCraftingQualityTier (accepts a tier or a qualityID). nil when the
+-- recipe has no qualities (Forever). Theoretical for enchant recipes until
+-- checked in-game.
+local function ResolvePredictedQualityTier(recipeInfo, sf, operationInfo)
+    local adapters = PocketCFO and PocketCFO.ItemIdentityAdapters or _G.PocketCFO_ItemIdentityAdapters
+    if not adapters or type(adapters.NormalizeCraftingQualityTier) ~= "function" then
+        return nil
+    end
+    local okQuality, qualityID = SafeMethod(sf, "GetOutputOverrideQualityID")
+    local tier = okQuality and adapters:NormalizeCraftingQualityTier(recipeInfo, qualityID) or nil
+    if not tier then
+        tier = adapters:NormalizeCraftingQualityTier(recipeInfo, operationInfo and operationInfo.craftingQuality)
+    end
+    return tier
+end
+
+-- Enchanting Vellum: the target an enchant is cast on to make a scroll.
+-- Priced through ValuationService like any mat (VendorPriceDefaults has it;
+-- a merchant visit replaces the default with the real price).
+local ENCHANTING_VELLUM_ITEM_ID = 38682
+
 local function ResolveOutput(recipeID, recipeInfo, schematicInfo, sf, operationInfo, diagnostics)
     local identityService = GetItemIdentityService()
     local fallbackItemID = NumberOrNil(schematicInfo and schematicInfo.outputItemID)
@@ -179,6 +204,20 @@ local function ResolveOutput(recipeID, recipeInfo, schematicInfo, sf, operationI
         return fallbackItemID, nil, nil
     end
 
+    -- Enchant recipes (2026-11-01): the spell has no output item, so the
+    -- identity service finds the scroll by the recipe's name. Scrolls come
+    -- in a separate itemID per quality, so pass the quality the form
+    -- predicts. Only for recipes with no output item; every other recipe's
+    -- identity call is unchanged.
+    local nameLookupQuality = nil
+    if not fallbackItemID then
+        nameLookupQuality = ResolvePredictedQualityTier(recipeInfo, sf, operationInfo)
+        diagnostics.noOutputItemLookup = {
+            recipeName = recipeInfo and recipeInfo.name,
+            qualityTier = nameLookupQuality,
+        }
+    end
+
     local _, currentRecipeInfo = SafeMethod(sf, "GetRecipeInfo")
     local ok, identity, resolution = pcall(function()
         return identityService:BuildRecipeOutputIdentity(recipeID, {
@@ -186,8 +225,13 @@ local function ResolveOutput(recipeID, recipeInfo, schematicInfo, sf, operationI
             currentRecipeInfo = type(currentRecipeInfo) == "table" and currentRecipeInfo or nil,
             schematicInfo = schematicInfo,
             operationInfo = operationInfo,
+            craftingQuality = nameLookupQuality,
         })
     end)
+    if diagnostics.noOutputItemLookup then
+        diagnostics.noOutputItemLookup.resolvedItemID = ok and type(identity) == "table" and NumberOrNil(identity.itemID) or nil
+        diagnostics.noOutputItemLookup.itemIDSource = ok and type(identity) == "table" and identity.itemIDSource or nil
+    end
 
     local resolvedItemID = (ok and type(identity) == "table" and NumberOrNil(identity.itemID))
         or (ok and type(resolution) == "table" and NumberOrNil(resolution.targetItemID))
@@ -272,6 +316,14 @@ function RecipeObservationBuilder:BuildCurrentRecipeObservation(recipeID)
 
     local outputItemID, outputConfigKey, outputQuality =
         ResolveOutput(recipeID, recipeInfo, schematicInfo, sf, operationInfo, diagnostics)
+
+    -- An enchant priced as its scroll uses up a vellum: one vellum per craft
+    -- in the cost (2026-11-01, Brian). Kept out of reagents so
+    -- Resourcefulness never predicts returned vellums.
+    local vellumRows = nil
+    if diagnostics.noOutputItemLookup and diagnostics.noOutputItemLookup.itemIDSource == "nameLookup" and outputItemID then
+        vellumRows = { { itemID = ENCHANTING_VELLUM_ITEM_ID, quantity = 1 } }
+    end
     local outputItemLink = ResolveOutputItemLink(recipeID, sf, transaction, reagentTbl)
     if outputItemLink and GetItemInfoInstant then
         -- Keep itemID and link describing the same item (per-quality itemIDs).
@@ -291,6 +343,7 @@ function RecipeObservationBuilder:BuildCurrentRecipeObservation(recipeID)
             baseOutputQuantity = baseOutputQuantity,
             reagents = reagents,
             finishingReagents = finishingReagents,
+            vellumRows = vellumRows,
             displayedResourcefulnessPct = resourcefulnessPct,
             displayedMulticraftPct = multicraftPct,
             concentrating = concentrating,

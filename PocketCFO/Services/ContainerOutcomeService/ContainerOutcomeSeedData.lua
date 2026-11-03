@@ -13,7 +13,12 @@
 
 local PocketCFO = _G.PocketCFO
 
-local SEED_VERSION = 1
+-- Version 2 (2026-10-30): three War Within items removed from the Midnight
+-- payout (246585): Artisan's Acuity x30 (a War Within order reward) and two
+-- War Within profession tools (Bismuth Fisherfriend, Lightweight Scribe's
+-- Quill; most likely mail). The logger counted anything new in the bags during
+-- an opening. Items matching the bag's expansion were kept (Brian).
+local SEED_VERSION = 2
 
 local SEED_CONTAINERS = {
     [260534] = {
@@ -46,7 +51,6 @@ local SEED_CONTAINERS = {
             { itemID = 259085, quality = 0, quantity = 2 }, -- Void-Touched Augment Rune
             -- excluded self-referential capture artifact: itemID=246585 quality=0 quantity=2 ("Artisan's Consortium Payout")
             { itemID = 238523, quality = 0, quantity = 102 }, -- Carving Canine
-            { itemID = 210814, quality = 0, quantity = 30 }, -- Artisan's Acuity
             { itemID = 238522, quality = 0, quantity = 130 }, -- Peerless Plumage
             { itemID = 246335, quality = 0, quantity = 2 }, -- Glimmer of Midnight Tailoring Knowledge
             { itemID = 238514, quality = 2, quantity = 248 }, -- Void-Tempered Scales
@@ -54,7 +58,6 @@ local SEED_CONTAINERS = {
             { itemID = 237364, quality = 1, quantity = 122 }, -- Brilliant Silver Ore
             { itemID = 236770, quality = 1, quantity = 85 }, -- Sanguithorn
             { itemID = 236775, quality = 2, quantity = 34 }, -- Azeroot
-            { itemID = 221790, quality = 5, quantity = 1 }, -- Bismuth Fisherfriend
             { itemID = 238520, quality = 1, quantity = 1 }, -- Void-Tempered Plating
             { itemID = 237365, quality = 2, quantity = 65 }, -- Brilliant Silver Ore
             { itemID = 238525, quality = 0, quantity = 104 }, -- Fantastic Fur
@@ -68,7 +71,6 @@ local SEED_CONTAINERS = {
             { itemID = 247719, quality = 0, quantity = 253 }, -- Multicraft Matrix
             { itemID = 237362, quality = 1, quantity = 118 }, -- Umbral Tin Ore
             { itemID = 238518, quality = 1, quantity = 3 }, -- Void-Tempered Hide
-            { itemID = 222573, quality = 5, quantity = 1 }, -- Lightweight Scribe's Quill
             { itemID = 251285, quality = 0, quantity = 249 }, -- Petrified Root
             { itemID = 237361, quality = 2, quantity = 328 }, -- Refulgent Copper Ore
             { itemID = 247725, quality = 0, quantity = 254 }, -- Resourceful Rebar

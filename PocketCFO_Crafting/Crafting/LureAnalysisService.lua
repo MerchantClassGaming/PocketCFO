@@ -17,6 +17,10 @@
 -- RecipeEconomicsService:EvaluateObservation - no cost math here.
 --
 -- Storage: PocketCFO_Crafting_DB.global.lureRecipes[lureItemID] = observation
+--
+-- Gold per Hour (2026-10-26): lures are bind on pickup, so their cost for a
+-- Grand beasts run is this Cost to Make. Every known lure cost is sent to core
+-- ActivityRuns:SetLureCost when this addon loads and after each Evaluate.
 
 -- Patch compat: Blizzard removed the global item APIs; route to C_Item.
 local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
@@ -247,7 +251,35 @@ function LureAnalysisService:Evaluate(economicsResult)
     end)
 
     selected.allLures = allLures
+    self:PushLureCosts()
     return selected
+end
+
+-- Sends every lure cost we can price (saved observations, today's values)
+-- to core ActivityRuns for Grand beasts runs.
+function LureAnalysisService:PushLureCosts()
+    local activityRuns = PocketCFO and PocketCFO:GetModule("ActivityRuns", true)
+    local economicsService = GetEconomicsService()
+    local saved = SavedLureRecipes()
+    if not activityRuns or not economicsService or not economicsService.EvaluateObservation or not saved then
+        return
+    end
+    for lureItemID, observation in pairs(saved) do
+        local ok, result = pcall(function()
+            return economicsService:EvaluateObservation(observation)
+        end)
+        local cost = ok and type(result) == "table" and result.resolved and LureCost(result.economics) or nil
+        if cost then
+            activityRuns:SetLureCost(lureItemID, cost)
+        end
+    end
+end
+
+function LureAnalysisService:OnEnable()
+    -- Short delay so saved data and valuation are ready.
+    C_Timer.After(2, function()
+        LureAnalysisService:PushLureCosts()
+    end)
 end
 
 function LureAnalysisService:GetLureName(lureItemID)

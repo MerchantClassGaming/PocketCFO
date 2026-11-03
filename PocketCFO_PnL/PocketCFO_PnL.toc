@@ -2,15 +2,15 @@
 ## Title: PocketCFO P&L
 ## Notes: Gold balances, income sources, and profit views.
 ## Author: MerchantClassGaming
-## Version: v1.2.0
+## Version: v1.2.1
 ## LoadOnDemand: 1
 ## Dependencies: PocketCFO
 
 Init.lua
 Services\IncomeReport.lua
 Services\OrderReport.lua
-Services\GatheringReport.lua
+Services\GoldPerHourReport.lua
 UI\GoldWindow.lua
 UI\OrdersTab.lua
-UI\GatheringTab.lua
-UI\GatheringSessionFrame.lua
+UI\GoldPerHourTab.lua
+UI\GoldPerHourWindow.lua

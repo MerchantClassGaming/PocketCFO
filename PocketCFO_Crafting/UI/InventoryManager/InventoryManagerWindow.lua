@@ -1418,7 +1418,7 @@ end
 -- "no rows" state. Owns no timing/retry logic - that's CraftQueueController's.
 -- ---------------------------------------------------------------------------
 
-function InventoryManagerWindow:RenderAnalysisLoading(analysisResult)
+function InventoryManagerWindow:RenderAnalysisLoading(analysisResult, blank)
     local startedAt = DebugTime()
     if not mainFrame or not mainFrame:IsShown() then return end
     if self:RefreshActiveModeShell() then return end
@@ -1441,7 +1441,9 @@ function InventoryManagerWindow:RenderAnalysisLoading(analysisResult)
         emptyLabel = contentFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         emptyLabel:SetPoint("CENTER", contentFrame, "CENTER", 0, 0)
     end
-    emptyLabel:SetText("Loading analysis...")
+    -- blank (CraftQueueController item data hold, first second): an empty
+    -- panel with no text, so nothing flashes before the real result.
+    emptyLabel:SetText(blank and "" or "Loading analysis...")
     emptyLabel:Show()
 
     contentFrame:SetHeight(80)

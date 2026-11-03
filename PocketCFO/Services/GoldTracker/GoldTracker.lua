@@ -6,6 +6,11 @@
 -- Storage: PocketCFO_DB.global.gold
 --   characters[characterGUID] = { name, realm, classFile, copper, updatedAt }
 --   warband = { copper, updatedAt } | false
+--   hidden[characterGUID] = true   (unchecked in the Gold window's character
+--                                   list; all data is still captured)
+-- Removing a character drops it from characters (and hidden). Its history is
+-- kept, but the Gold window only shows characters in this list, so it
+-- disappears until that character logs in again and is saved here.
 -- A character's balance is saved on login and whenever it changes;
 -- characters not logged in recently keep their last known amount.
 --
@@ -32,6 +37,7 @@ local function GoldDB()
     end
     globalDB.gold = globalDB.gold or {}
     globalDB.gold.characters = globalDB.gold.characters or {}
+    globalDB.gold.hidden = globalDB.gold.hidden or {}
     return globalDB.gold
 end
 
@@ -87,7 +93,44 @@ function GoldTracker:GetBalances()
     return {
         characters = goldDB.characters,
         warband = goldDB.warband or nil,
+        hidden = goldDB.hidden,
     }
+end
+
+-- Hidden characters: left out of every Gold window view. Capture continues.
+function GoldTracker:IsHidden(guid)
+    local goldDB = GoldDB()
+    return goldDB ~= nil and guid ~= nil and goldDB.hidden[guid] == true
+end
+
+function GoldTracker:SetHidden(guid, hidden)
+    local goldDB = GoldDB()
+    if not goldDB or not guid then
+        return
+    end
+    goldDB.hidden[guid] = hidden and true or nil
+    self:SendMessage("MCG_GOLD_BALANCES_CHANGED")
+end
+
+-- Is this character on the Gold window's list and checked?
+function GoldTracker:IsShown(guid)
+    local goldDB = GoldDB()
+    return goldDB ~= nil and guid ~= nil and goldDB.characters[guid] ~= nil
+        and not goldDB.hidden[guid]
+end
+
+-- Takes a character off the list until it logs in again. The character you
+-- are playing can't be removed (it would be saved again right away).
+-- Returns true if removed.
+function GoldTracker:RemoveCharacter(guid)
+    local goldDB = GoldDB()
+    if not goldDB or not guid or guid == (UnitGUID and UnitGUID("player")) then
+        return false
+    end
+    goldDB.characters[guid] = nil
+    goldDB.hidden[guid] = nil
+    self:SendMessage("MCG_GOLD_BALANCES_CHANGED")
+    return true
 end
 
 -- ---------------------------------------------------------------------------
