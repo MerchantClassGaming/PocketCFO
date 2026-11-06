@@ -331,6 +331,149 @@ local function CandidateDedupeKey(candidate, row)
         or "")
 end
 
+-- Patch compat: Blizzard removed the global item APIs; route to C_Item.
+local GetItemInfoForQueue = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+
+local function IsGrayItem(row)
+    if type(GetItemInfoForQueue) ~= "function" then
+        return false
+    end
+    local ok, _, _, rarity = pcall(GetItemInfoForQueue, row.itemLink or row.itemID)
+    return ok and tonumber(rarity) == 0
+end
+
+-- How many of each item the Auction House will take, counted slot by slot
+-- from a live pass over the bags (bound tooltip + C_AuctionHouse.IsSellItemValid,
+-- via PostingEligibilityService). Per slot, not per item: a crafter's own
+-- bound copy of a profession tool must not hide the BoE copies of the same
+-- item (Brian, 2026-11-04), and bound copies don't count toward the quantity.
+-- Needed because bag snapshot rows carry no bag/slot and mark a whole
+-- configKey bound when any copy is. Includes the reagent bag.
+local function LivePostableQuantities(eligibility)
+    local live = { byConfigKey = {}, byItemID = {}, keyedItemIDs = {}, inspected = false }
+    local identityService = GetItemIdentityService()
+    if not eligibility or not eligibility.IsBagSlotAHPostable
+        or not C_Container or not C_Container.GetContainerNumSlots or not C_Container.GetContainerItemInfo then
+        return live
+    end
+    local lastBag = tonumber(_G.NUM_TOTAL_EQUIPPED_BAG_SLOTS) or ((tonumber(_G.NUM_BAG_SLOTS) or 4) + 1)
+    for containerID = 0, lastBag do
+        local okSlots, numSlots = pcall(C_Container.GetContainerNumSlots, containerID)
+        if okSlots and numSlots and numSlots > 0 then
+            live.inspected = true
+            for slot = 1, numSlots do
+                local okInfo, info = pcall(C_Container.GetContainerItemInfo, containerID, slot)
+                local itemID = okInfo and info and tonumber(info.itemID) or nil
+                if itemID then
+                    local okPost, postable = pcall(eligibility.IsBagSlotAHPostable, eligibility, containerID, slot, itemID)
+                    if okPost and postable == true then
+                        local count = tonumber(info.stackCount) or 1
+                        live.byItemID[itemID] = (live.byItemID[itemID] or 0) + count
+                        local configKey = nil
+                        if identityService and type(identityService.FromBagSlot) == "function" then
+                            local okIdentity, identity = pcall(identityService.FromBagSlot, identityService, containerID, slot)
+                            configKey = okIdentity and identity and identity.configKey or nil
+                        end
+                        if configKey then
+                            live.byConfigKey[configKey] = (live.byConfigKey[configKey] or 0) + count
+                            live.keyedItemIDs[itemID] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return live
+end
+
+-- Smart AH view (design: claude/AH_Smart_Posting_Design.md): every bag item
+-- the Auction House will take, minus the character's Keep list. No rules:
+-- each candidate gets a smart rule carrying its floor (minPrice) and ceiling
+-- (maxPrice) from SmartPricing, default duration 12h. Grays are left out.
+function PostingQueuePipeline:BuildSmartCandidates(bagRows, ownerKey, diagnostics)
+    local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+    local eligibility = GetPostingEligibilityService()
+    local candidates = {}
+    local skipped = { unsellable = 0, gray = 0, kept = 0 }
+    local live = LivePostableQuantities(eligibility)
+
+    for _, row in ipairs(bagRows or {}) do
+        -- Postable copies only. The snapshot's isBound (any copy bound =
+        -- whole row bound) is used only if the live pass couldn't run.
+        local postableQuantity = tonumber(row.quantity) or 0
+        if live.inspected then
+            local itemID = tonumber(row.itemID)
+            -- Same identity service as the bag snapshot (FromBagSlot), so keys
+            -- line up; if no slot of this item got a key, count by itemID.
+            postableQuantity = live.byConfigKey[row.configKey]
+                or (not live.keyedItemIDs[itemID] and live.byItemID[itemID])
+                or 0
+            postableQuantity = math.min(postableQuantity, tonumber(row.quantity) or postableQuantity)
+        elseif row.isBound == true then
+            postableQuantity = 0
+        end
+        local postable = postableQuantity > 0
+
+        if not postable then
+            skipped.unsellable = skipped.unsellable + 1
+        elseif IsGrayItem(row) then
+            skipped.gray = skipped.gray + 1
+        else
+            local itemKey = row.configKey or tostring(row.itemID)
+            local offered = smart:QuantityAfterKeep(itemKey, postableQuantity)
+            if offered <= 0 then
+                skipped.kept = skipped.kept + 1
+            else
+                local candidate = self:BuildCandidate(row, "smart", itemKey, nil)
+                local bounds = smart:GetBounds(candidate)
+                -- Matching path from the item's identity (e.g. itemID_ilvl_stat
+                -- for stat-variant gear) so competitors are matched on the
+                -- same stats and the row name shows the stat suffix, as rules do.
+                local matchingPath = (row.identity and row.identity.matchingPath)
+                    or tostring(row.configKey or ""):match("|path:([^|]+)")
+                local rule = {
+                    smart = true,
+                    matchingPath = matchingPath,
+                    sourceType = "smart",
+                    sourceKey = itemKey,
+                    ruleKey = itemKey,
+                    -- Smart posts everything offered; owned auctions already
+                    -- at the lowest price never reduce it (FIFO puts new posts
+                    -- behind our own at the same price).
+                    maxToPost = offered,
+                    minPrice = bounds.floor,
+                    maxPrice = bounds.ceiling,
+                    duration = smart.DEFAULT_DURATION,
+                    bounds = bounds,
+                }
+                candidate.quantity = offered
+                candidate.bagQuantity = offered
+                -- Stackable = commodity. The bag row's identity can miss it on a cold
+                -- item cache, which sent pigments and herbs down the item-auction
+                -- search: no answer, a 5s timeout, and a false "No one else
+                -- selling" (session log 2026-11-04). Same signal as
+                -- PostingEligibilityService IsLikelyCommodityItem. Theoretical that
+                -- every stackable is a commodity.
+                if (tonumber(bounds.stackSize) or 1) > 1 then
+                    candidate.isCommodity = true
+                    candidate.isStackable = true
+                end
+                candidate.rule = rule
+                candidate.effectiveRule = rule
+                candidates[#candidates + 1] = candidate
+            end
+        end
+    end
+
+    self.lastCandidates = candidates
+    SessionLog("PostingQueuePipeline: smart candidates owner=%s rows=%d candidates=%d unsellable=%d gray=%d kept=%d",
+        tostring(ownerKey), #(bagRows or {}), #candidates, skipped.unsellable, skipped.gray, skipped.kept)
+    if diagnostics and diagnostics.CompleteRun then
+        diagnostics:CompleteRun({ ownerKey = ownerKey, bagRows = #(bagRows or {}), candidates = #candidates, smart = true })
+    end
+    return candidates, { ownerKey = ownerKey, skipped = skipped, smart = true }
+end
+
 function PostingQueuePipeline:BuildCandidates(options)
     options = options or {}
     local ownerKey = options.ownerKey or GetOwnerKey()
@@ -361,6 +504,12 @@ function PostingQueuePipeline:BuildCandidates(options)
         if diagnostics.EnsureRows then
             diagnostics:EnsureRows(bagRows)
         end
+    end
+
+    -- Smart AH view: every sellable bag item, no rules (SmartPricing.lua).
+    local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+    if smart and smart:IsSmartView() then
+        return self:BuildSmartCandidates(bagRows, ownerKey, diagnostics)
     end
 
     if not resolver then

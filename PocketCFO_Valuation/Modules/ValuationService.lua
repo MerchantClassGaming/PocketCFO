@@ -52,7 +52,8 @@ local BASIS_UNRESOLVED = "unresolved"
 --   1. registered custom strategy (ResolveCustomItemValuation) - always
 --      wins when it resolves, including both fixed and modeled strategies
 --   2. vendor purchase price (VendorPriceService - player observation or
---      bundled default, both canonical)
+--      bundled default, both canonical), unless a confident AH value is
+--      lower: the vendor price is a ceiling (2026-11-05)
 --   3. AH-derived value (ResolveAHValue)
 --   4. unresolved
 -- Custom strategies are pcall-guarded and share a single recursion guard
@@ -659,9 +660,24 @@ local function ResolveItemValueTrace(normalized, options)
     local vendorResult, vendorUnresolvedReason = ResolveVendorValue(normalized)
     local ahResult, ahUnresolvedReason = ResolveAHValue(normalized, facts)
 
+    -- Vendor purchase price is a ceiling, not the value (2026-11-05): a vendor
+    -- that sells an item for more than the AH clears it is overpriced. When a
+    -- confident AH value is below the vendor price, the AH value wins. Thin
+    -- AH evidence (GetConfidence "uncertain") keeps the vendor price so one
+    -- dump listing can't drag a vendor item down.
+    local ahBelowVendor = false
+    if vendorResult and ahResult
+        and tonumber(ahResult.value) and tonumber(vendorResult.value)
+        and tonumber(ahResult.value) < tonumber(vendorResult.value) then
+        local ok, level = pcall(ValuationService.GetConfidence, ValuationService, ahResult)
+        ahBelowVendor = ok and level == "confident"
+    end
+
     local selected
     if customResult and customResult.resolved == true then
         selected = customResult
+    elseif ahBelowVendor then
+        selected = ahResult
     elseif vendorResult then
         selected = vendorResult
     elseif ahResult then
@@ -940,6 +956,80 @@ function ValuationService:ExplainValue(itemRef, options)
     end
 
     return result
+end
+
+-- ---------------------------------------------------------------------------
+-- Value confidence (Brian, 2026-11-04). GetItemValue is unchanged; this is a
+-- separate question asked only by callers that care: is there enough
+-- evidence behind this value to trust it? A thin market (one listing, seen
+-- once) can't tell a dump or a clown from a real price, so the honest answer
+-- there is "not sure", not a confident wrong number.
+--
+-- result: a GetItemValue result. Returns "confident" | "uncertain", reason.
+-- Confident:
+--   - not an AH price (custom rule, vendor purchase price)
+--   - our own sale of it in the last SALE_DAYS days (SaleIndex)
+--   - stackable priced from >= MIN_UNITS units across >= 2 listings
+--   - anything else with >= MIN_LISTINGS listings of that exact version
+--   - seen on >= MIN_DAYS days (ScanHistory)
+-- Uncertain, whatever the above: today's price under 50% or over 2x the
+-- item's recent history (MIN_DAYS+ days) - a dump or a clown.
+-- ---------------------------------------------------------------------------
+
+local CONFIDENCE_MIN_UNITS = 10
+local CONFIDENCE_MIN_LISTINGS = 3
+local CONFIDENCE_MIN_DAYS = 3
+local CONFIDENCE_SALE_DAYS = 30
+local CONFIDENCE_LOW_PCT = 0.5
+local CONFIDENCE_HIGH_X = 2
+
+function ValuationService:GetConfidence(result)
+    if type(result) ~= "table" or result.unresolved or not tonumber(result.value) then
+        return "uncertain", "noValue"
+    end
+    if result.source ~= "auctionHouse" then
+        return "confident", "notAuctionHouse"
+    end
+    local value = tonumber(result.value)
+    local marketKey = result.provenance and result.provenance.marketKey
+    local cache = PocketCFO_Valuation:GetModule("PricingCache", true)
+    local history = PocketCFO_Valuation:GetModule("ScanHistory", true)
+    local sales = PocketCFO_Valuation:GetModule("SaleIndex", true)
+
+    local row = cache and marketKey and cache:GetEntry(marketKey) or nil
+    local rec = history and marketKey and history:Get(marketKey) or nil
+    local daysSeen = rec and tonumber(rec.daysSeen) or 0
+    local recent = rec and tonumber(rec.recent)
+
+    if daysSeen >= CONFIDENCE_MIN_DAYS and recent and recent > 0 then
+        local before = tonumber(row and row.value) or value
+        if before < recent * CONFIDENCE_LOW_PCT or before > recent * CONFIDENCE_HIGH_X then
+            return "uncertain", "farFromUsual"
+        end
+    end
+
+    if sales then
+        local ok, price, at = pcall(sales.GetLastSale, sales, result.configKey, result.itemID)
+        local now = GetServerTime and GetServerTime() or time()
+        if ok and price and at and now - at <= CONFIDENCE_SALE_DAYS * 86400 then
+            return "confident", "soldRecently"
+        end
+    end
+
+    local listings = row and tonumber(row.listingCount)
+    local units = row and tonumber(row.unitCount)
+    if listings and units and units > listings then
+        -- Stackable: units across listings.
+        if units >= CONFIDENCE_MIN_UNITS and listings >= 2 then
+            return "confident", "manyUnits"
+        end
+    elseif listings and listings >= CONFIDENCE_MIN_LISTINGS then
+        return "confident", "manyListings"
+    end
+    if daysSeen >= CONFIDENCE_MIN_DAYS then
+        return "confident", "seenManyDays"
+    end
+    return "uncertain", "fewListings"
 end
 
 function ValuationService:OnEnable()

@@ -43,13 +43,17 @@ local function CreateButton(parent, text, x, y, width, onClick)
     return button
 end
 
-local function GetVisibleListRows(listBox)
+-- Smart view: two-line column headers ("Usually / Post"), so rows start lower.
+local LIST_TOP = 24
+local SMART_LIST_TOP = 30
+
+local function GetVisibleListRows(listBox, listTop)
     local height = listBox and listBox.GetHeight and listBox:GetHeight() or 0
     if height <= 0 then
         return VISIBLE_ROWS
     end
 
-    local available = height - 28
+    local available = height - (listTop or LIST_TOP) - 4
     if available <= 0 then
         return 1
     end
@@ -147,6 +151,36 @@ local function RowPostedCount(row)
     return tonumber(row and row.posting and row.posting.postedCount) or 0
 end
 
+-- Post Now: what's left to post on this row (gear posts one per click).
+local function RowRemaining(row)
+    return math.max(0, RowToPost(row) - RowPostedCount(row))
+end
+
+-- Usually Post: saved number, or the default (one stack, 1 if it doesn't
+-- stack). Second return: true when the player saved it.
+local function UsuallyPostFor(row)
+    local bounds = row and row.resolvedRule and row.resolvedRule.bounds or {}
+    local saved = tonumber(bounds.usuallyPost)
+    if saved and saved > 0 then
+        return saved, true
+    end
+    local stackSize = tonumber(bounds.stackSize) or 0
+    return stackSize > 0 and math.floor(stackSize) or 1, false
+end
+
+-- Smart view groups (Brian, 2026-11-04).
+local GROUP_TITLES = { "Ready to post", "Your call", "Probably not" }
+
+local function RowGroup(row)
+    local status = RowStatus(row)
+    if status == "Ready" then
+        return 1
+    elseif status == "Listed" or status == "Skipped" or status == "Posted" then
+        return 3
+    end
+    return 2
+end
+
 local function RowCanPost(row)
     return RowStatus(row) == "Ready"
         and row and row.evaluation and row.evaluation.shouldPost == true
@@ -204,6 +238,275 @@ local function RowItemID(row)
         or tonumber(row and row.target and (row.target.debugItemID or row.target.targetItemID))
 end
 
+-- ---------------------------------------------------------------------------
+-- Compare block (smart view, Needs Price / Skipped rows): what the
+-- neighbours are priced at, from data PocketCFO already has, so the player
+-- can pick a price without leaving the window (Brian, 2026-11-04).
+-- ---------------------------------------------------------------------------
+
+local function GoldText(copper)
+    copper = tonumber(copper)
+    if not copper then
+        return "-"
+    end
+    -- Two biggest coins (core PocketCFO:FormatMoney, 2026-11-05).
+    return PocketCFO:FormatMoney(copper)
+end
+
+local function AgeText(timestamp)
+    timestamp = tonumber(timestamp)
+    if not timestamp then
+        return ""
+    end
+    local now = GetServerTime and GetServerTime() or time()
+    local seconds = math.max(0, now - timestamp)
+    if seconds < 3600 then
+        return string.format("%dm ago", math.floor(seconds / 60))
+    elseif seconds < 86400 then
+        return string.format("%dh ago", math.floor(seconds / 3600))
+    end
+    return string.format("%dd ago", math.floor(seconds / 86400))
+end
+
+local function StatLabel(statKey)
+    local labels = {}
+    for raw in string.gmatch(tostring(statKey or ""), "([^|]+)") do
+        local part = raw:gsub("^ITEM_MOD_", ""):gsub("_SHORT$", ""):gsub("_STAT$", ""):gsub("_RATING$", "")
+        part = part:gsub("_", " "):lower():gsub("(%a)([%w']*)", function(a, b) return a:upper() .. b end)
+        if part ~= "" and not part:find("^Modified Crafting") then
+            labels[#labels + 1] = part
+        end
+    end
+    return table.concat(labels, " / ")
+end
+
+-- "222573|q5|stats:ITEM_MOD_MULTICRAFT_SHORT" -> "Q5 Multicraft".
+local function VersionLabel(marketKey)
+    marketKey = tostring(marketKey or "")
+    local parts = {}
+    local quality = marketKey:match("|q(%d+)")
+    if quality and quality ~= "0" then
+        parts[#parts + 1] = "Q" .. quality
+    end
+    local ilvl = marketKey:match("|ilvl(%d+)")
+    if ilvl then
+        parts[#parts + 1] = "ilvl " .. ilvl
+    end
+    local stats = marketKey:match("|stats:(.+)$")
+    if stats then
+        local label = StatLabel(stats)
+        if label ~= "" then
+            parts[#parts + 1] = label
+        end
+    end
+    return #parts > 0 and table.concat(parts, " ") or "Base"
+end
+
+local function ValuationModule(name)
+    local addon = _G.PocketCFO_Valuation
+    return addon and addon.GetModule and addon:GetModule(name, true) or nil
+end
+
+-- The stats that make a version (Crit / Haste, Multicraft...), with
+-- primaries, stamina and armor dropped: the same filter as the row name
+-- (core IdentityAdapters). "" when none.
+local function VersionStats(stats)
+    if not stats or stats == "" then
+        return ""
+    end
+    local adapters = PocketCFO and PocketCFO.ItemIdentityAdapters
+    if adapters and adapters.NormalizeVariantStatFingerprint then
+        local ok, filtered = pcall(adapters.NormalizeVariantStatFingerprint, adapters, stats)
+        if ok then
+            return filtered or ""
+        end
+    end
+    return stats
+end
+
+-- Keeps the cheapest entry per label (an Agility and an Intellect version
+-- with the same Crit / Mastery are one line).
+local function CheapestPerLabel(list)
+    local byLabel, order = {}, {}
+    for _, entry in ipairs(list) do
+        local current = byLabel[entry.label]
+        if not current then
+            byLabel[entry.label] = entry
+            order[#order + 1] = entry.label
+        elseif (tonumber(entry.value) or 0) < (tonumber(current.value) or 0) then
+            byLabel[entry.label] = entry
+        end
+    end
+    local result = {}
+    for _, label in ipairs(order) do
+        result[#result + 1] = byLabel[label]
+    end
+    return result
+end
+
+-- Parts of a market key: quality, item level, stats ("" when none).
+local function KeyParts(marketKey)
+    marketKey = tostring(marketKey or "")
+    return tonumber(marketKey:match("|q(%d+)")), tonumber(marketKey:match("|ilvl(%d+)")),
+        marketKey:match("|stats:(.+)$") or ""
+end
+
+local function SortByValue(list)
+    table.sort(list, function(a, b) return (tonumber(a.value) or 0) < (tonumber(b.value) or 0) end)
+end
+
+-- Brian, 2026-11-04: what matters when pricing a tool by hand is
+--   1. the same item at the same quality / item level, any stat: a buyer
+--      who just wants a tool takes the cheapest, so that's competition;
+--   2. better versions with the SAME stat: higher qualities of this item and
+--      its blue partner. Other stats of the better version don't matter.
+local function AddCompareLines(tooltip, row)
+    local cache = ValuationModule("PricingCache")
+    local identity = ValuationModule("PricingIdentity")
+    local itemID = RowItemID(row)
+    if not cache or not itemID then
+        return
+    end
+    local itemLink = row.itemLink or (row.candidate and row.candidate.itemLink)
+    local ownKey = identity and itemLink and identity.BuildMarketKey and identity:BuildMarketKey(itemLink) or nil
+    local ownQuality, ownIlvl, ownStats = KeyParts(ownKey)
+    ownStats = VersionStats(ownStats)
+
+    tooltip:AddLine(" ")
+
+    -- Why this price: the range we'd post in and what set each end.
+    local bounds = row.resolvedRule and row.resolvedRule.bounds or {}
+    local function Times(multiplier)
+        multiplier = tonumber(multiplier)
+        if not multiplier then
+            return ""
+        end
+        local text = string.format("%.1f", multiplier):gsub("%.0$", "")
+        return text .. "x "
+    end
+    local FLOOR_SOURCES = { cost = "cost to make", disenchant = "disenchant value", vendor = "vendor price" }
+    if tonumber(bounds.floor) then
+        tooltip:AddDoubleLine("Lowest we'd post",
+            GoldText(bounds.floor) .. "  |cff999999" .. (FLOOR_SOURCES[bounds.floorSource] or "?") .. " +10%|r",
+            1, 0.82, 0, 1, 1, 1)
+    end
+    if tonumber(bounds.ceiling) then
+        local why
+        if bounds.ceilingBase == "sale" then
+            why = Times(bounds.multiplier) .. "your last sale"
+        elseif bounds.ceilingBase == "cost" then
+            why = Times(bounds.multiplier) .. "cost to make"
+        elseif bounds.ceilingBase == "market" then
+            why = Times(bounds.multiplier) .. "market value"
+        elseif bounds.ceilingBase == "rule" then
+            why = "below the better version"
+        else
+            why = "?"
+        end
+        tooltip:AddDoubleLine("Highest we'd post", GoldText(bounds.ceiling) .. "  |cff999999" .. why .. "|r",
+            1, 0.82, 0, 1, 1, 1)
+    end
+    if tonumber(bounds.marketValue) then
+        local few = bounds.confidence == "uncertain" and "  |cff999999few listings|r" or ""
+        tooltip:AddDoubleLine("Market value", GoldText(bounds.marketValue) .. few, 1, 0.82, 0, 1, 1, 1)
+    end
+    local cheapest = row.evaluation and tonumber(row.evaluation.lowestMatchingPrice)
+    if cheapest then
+        tooltip:AddDoubleLine("Cheapest listing", GoldText(cheapest), 1, 0.82, 0, 1, 1, 1)
+    end
+    -- No cost yet but one of our characters knows the recipe: say how to get
+    -- it (Brian, 2026-11-04). Costs are read when the list is built.
+    local costText = bounds.costToMake and GoldText(bounds.costToMake) or "-"
+    if not bounds.costToMake then
+        local registry = PocketCFO and PocketCFO.RecipeRegistry
+        local okKnown, known = pcall(function()
+            return registry and registry:IsRecipeOutputItem(RowItemID(row), row.itemName)
+        end)
+        if okKnown and known then
+            costText = "|cff999999Open the recipe, then Refresh|r"
+        end
+    end
+    tooltip:AddDoubleLine("Cost to make", costText, 1, 0.82, 0, 1, 1, 1)
+    tooltip:AddDoubleLine("Your last sale", bounds.lastSale and GoldText(bounds.lastSale) or "-", 1, 0.82, 0, 1, 1, 1)
+
+    -- 1. Same item, same quality / item level, other stats. Same stats as
+    -- ours (other primary) is direct competition: already in the price.
+    local sameTier, betterSameStat = {}, {}
+    for _, cached in ipairs(cache:GetCandidatesForItemID(itemID) or {}) do
+        if type(cached) == "table" and cached.marketKey ~= ownKey and tonumber(cached.value) then
+            local quality, ilvl, rawStats = KeyParts(cached.marketKey)
+            local stats = VersionStats(rawStats)
+            if quality == ownQuality and ilvl == ownIlvl then
+                if stats ~= ownStats then
+                    sameTier[#sameTier + 1] = { value = cached.value, timestamp = cached.timestamp,
+                        label = stats ~= "" and StatLabel(stats) or VersionLabel(cached.marketKey) }
+                end
+            elseif stats == ownStats and ((quality and ownQuality and quality > ownQuality)
+                or (ilvl and ownIlvl and ilvl > ownIlvl)) then
+                betterSameStat[#betterSameStat + 1] = { value = cached.value, timestamp = cached.timestamp,
+                    label = (quality and ("Q" .. quality)) or ("ilvl " .. ilvl) }
+            end
+        end
+    end
+    sameTier = CheapestPerLabel(sameTier)
+    SortByValue(sameTier)
+    if #sameTier > 0 then
+        tooltip:AddLine(" ")
+        tooltip:AddLine("Same tier, other stats", 1, 0.82, 0)
+        for _, entry in ipairs(sameTier) do
+            tooltip:AddDoubleLine("  " .. entry.label,
+                GoldText(entry.value) .. "  |cff999999" .. AgeText(entry.timestamp) .. "|r", 1, 1, 1, 1, 1, 1)
+        end
+    end
+
+    -- 2. Better versions, same stat: blue partner too.
+    local GetInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    local pairsModule = ValuationModule("ProfessionGearPairs")
+    local partnerID = pairsModule and pairsModule.GetPartner and pairsModule:GetPartner(itemID)
+    if partnerID and GetInfo then
+        local okOwn, _, _, ownRarity = pcall(GetInfo, itemLink or itemID)
+        local okPartner, name, _, partnerRarity = pcall(GetInfo, partnerID)
+        if okOwn and okPartner and tonumber(partnerRarity) and tonumber(ownRarity)
+            and tonumber(partnerRarity) > tonumber(ownRarity) then
+            for _, cached in ipairs(cache:GetCandidatesForItemID(partnerID) or {}) do
+                if type(cached) == "table" and tonumber(cached.value) then
+                    local quality, ilvl, rawStats = KeyParts(cached.marketKey)
+                    if VersionStats(rawStats) == ownStats then
+                        betterSameStat[#betterSameStat + 1] = { value = cached.value, timestamp = cached.timestamp,
+                            label = (name or "Blue") .. " " .. ((quality and ("Q" .. quality)) or (ilvl and ("ilvl " .. ilvl)) or "") }
+                    end
+                end
+            end
+        end
+    end
+    betterSameStat = CheapestPerLabel(betterSameStat)
+    SortByValue(betterSameStat)
+    if #betterSameStat > 0 then
+        local statText = ownStats ~= "" and (" (" .. StatLabel(ownStats) .. ")") or ""
+        tooltip:AddLine(" ")
+        tooltip:AddLine("Better versions" .. statText, 1, 0.82, 0)
+        for _, entry in ipairs(betterSameStat) do
+            tooltip:AddDoubleLine("  " .. entry.label,
+                GoldText(entry.value) .. "  |cff999999" .. AgeText(entry.timestamp) .. "|r", 1, 1, 1, 1, 1, 1)
+        end
+    end
+
+    -- Higher-quality items (quality-tier reagents etc., separate itemIDs).
+    local siblings = ValuationModule("QualitySiblings")
+    local higher = siblings and siblings.GetHigherSiblings and siblings:GetHigherSiblings(itemID)
+    if type(higher) == "table" then
+        for _, siblingID in ipairs(higher) do
+            local key = siblings:GetMarketKey(siblingID)
+            local value = key and cache:GetValueByMarketKey(key)
+            if tonumber(value) then
+                tooltip:AddDoubleLine("Higher quality (Q" .. tostring(siblings:GetTier(siblingID) or "?") .. ")",
+                    GoldText(value), 1, 0.82, 0, 1, 1, 1)
+            end
+        end
+    end
+
+end
+
 local function ShowRowTooltip(button)
     local row = button and button.queueRow
     if not row or not GameTooltip then
@@ -211,6 +514,22 @@ local function ShowRowTooltip(button)
     end
 
     GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+    -- The game's own item tooltip (with PocketCFO's value lines), as
+    -- anywhere else in the game (Brian, 2026-11-04).
+    local itemLink = row.itemLink or (row.candidate and row.candidate.itemLink)
+    if type(itemLink) == "string" and itemLink:find("|H") then
+        local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, itemLink)
+        if ok then
+            local status = RowStatus(row)
+            -- Every smart row (Brian, 2026-11-04): check a price without
+            -- leaving the window.
+            if row.resolvedRule and row.resolvedRule.smart then
+                pcall(AddCompareLines, GameTooltip, row)
+            end
+            GameTooltip:Show()
+            return
+        end
+    end
     GameTooltip:SetText(tostring(row.item or row.itemName or "Item"), 1, 1, 1)
     local itemID = RowItemID(row)
     if itemID then
@@ -238,6 +557,210 @@ end
 
 function PostingUI:GetController()
     return PocketCFO_AH:GetModule("PostingController", true)
+end
+
+-- ---------------------------------------------------------------------------
+-- Smart AH view: Qty / Price / Duration are edited in place (this post only).
+-- Design: claude/AH_Smart_Posting_Design.md.
+-- ---------------------------------------------------------------------------
+
+local OVERRIDE_R, OVERRIDE_G, OVERRIDE_B = 1, 0.82, 0
+local DURATION_CYCLE = { [12] = 24, [24] = 48, [48] = 12 }
+
+local function IsSmartView()
+    local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+    return smart ~= nil and smart:IsSmartView() == true
+end
+
+-- "125" = 125 gold; also accepts "12g 50s 3c" and "12.5".
+local function ParsePrice(text)
+    text = tostring(text or ""):lower():gsub(",", "")
+    if text:match("^%s*$") then
+        return nil
+    end
+    if text:find("[gsc]") then
+        local gold = tonumber(text:match("([%d%.]+)%s*g")) or 0
+        local silver = tonumber(text:match("([%d%.]+)%s*s")) or 0
+        local copper = tonumber(text:match("([%d%.]+)%s*c")) or 0
+        local total = math.floor(gold * 10000 + silver * 100 + copper + 0.5)
+        return total > 0 and total or nil
+    end
+    local gold = tonumber(text)
+    if not gold or gold <= 0 then
+        return nil
+    end
+    return math.floor(gold * 10000 + 0.5)
+end
+
+local function PriceForEdit(copper)
+    copper = tonumber(copper)
+    if not copper or copper <= 0 then
+        return ""
+    end
+    local gold = copper / 10000
+    if gold == math.floor(gold) then
+        return tostring(math.floor(gold))
+    end
+    return string.format("%.2f", gold)
+end
+
+local function RowEditable(controller, rows, row)
+    if not row or not row.evaluation then
+        return false
+    end
+    if IsEvaluationInProgress(controller, rows) or IsPostingInProgress(controller, rows) then
+        return false
+    end
+    if row.posting and row.posting.pending == true then
+        return false
+    end
+    return RowStatus(row) ~= "Posted"
+end
+
+function PostingUI:EnsureEditBox(parent)
+    if self.editBox and self.editBox:GetParent() == parent then
+        return self.editBox
+    end
+    local box = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+    box:SetAutoFocus(false)
+    box:SetFontObject("GameFontHighlightSmall")
+    box:SetFrameStrata("DIALOG")
+    box:Hide()
+    box:SetScript("OnEnterPressed", function(edit)
+        self:FinishEdit(true)
+        edit:ClearFocus()
+    end)
+    box:SetScript("OnEscapePressed", function(edit)
+        self:FinishEdit(false)
+        edit:ClearFocus()
+    end)
+    box:SetScript("OnEditFocusLost", function()
+        self:FinishEdit(true)
+    end)
+    self.editBox = box
+    return box
+end
+
+function PostingUI:StartEdit(button, field)
+    local row = button and button.queueRow
+    local controller = self:GetController()
+    if not row then
+        return
+    end
+    -- Usually Post can be set on any row, Posted included.
+    if not RowEditable(controller, self.rows, row)
+        and not (field == "usually" and row.evaluation and not (row.posting and row.posting.pending == true)
+            and not IsEvaluationInProgress(controller, self.rows) and not IsPostingInProgress(controller, self.rows)) then
+        return
+    end
+    self:SelectRow(button.queueIndex, false)
+    if field == "duration" then
+        local current = tonumber(row.duration) or 12
+        controller:ApplyOverride(row, "duration", DURATION_CYCLE[current] or 12)
+        return
+    end
+    local cell = (field == "price" and button.PriceText) or (field == "usually" and button.InBagsText) or button.ToPostText
+    local box = self:EnsureEditBox(self.list and self.list.listBox or button)
+    box:ClearAllPoints()
+    box:SetPoint("LEFT", cell, "LEFT", 4, 0)
+    box:SetSize(field == "price" and 80 or 44, 18)
+    local value
+    if field == "price" then
+        value = PriceForEdit(RowPrice(row) or (row.evaluation and row.evaluation.suggestedPrice))
+    elseif field == "usually" then
+        value = tostring(UsuallyPostFor(row))
+    elseif RowRemaining(row) > 0 then
+        value = tostring(RowRemaining(row))
+    else
+        value = tostring(RowToPost(row) > 0 and RowToPost(row)
+            or (row.evaluation and row.evaluation.suggestedQuantity) or (row.inBags or ""))
+    end
+    self.editing = { row = row, field = field, done = false }
+    box:SetText(value)
+    box:Show()
+    box:SetFocus()
+    box:HighlightText()
+end
+
+-- commit = true: apply what was typed (empty = smart value back);
+-- false (Esc): put the smart value back.
+function PostingUI:FinishEdit(commit)
+    local editing = self.editing
+    if not editing or editing.done then
+        return
+    end
+    editing.done = true
+    self.editing = nil
+    local box = self.editBox
+    local text = box and box:GetText() or ""
+    if box then
+        box:Hide()
+    end
+    local controller = self:GetController()
+    if not controller or not controller.ApplyOverride then
+        return
+    end
+    if editing.field == "usually" then
+        if commit and controller.SetUsuallyPost then
+            -- Blank = back to the default.
+            controller:SetUsuallyPost(editing.row, tonumber(text))
+        end
+        return
+    end
+    local value = nil
+    if commit then
+        if editing.field == "price" then
+            value = ParsePrice(text)
+        else
+            value = tonumber(text)
+        end
+    end
+    controller:ApplyOverride(editing.row, editing.field, value)
+end
+
+function PostingUI:HandleSkipSelected()
+    local row = self.selectedIndex and self.rows and self.rows[self.selectedIndex] or nil
+    local controller = self:GetController()
+    if not row or not controller or not controller.SkipRow then
+        return
+    end
+    if IsEvaluationInProgress(controller, self.rows) or IsPostingInProgress(controller, self.rows) then
+        return
+    end
+    self.selectedIndex = nil
+    self.selectedRowID = nil
+    controller:SkipRow(row)
+end
+
+function PostingUI:HandleKeepSelected()
+    local row = self.selectedIndex and self.rows and self.rows[self.selectedIndex] or nil
+    local controller = self:GetController()
+    if not row or not controller or not controller.KeepRow then
+        return
+    end
+    if IsEvaluationInProgress(controller, self.rows) or IsPostingInProgress(controller, self.rows) then
+        return
+    end
+    self.selectedIndex = nil
+    self.selectedRowID = nil
+    controller:KeepRow(row)
+end
+
+local function CreateCellButton(row, anchor, width, onClick)
+    local cell = CreateFrame("Button", nil, row)
+    cell:SetPoint("LEFT", anchor, "LEFT", 0, 0)
+    cell:SetSize(width, row:GetHeight())
+    cell:SetScript("OnClick", onClick)
+    cell:SetScript("OnEnter", function()
+        ShowRowTooltip(row)
+    end)
+    cell:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
+    end)
+    cell:Hide()
+    return cell
 end
 
 function PostingUI:CreateQueueRow(parent, x, y, width, height)
@@ -282,6 +805,25 @@ function PostingUI:CreateQueueRow(parent, x, y, width, height)
     row.NoteText:SetPoint("LEFT", row, "LEFT", 532, 0)
     row.NoteText:SetPoint("RIGHT", row, "RIGHT", -6, 0)
     row.NoteText:SetJustifyH("LEFT")
+    -- Never spill into the next row: 2 lines max, the rest cut off.
+    if row.NoteText.SetMaxLines then
+        row.NoteText:SetMaxLines(2)
+    end
+
+    -- Smart view: click a cell to edit it (shown only in the smart view).
+    -- The In Bags spot holds Usually Post there.
+    row.UsuallyCell = CreateCellButton(row, row.InBagsText, 48, function()
+        self:StartEdit(row, "usually")
+    end)
+    row.QtyCell = CreateCellButton(row, row.ToPostText, 48, function()
+        self:StartEdit(row, "quantity")
+    end)
+    row.PriceCell = CreateCellButton(row, row.PriceText, 86, function()
+        self:StartEdit(row, "price")
+    end)
+    row.DurationCell = CreateCellButton(row, row.DurationText, 62, function()
+        self:StartEdit(row, "duration")
+    end)
 
     return row
 end
@@ -377,36 +919,73 @@ function PostingUI:RefreshRows()
     self.rows = self.rows or {}
     self:RestoreSelection()
 
+    -- Smart view: a header over each group once evaluation is done (Brian,
+    -- 2026-11-04). display = { {header = title} | {rowIndex = n} }.
+    local display = {}
+    local controller = self:GetController()
+    local showGroups = self.smart and not IsEvaluationInProgress(controller, self.rows)
+    local lastGroup = nil
+    for rowIndex, row in ipairs(self.rows) do
+        if showGroups then
+            local group = RowGroup(row)
+            if group ~= lastGroup then
+                display[#display + 1] = { header = GROUP_TITLES[group] }
+                lastGroup = group
+            end
+        end
+        display[#display + 1] = { rowIndex = rowIndex }
+    end
+
     local offset = FauxScrollFrame_GetOffset and FauxScrollFrame_GetOffset(list.scrollFrame) or 0
-    local visibleRows = GetVisibleListRows(list.listBox)
+    local visibleRows = GetVisibleListRows(list.listBox, self.listTop)
     if FauxScrollFrame_Update then
-        FauxScrollFrame_Update(list.scrollFrame, #self.rows, visibleRows, ROW_HEIGHT)
+        FauxScrollFrame_Update(list.scrollFrame, #display, visibleRows, ROW_HEIGHT)
     end
 
     for index, button in ipairs(list.buttons or {}) do
         if index > visibleRows then
             button:Hide()
         else
-            local rowIndex = offset + index
-            local row = self.rows[rowIndex]
+            local entry = display[offset + index]
+            local rowIndex = entry and entry.rowIndex
+            local row = rowIndex and self.rows[rowIndex] or nil
             if row then
                 local status = RowStatus(row)
                 local price = RowPrice(row)
                 local isInactiveRow =
                     status == "Skipped"
                     or status == "Posted"
+                    or (self.smart and status == "Listed")
 
                 button.queueIndex = rowIndex
                 button.queueRow = row
                 button.ItemText:SetText(tostring(row.item or row.itemName or ""))
-                button.InBagsText:SetText(tostring(row.inBags or 0))
-                button.ToPostText:SetText(tostring(RowToPost(row)))
-                button.PriceText:SetText(price and FormatCopperString(price) or "")
+                local usuallyPost, usuallySaved = UsuallyPostFor(row)
+                button.InBagsText:SetText(self.smart and tostring(usuallyPost) or tostring(row.inBags or 0))
+                local shownQuantity = self.smart and RowRemaining(row) or RowToPost(row)
+                if self.smart and shownQuantity <= 0 and (status == "Skipped" or status == "Needs Price"
+                    or status == "Too Cheap") then
+                    -- Starting Post Now for rows that won't post as they are.
+                    shownQuantity = tonumber(row.evaluation and row.evaluation.suggestedQuantity) or 0
+                end
+                button.ToPostText:SetText(tostring(shownQuantity))
+                local shownPrice = price
+                if self.smart and not shownPrice and (status == "Skipped" or status == "Listed"
+                    or status == "Too Cheap") then
+                    -- Starting value for rows that won't post as they are.
+                    shownPrice = row.evaluation and row.evaluation.suggestedPrice
+                end
+                button.PriceText:SetText(shownPrice and FormatCopperString(shownPrice) or "")
                 button.DurationText:SetText(row.duration and (tostring(row.duration) .. "h") or "")
                 button.StatusText:SetText(status)
                 button.NoteText:SetText(RowNote(row))
                 button:Enable()
                 button:Show()
+                button.InBagsText:SetShown(true)
+                button.UsuallyCell:SetShown(self.smart)
+                button.QtyCell:SetShown(self.smart)
+                button.PriceCell:SetShown(self.smart)
+                button.DurationCell:SetShown(self.smart)
 
                 if rowIndex == self.selectedIndex then
                     button:SetBackdropColor(0.18, 0.24, 0.34, 0.95)
@@ -421,18 +1000,37 @@ function PostingUI:RefreshRows()
                 else
                     SetTextColor(button, 1, 1, 1)
                 end
+                if self.smart and usuallySaved then
+                    button.InBagsText:SetTextColor(OVERRIDE_R, OVERRIDE_G, OVERRIDE_B)
+                end
+                local overrides = self.smart and row.overrides or nil
+                if overrides then
+                    if overrides.quantity then button.ToPostText:SetTextColor(OVERRIDE_R, OVERRIDE_G, OVERRIDE_B) end
+                    if overrides.price then button.PriceText:SetTextColor(OVERRIDE_R, OVERRIDE_G, OVERRIDE_B) end
+                    if overrides.duration then button.DurationText:SetTextColor(OVERRIDE_R, OVERRIDE_G, OVERRIDE_B) end
+                end
             else
                 button.queueIndex = nil
                 button.queueRow = nil
-                button.ItemText:SetText("")
+                button.ItemText:SetText(entry and entry.header or "")
                 button.InBagsText:SetText("")
                 button.ToPostText:SetText("")
                 button.PriceText:SetText("")
                 button.DurationText:SetText("")
                 button.StatusText:SetText("")
                 button.NoteText:SetText("")
+                button.UsuallyCell:Hide()
+                button.QtyCell:Hide()
+                button.PriceCell:Hide()
+                button.DurationCell:Hide()
                 button:Disable()
-                button:SetBackdropColor(0.04, 0.04, 0.04, 0.45)
+                if entry and entry.header then
+                    -- Group header: gold text, no backdrop.
+                    button.ItemText:SetTextColor(1, 0.82, 0)
+                    button:SetBackdropColor(0, 0, 0, 0)
+                else
+                    button:SetBackdropColor(0.04, 0.04, 0.04, 0.45)
+                end
                 button:Show()
             end
         end
@@ -457,6 +1055,22 @@ function PostingUI:RefreshRows()
             self.postSelectedButton:Disable()
         end
 
+        if self.keepButton then
+            if selected and not evaluating and not posting then
+                self.keepButton:Enable()
+            else
+                self.keepButton:Disable()
+            end
+        end
+        if self.skipButton then
+            if selected and not evaluating and not posting and not selected.userSkipped
+                and RowStatus(selected) ~= "Posted" then
+                self.skipButton:Enable()
+            else
+                self.skipButton:Disable()
+            end
+        end
+
         if self.unstickButton then
             if posting then
                 self.unstickButton:Enable()
@@ -469,6 +1083,9 @@ end
 
 function PostingUI:OnQueueChanged(rows, reason)
     self.rows = rows or {}
+    if reason == "complete" then
+        self.evaluatedAt = GetTime and GetTime() or nil
+    end
     if self.loadingLabel then
         self.loadingLabel:Hide()
     end
@@ -478,7 +1095,9 @@ function PostingUI:OnQueueChanged(rows, reason)
         end
     else
         if not self.emptyLabel and self.listContainer then
-            self.emptyLabel = CreateListMessage(self.listContainer, "No configured bag candidates with posting rules.", "GameFontDisableSmall")
+            self.emptyLabel = CreateListMessage(self.listContainer, self.smart
+                and "Nothing to post. Everything in your bags is on your Keep List or can't be sold."
+                or "No configured bag candidates with posting rules.", "GameFontDisableSmall")
         elseif self.emptyLabel then
             self.emptyLabel:Show()
         end
@@ -563,7 +1182,42 @@ function PostingUI:HandleUnstickPost()
     end
 end
 
+-- Smart view: coming back to Post Auctions within this long shows the list
+-- that was already evaluated instead of evaluating everything again
+-- (Brian, 2026-11-04). Refresh always re-evaluates.
+local SAVED_LIST_SECONDS = 5 * 60
+
+function PostingUI:CanReuseList()
+    local controller = self:GetController()
+    if not self.smart or not self.evaluatedAt or not GetTime or not controller then
+        return false
+    end
+    if GetTime() - self.evaluatedAt > SAVED_LIST_SECONDS then
+        return false
+    end
+    local rows = controller:GetRows() or {}
+    -- A post that was in flight (e.g. when the AH closed) may or may not
+    -- have gone through: evaluate fresh rather than guess.
+    for _, row in ipairs(rows) do
+        if row.posting and row.posting.pending == true then
+            return false
+        end
+    end
+    return #rows > 0 and not IsEvaluationInProgress(controller, rows) and not IsPostingInProgress(controller, rows)
+end
+
+function PostingUI:ShowSavedList()
+    local controller = self:GetController()
+    self.rows = controller and controller:GetRows() or {}
+    if self.loadingLabel then
+        self.loadingLabel:Hide()
+    end
+    self:SelectInitialRow()
+    self:RefreshRows()
+end
+
 function PostingUI:RefreshQueue(reason)
+    self.evaluatedAt = nil
     local controller = self:GetController()
     self.selectedIndex = nil
     self.selectedRowID = nil
@@ -592,7 +1246,22 @@ function PostingUI:HandleRefresh()
     self:RefreshQueue("post-auctions-refresh")
 end
 
+-- Smart view: reopening the AH within this long of it closing (an
+-- accidental dismount) restores the list instead of evaluating again
+-- (Brian, 2026-11-04). The saved-list window (SAVED_LIST_SECONDS) applies too.
+local REOPEN_RESTORE_SECONDS = 3 * 60
+
+function PostingUI:OnAuctionHouseClosed()
+    self.closedAt = GetTime and GetTime() or nil
+end
+
 function PostingUI:RefreshFromAuctionHouseOpen()
+    local closedAt = self.closedAt
+    self.closedAt = nil
+    if closedAt and GetTime and GetTime() - closedAt <= REOPEN_RESTORE_SECONDS and self:CanReuseList() then
+        self:ShowSavedList()
+        return
+    end
     self:RefreshQueue("post-auctions-ah-open")
 end
 
@@ -617,6 +1286,54 @@ function PostingUI:Render(parent)
     end))
     self.unstickButton:Disable()
 
+    self.smart = IsSmartView()
+    self.editing = nil
+    self.keepButton = nil
+    self.skipButton = nil
+    if self.smart then
+        self.keepButton = AddChild(parent, CreateButton(parent, "Keep", 352, -8, 80, function()
+            self:HandleKeepSelected()
+        end))
+        self.keepButton:Disable()
+        self.keepButton:SetScript("OnEnter", function(button)
+            if GameTooltip then
+                GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Keep", 1, 1, 1)
+                GameTooltip:AddLine("Don't sell this item on this character. Change how many to keep on the Keep List tab.", 0.8, 0.8, 0.8, true)
+                GameTooltip:Show()
+            end
+        end)
+        self.keepButton:SetScript("OnLeave", function()
+            if GameTooltip then GameTooltip:Hide() end
+        end)
+
+        self.skipButton = AddChild(parent, CreateButton(parent, "Skip", 440, -8, 80, function()
+            self:HandleSkipSelected()
+        end))
+        self.skipButton:Disable()
+        self.skipButton:SetScript("OnEnter", function(button)
+            if GameTooltip then
+                GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Skip", 1, 1, 1)
+                GameTooltip:AddLine("Don't post this now. It comes back next time.", 0.8, 0.8, 0.8, true)
+                GameTooltip:Show()
+            end
+        end)
+        self.skipButton:SetScript("OnLeave", function()
+            if GameTooltip then GameTooltip:Hide() end
+        end)
+
+        -- Smart view order (Brian, 2026-11-04): the two most-used buttons
+        -- side by side, then Keep, then the rarely used Refresh and Unstick.
+        local x = 10
+        for _, button in ipairs({ self.postSelectedButton, self.skipButton, self.keepButton,
+            self.refreshButton, self.unstickButton }) do
+            button:ClearAllPoints()
+            button:SetPoint("TOPLEFT", parent, "TOPLEFT", x, -8)
+            x = x + button:GetWidth() + 7
+        end
+    end
+
     local listBox = AddChild(parent, CreateFrame("Frame", nil, parent, "BackdropTemplate"))
     listBox:SetPoint("TOPLEFT", parent, "TOPLEFT", 10, -36)
     listBox:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
@@ -629,17 +1346,26 @@ function PostingUI:Render(parent)
     listBox:SetBackdropColor(0.025, 0.025, 0.025, 0.9)
     listBox:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.85)
 
-    AddChild(parent, CreateLabel(listBox, "Item", 8, -6, 150, "GameFontDisableSmall", "LEFT"))
-    AddChild(parent, CreateLabel(listBox, "In Bags", 170, -6, 48, "GameFontDisableSmall", "CENTER"))
-    AddChild(parent, CreateLabel(listBox, "To Post", 226, -6, 48, "GameFontDisableSmall", "CENTER"))
-    AddChild(parent, CreateLabel(listBox, "Price", 286, -6, 86, "GameFontDisableSmall", "CENTER"))
-    AddChild(parent, CreateLabel(listBox, "Duration", 384, -6, 62, "GameFontDisableSmall", "CENTER"))
-    AddChild(parent, CreateLabel(listBox, "Status", 456, -6, 70, "GameFontDisableSmall", "CENTER"))
-    AddChild(parent, CreateLabel(listBox, "Note", 532, -6, 150, "GameFontDisableSmall", "LEFT"))
+    local listTop = self.smart and SMART_LIST_TOP or LIST_TOP
+    self.listTop = listTop
+    -- Single-line headers sit on the bottom line of the two-line ones.
+    local headerY = self.smart and -16 or -6
+    AddChild(parent, CreateLabel(listBox, "Item", 8, headerY, 150, "GameFontDisableSmall", "LEFT"))
+    if self.smart then
+        AddChild(parent, CreateLabel(listBox, "Usually\nPost", 170, -5, 48, "GameFontDisableSmall", "CENTER"))
+        AddChild(parent, CreateLabel(listBox, "Post\nNow", 226, -5, 48, "GameFontDisableSmall", "CENTER"))
+    else
+        AddChild(parent, CreateLabel(listBox, "In Bags", 170, -6, 48, "GameFontDisableSmall", "CENTER"))
+        AddChild(parent, CreateLabel(listBox, "To Post", 226, -6, 48, "GameFontDisableSmall", "CENTER"))
+    end
+    AddChild(parent, CreateLabel(listBox, "Price", 286, headerY, 86, "GameFontDisableSmall", "CENTER"))
+    AddChild(parent, CreateLabel(listBox, "Duration", 384, headerY, 62, "GameFontDisableSmall", "CENTER"))
+    AddChild(parent, CreateLabel(listBox, "Status", 456, headerY, 70, "GameFontDisableSmall", "CENTER"))
+    AddChild(parent, CreateLabel(listBox, "Note", 532, headerY, 150, "GameFontDisableSmall", "LEFT"))
 
     local buttons = {}
     for index = 1, VISIBLE_ROWS do
-        local button = AddChild(parent, self:CreateQueueRow(listBox, 4, -24 - ((index - 1) * ROW_HEIGHT), 706, ROW_HEIGHT - 2))
+        local button = AddChild(parent, self:CreateQueueRow(listBox, 4, -listTop - ((index - 1) * ROW_HEIGHT), 706, ROW_HEIGHT - 2))
         button:SetScript("OnClick", function(clicked)
             self:SelectRow(clicked.queueIndex, false)
         end)
@@ -653,7 +1379,7 @@ function PostingUI:Render(parent)
     end
 
     local scrollFrame = AddChild(parent, CreateFrame("ScrollFrame", nil, listBox, "FauxScrollFrameTemplate"))
-    scrollFrame:SetPoint("TOPLEFT", listBox, "TOPLEFT", 0, -24)
+    scrollFrame:SetPoint("TOPLEFT", listBox, "TOPLEFT", 0, -listTop)
     scrollFrame:SetPoint("BOTTOMRIGHT", listBox, "BOTTOMRIGHT", -26, 4)
     scrollFrame:SetScript("OnVerticalScroll", function(frame, offset)
         if FauxScrollFrame_OnVerticalScroll then

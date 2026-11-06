@@ -6,6 +6,8 @@
 local ADDON_NAME, _ = ...
 local PocketCFO          = _G.PocketCFO
 local PocketCFO_Crafting = _G.PocketCFO_Crafting
+-- Global GetItemInfo is gone on WoW Forever (probe 2026-11-04); C_Item first.
+local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
 
 local CraftStatLog = PocketCFO_Crafting:NewModule("CraftStatLog")
 

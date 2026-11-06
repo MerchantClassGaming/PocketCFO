@@ -418,23 +418,23 @@ end
 -- Processing Analysis row pool
 -- ---------------------------------------------------------------------------
 
+-- Money shows the two biggest coins (core PocketCFO:RoundMoney /
+-- FormatMoney, 2026-11-05).
 local function FormatAnalysisValue(copperValue)
     if copperValue == nil then return "--" end
-    local rounded = math.floor(copperValue + 0.5)
+    local rounded = _G.PocketCFO:RoundMoney(copperValue)
     if GetCoinTextureString then
         return GetCoinTextureString(rounded)
     end
-    return tostring(rounded) .. "c"
+    return _G.PocketCFO:FormatMoney(rounded)
 end
 
--- Compact signed-gold text for the analysis list column ("+82g" / "-46g"),
+-- Compact signed text for the analysis list column ("+82g 40s" / "-46g 05s"),
 -- per the "Expected / Craft" list-view spec - deliberately not the coin-icon
 -- format FormatAnalysisValue uses for the detail view.
 local function FormatSignedGold(copperValue)
     if copperValue == nil then return nil end
-    local gold = math.floor(math.abs(copperValue) / 10000 + 0.5)
-    if gold == 0 then return "0g" end
-    return (copperValue < 0 and "-" or "+") .. tostring(gold) .. "g"
+    return _G.PocketCFO:FormatMoney(copperValue, true)
 end
 
 local function FormatROIPercent(pct)
@@ -937,11 +937,13 @@ function InventoryManagerWindow:SetAnalysisInfoTooltip(info)
 end
 
 -- Auction House beta toggle (PocketCFO/Infrastructure/BetaFeatures.lua).
--- Posting Rules/Profiles are AH features, so they stay hidden while it is off
--- even when the rest of the Inventory-only controls are showing.
+-- Posting Rules/Profiles belong to the rules view only, so they stay hidden
+-- while AH Posting is off or Smart Posting is on (Brian, 2026-11-06), even
+-- when the rest of the Inventory-only controls are showing.
 local function IsAuctionHouseBetaEnabled()
     local beta = PocketCFO and PocketCFO.GetModule and PocketCFO:GetModule("BetaFeatures", true)
     return beta ~= nil and beta:IsAuctionHouseEnabled() == true
+        and beta:IsSmartAuctionHouseOn() ~= true
 end
 
 -- Expansion dropdown, Show All toggle, Posting Rules, Posting Profiles -

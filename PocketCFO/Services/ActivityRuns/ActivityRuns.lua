@@ -104,6 +104,14 @@
 -- In memory only (not saved): every loot of the last RECENT_SECONDS as
 -- { at, copper }, for later uses like "last 15 minutes" rates.
 --
+-- "Still gathering?" (agreed with Brian 2026-11-05): a gathering or fishing run
+--   with MIN_RUN_LOOTS+ loots and GAP_CAP_SECONDS without loot gets a prompt
+--   (ActivityControl, held until out of combat). Still gathering: this gap
+--   counts in full (run.stillGathering, up to RUN_END_SECONDS) instead of
+--   being capped. I'm done: the run is filed, ending at its last loot.
+--   No answer: the gap is capped as before, and RUN_END_SECONDS still ends it.
+--   Not for beast runs (they end at BEAST_RUN_END_SECONDS) or while paused.
+--
 -- Messages (split 2026-10-26: rebuilding the ranking on every loot lagged each skin):
 --   MCG_ACTIVITY_RUNS_UPDATED - loot added to the run in progress (live numbers only)
 --   MCG_ACTIVITY_RUNS_FILED   - a run was filed or saved runs changed (ranking)
@@ -368,7 +376,14 @@ ActivityRuns.AddProcTo = AddProc
 
 -- Longest gap between two loots that counts as run time.
 local function GapCap(run)
-    return (run and run.activity == "beasts") and BEAST_RUN_END_SECONDS or GAP_CAP_SECONDS
+    if run and run.activity == "beasts" then
+        return BEAST_RUN_END_SECONDS
+    end
+    -- "Still gathering" answered for this gap: the search time counts in full.
+    if run and run.stillGathering then
+        return RUN_END_SECONDS
+    end
+    return GAP_CAP_SECONDS
 end
 
 -- The run's bucket for the zone the player is in now (created if needed).
@@ -642,6 +657,7 @@ function ActivityRuns:AddLoot(source, partKey, slots, copper, info)
         run.seconds = (run.seconds or 0) + gap
     end
     run.lastLootAt = now
+    run.stillGathering = nil  -- a new gap starts; the prompt can come again
     AddToBucket(run, slots, copper)
 
     local part = run.parts[partKey] or NewBucket()
@@ -1087,6 +1103,7 @@ function ActivityRuns:ResumeRun(characterGUID)
     end
     SessionLog("run resumed after %ds paused", now - run.pausedAt)
     run.pausedAt, run.pauseDeclined = nil, nil
+    run.stillGathering = nil
     self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
     return true
 end
@@ -1107,6 +1124,39 @@ function ActivityRuns:HoldIfPaused(characterGUID, fn)
     if control then
         control:Hold("run", fn)
     end
+    return true
+end
+
+-- ---------------------------------------------------------------------------
+-- "Still gathering?" prompt (2026-11-05; the popup is in ActivityControl)
+-- ---------------------------------------------------------------------------
+
+-- True when this run should ask "Still gathering?" now: a gathering or
+-- fishing run, not paused, not already answered for this gap, with at least
+-- MIN_RUN_LOOTS loots and GAP_CAP_SECONDS since the last loot.
+function ActivityRuns:NeedsStillGatheringPrompt(run, now)
+    if not run or run.endedAt or run.pausedAt or run.stillGathering then
+        return false
+    end
+    if run.activity == "beasts" or (run.loots or 0) < MIN_RUN_LOOTS then
+        return false
+    end
+    now = now or time()
+    return (now - (run.lastLootAt or now)) >= GAP_CAP_SECONDS
+end
+
+-- "Still gathering": the time since the last loot counts in full (up to
+-- RUN_END_SECONDS, when the run ends anyway) until the next loot.
+function ActivityRuns:KeepGathering(characterGUID)
+    local db = RunsDB()
+    characterGUID = characterGUID or PlayerGUID()
+    local run = db and characterGUID and db.current[characterGUID]
+    if not run or run.pausedAt or run.activity == "beasts" then
+        return false
+    end
+    run.stillGathering = true
+    SessionLog("still gathering (%ds since last loot)", time() - (run.lastLootAt or time()))
+    self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
     return true
 end
 

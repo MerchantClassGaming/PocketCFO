@@ -58,6 +58,63 @@ function PocketCFO:GetCharacterGUID()
     return UnitGUID("player")
 end
 
+-- ---------------------------------------------------------------------------
+-- Money display: the two biggest coins (2026-11-05).
+--   12,345g 67s 89c -> 12,345g 68s
+--   3s 45c          -> 3s 45c
+--   18c             -> 18c
+-- Display only. All math stays in exact copper. Balances, AH listing prices,
+-- price edit boxes, debug dumps and the item tooltip keep their exact formats.
+-- ---------------------------------------------------------------------------
+
+-- Copper rounded to what the display shows: nearest silver from 1 gold up,
+-- whole copper below that. Rounding the total carries (9g 99s 60c -> 10g 00s).
+function PocketCFO:RoundMoney(copper)
+    copper = tonumber(copper) or 0
+    local negative = copper < 0
+    local absValue = math.abs(copper)
+    if absValue >= 10000 then
+        absValue = math.floor(absValue / 100 + 0.5) * 100
+    else
+        absValue = math.floor(absValue + 0.5)
+    end
+    return negative and -absValue or absValue
+end
+
+local function WithCommas(number)
+    local text = tostring(number):reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    if text:sub(1, 1) == "," then
+        text = text:sub(2)
+    end
+    return text
+end
+
+-- Letter format. signed = true always shows "+" or "-"; otherwise only "-".
+-- The second coin is two digits ("5g 00s", "3s 05c") so right-aligned
+-- columns line up.
+function PocketCFO:FormatMoney(copper, signed)
+    local rounded = self:RoundMoney(copper)
+    local negative = rounded < 0
+    local absValue = math.abs(rounded)
+    local gold = math.floor(absValue / 10000)
+    local silver = math.floor((absValue % 10000) / 100)
+    local cop = absValue % 100
+
+    local text
+    if gold > 0 then
+        text = string.format("%sg %02ds", WithCommas(gold), silver)
+    elseif silver > 0 then
+        text = string.format("%ds %02dc", silver, cop)
+    else
+        text = string.format("%dc", cop)
+    end
+
+    if negative then
+        return "-" .. text
+    end
+    return signed and ("+" .. text) or text
+end
+
 PocketCFO.debugEnabled = false
 PocketCFO.sessionLog = PocketCFO.sessionLog or {}
 

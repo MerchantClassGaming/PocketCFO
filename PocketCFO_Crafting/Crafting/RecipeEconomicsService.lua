@@ -452,6 +452,13 @@ function RecipeEconomicsService:EvaluateCurrentRecipe(recipeID)
     local result = self:EvaluateObservation(built.observation)
     result.observation = built.observation
     result.observationDiagnostics = built.diagnostics
+
+    -- Save the mat list so Cost to Make can be re-priced at the Auction
+    -- House (CostToMakeStore.lua, smart posting floor/ceiling). Never throws.
+    local store = PocketCFO and PocketCFO.CostToMakeStore
+    if store and result.resolved and type(store.Record) == "function" then
+        store:Record(built.observation, result.economics)
+    end
     return result
 end
 

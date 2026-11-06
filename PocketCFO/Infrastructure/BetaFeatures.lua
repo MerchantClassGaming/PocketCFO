@@ -6,6 +6,15 @@
 -- Gold per Hour window's gear panel; ActivityRuns ui.hidden, tracking always
 -- continues). The activity list needs PocketCFO_PnL, loaded when the panel opens.
 --
+-- Panel layout (Brian, 2026-11-06): three top-level sections, in order:
+--   Gold per Hour
+--   Show in Gold per Hour
+--   Beta Features (retail only)
+--       Inventory Manager
+--       Auction House Posting
+--           Smart Posting
+-- Everything under Beta Features is off by default.
+--
 -- Beta features stay fully built and loaded; turning a toggle off only hides
 -- the buttons that lead to them. Each consumer reads its flag through this
 -- module and listens for PCFO_SETTINGS_CHANGED to show/hide its buttons live.
@@ -30,12 +39,12 @@ local FLAG_DEFINITIONS = {
     {
         key = KEY_INVENTORY_MANAGER,
         label = "Inventory Manager",
-        description = "Adds a Show Inventory button to the crafting window for tracking how many of each item you want on hand.",
+        description = "Adds Add to Inventory Manager and Show Inventory buttons to the crafting window for tracking how many of each item you want on hand.",
     },
     {
         key = KEY_AUCTION_HOUSE,
         label = "Auction House Posting",
-        description = "Adds Post, Cancel, and posting rule pages to the auction house tab. Price scanning works without this.",
+        description = "Adds Post and Cancel pages to the auction house tab, using your own posting rules. Price scanning works without this.",
     },
 }
 
@@ -87,9 +96,105 @@ function BetaFeatures:IsAuctionHouseEnabled()
     return self:IsEnabled(KEY_AUCTION_HOUSE)
 end
 
+-- Smart Posting (PocketCFO_AH SmartPricing.lua): a beta option under
+-- Auction House Posting (Brian, 2026-11-06). Off by default. It only counts
+-- when Auction House Posting is also on: AH Posting on + Smart off = the
+-- original rules view, both on = smart view, AH Posting off = scan only.
+-- Retail only until Forever posting is tested.
+--
+-- The 2026-11-04 build saved "ahSmartView" and turned it on by itself for
+-- anyone without the AH beta. That key is retired and cleared at login
+-- (RetireOldSmartViewKey), so nobody gets Smart Posting until they check it.
+local KEY_AH_SMART_POSTING = "ahSmartPosting"
+local KEY_AH_SMART_VIEW_OLD = "ahSmartView"
+
+function BetaFeatures:RetireOldSmartViewKey()
+    local settings = SettingsTable()
+    if settings and settings[KEY_AH_SMART_VIEW_OLD] ~= nil then
+        settings[KEY_AH_SMART_VIEW_OLD] = nil
+        PocketCFO:Debug("BetaFeatures: cleared old %s", KEY_AH_SMART_VIEW_OLD)
+    end
+end
+
+-- The Smart Posting checkbox's own saved state (shown grayed out while
+-- Auction House Posting is off).
+function BetaFeatures:IsSmartPostingChecked()
+    if IsForever() then
+        return false
+    end
+    local settings = SettingsTable()
+    return settings ~= nil and settings[KEY_AH_SMART_POSTING] == true
+end
+
+-- Whether the smart view is actually in use: AH Posting on and Smart checked.
+function BetaFeatures:IsSmartAuctionHouseOn()
+    return self:IsAuctionHouseEnabled() and self:IsSmartPostingChecked()
+end
+
+function BetaFeatures:SetSmartAuctionHouse(enabled)
+    if IsForever() then
+        return
+    end
+    local settings = SettingsTable()
+    if not settings then
+        return
+    end
+    settings[KEY_AH_SMART_POSTING] = enabled == true
+    PocketCFO:Debug("BetaFeatures: %s=%s", KEY_AH_SMART_POSTING, tostring(enabled == true))
+    self:SendMessage(self.SETTINGS_CHANGED_MESSAGE, KEY_AH_SMART_POSTING, enabled == true)
+end
+
+-- One-time check for players who already built posting rules (Brian,
+-- 2026-11-06): turn Auction House Posting on for them; Smart Posting stays
+-- off. Called by PocketCFO_AH when it loads (first AH open), because the
+-- rules live in PocketCFO_AH's saved data. Runs once per account.
+local KEY_AH_RULES_CHECKED = "ahRulesCheckDone"
+
+function BetaFeatures:ApplyExistingRulesCheck(hasRules)
+    if IsForever() then
+        return
+    end
+    local settings = SettingsTable()
+    if not settings or settings[KEY_AH_RULES_CHECKED] then
+        return
+    end
+    settings[KEY_AH_RULES_CHECKED] = true
+    if hasRules == true and not self:IsAuctionHouseEnabled() then
+        self:SetEnabled(KEY_AUCTION_HOUSE, true)
+        PocketCFO:Debug("BetaFeatures: existing posting rules found, Auction House Posting turned on")
+    end
+end
+
 -- ---------------------------------------------------------------------------
 -- Settings panel (Game Menu > Options > AddOns > Pocket CFO)
 -- ---------------------------------------------------------------------------
+
+-- Settings-style check button with a label and an optional description line.
+-- offsetX / offsetY are from the anchor's bottom-left. The description sits
+-- 25px in from the check button.
+local function CreateSettingsCheck(panel, anchor, label, description, offsetY, offsetX)
+    local checkButton = CreateFrame("CheckButton", nil, panel, "SettingsCheckBoxTemplate")
+    checkButton:SetSize(21, 20)
+    checkButton:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", offsetX or 0, offsetY or -18)
+    checkButton.HoverBackground = nil
+    checkButton.text = checkButton:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    checkButton.text:SetPoint("LEFT", checkButton, "RIGHT", 4, 0)
+    checkButton.text:SetText(label)
+    checkButton:SetHitRectInsets(0, -checkButton.text:GetStringWidth() - 4, 0, 0)
+    local bottom = checkButton
+    if description then
+        local text = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+        text:SetPoint("TOPLEFT", checkButton, "BOTTOMLEFT", 25, -2)
+        text:SetWidth(510)
+        text:SetJustifyH("LEFT")
+        text:SetText(description)
+        bottom = text
+    end
+    return checkButton, bottom
+end
+
+local BETA_INDENT = 20   -- Inventory Manager / Auction House Posting, from the section header
+local SUB_INDENT  = 25   -- Smart Posting, from Auction House Posting
 
 function BetaFeatures:CreateSettingsPanel()
     if self.categoryID then
@@ -107,8 +212,31 @@ function BetaFeatures:CreateSettingsPanel()
     title:SetPoint("TOPLEFT", panel, "TOPLEFT", 16, -16)
     title:SetText("Pocket CFO")
 
+    -- Sections 1 and 2: Gold per Hour, Show in Gold per Hour (both flavors).
+    local gph = self:BuildGoldPerHourSection(panel, title)
+
+    -- Section 3: Beta Features (retail only).
+    local beta = nil
+    if not IsForever() then
+        beta = self:BuildBetaSection(panel, gph.bottom)
+    end
+
+    panel:SetScript("OnShow", function()
+        gph.Refresh()
+        if beta then
+            beta.Refresh()
+        end
+    end)
+
+    local category = blizzSettings.RegisterCanvasLayoutCategory(panel, "Pocket CFO")
+    blizzSettings.RegisterAddOnCategory(category)
+    self.categoryID = category:GetID()
+end
+
+-- Beta Features section. Returns { Refresh = fn }.
+function BetaFeatures:BuildBetaSection(panel, anchor)
     local header = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    header:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -20)
+    header:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -24)
     header:SetText("Beta Features")
 
     local intro = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -117,94 +245,66 @@ function BetaFeatures:CreateSettingsPanel()
     intro:SetJustifyH("LEFT")
     intro:SetText("These features are still being built. Turn them on to try them out. Some things may not work yet.")
 
-    local checkButtons = {}
-    local anchor = intro
-    local definitions = FLAG_DEFINITIONS
-    if IsForever() then
-        -- No beta features on Forever: the Gold per Hour section comes first.
-        header:Hide()
-        intro:Hide()
-        anchor = title
-        definitions = {}
-    end
-    for _, definition in ipairs(definitions) do
-        local checkButton = CreateFrame("CheckButton", nil, panel, "SettingsCheckBoxTemplate")
-        checkButton:SetSize(21, 20)
-        checkButton:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -18)
-        checkButton.HoverBackground = nil
+    local inventoryDef = FLAG_DEFINITIONS[1]
+    local ahDef = FLAG_DEFINITIONS[2]
 
-        checkButton.text = checkButton:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-        checkButton.text:SetPoint("LEFT", checkButton, "RIGHT", 4, 0)
-        checkButton.text:SetText(definition.label)
-        checkButton:SetHitRectInsets(0, -checkButton.text:GetStringWidth() - 4, 0, 0)
+    local inventoryCheck, bottom = CreateSettingsCheck(panel, intro, inventoryDef.label, inventoryDef.description,
+        -14, BETA_INDENT)
+    -- bottom is the description, 25px further in than the check button.
+    local ahCheck
+    ahCheck, bottom = CreateSettingsCheck(panel, bottom, ahDef.label, ahDef.description, -12, -25)
+    local smartCheck
+    smartCheck = CreateSettingsCheck(panel, bottom, "Smart Posting",
+        "Prices everything in your bags for you. No rules to set up. Leave off to post with your own rules.",
+        -12, SUB_INDENT - 25)
 
-        local description = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-        description:SetPoint("TOPLEFT", checkButton, "BOTTOMLEFT", 25, -2)
-        description:SetWidth(535)
-        description:SetJustifyH("LEFT")
-        description:SetText(definition.description)
-
-        local flagKey = definition.key
-        checkButton:SetScript("OnClick", function(button)
-            BetaFeatures:SetEnabled(flagKey, button:GetChecked() and true or false)
-            button:SetChecked(BetaFeatures:IsEnabled(flagKey))
-        end)
-
-        checkButtons[flagKey] = checkButton
-        anchor = description
+    local function RefreshSmartEnabled()
+        local ahOn = BetaFeatures:IsAuctionHouseEnabled()
+        smartCheck:SetEnabled(ahOn)
+        smartCheck.text:SetFontObject(ahOn and "GameFontNormal" or "GameFontDisable")
     end
 
-    -- anchor is the last beta description (25px in), or the title on Forever.
-    local gph = self:BuildGoldPerHourSection(panel, anchor, anchor == title and 0 or -25)
+    local function Refresh()
+        inventoryCheck:SetChecked(BetaFeatures:IsInventoryManagerEnabled())
+        ahCheck:SetChecked(BetaFeatures:IsAuctionHouseEnabled())
+        smartCheck:SetChecked(BetaFeatures:IsSmartPostingChecked())
+        RefreshSmartEnabled()
+    end
 
-    panel:SetScript("OnShow", function()
-        for flagKey, checkButton in pairs(checkButtons) do
-            checkButton:SetChecked(BetaFeatures:IsEnabled(flagKey))
-        end
-        gph.Refresh()
+    inventoryCheck:SetScript("OnClick", function(button)
+        BetaFeatures:SetEnabled(KEY_INVENTORY_MANAGER, button:GetChecked() and true or false)
+        button:SetChecked(BetaFeatures:IsInventoryManagerEnabled())
+    end)
+    ahCheck:SetScript("OnClick", function(button)
+        BetaFeatures:SetEnabled(KEY_AUCTION_HOUSE, button:GetChecked() and true or false)
+        button:SetChecked(BetaFeatures:IsAuctionHouseEnabled())
+        RefreshSmartEnabled()
+        -- The smart view depends on both boxes; tell listeners it may have changed.
+        BetaFeatures:SendMessage(BetaFeatures.SETTINGS_CHANGED_MESSAGE, KEY_AH_SMART_POSTING,
+            BetaFeatures:IsSmartAuctionHouseOn())
+    end)
+    smartCheck:SetScript("OnClick", function(button)
+        BetaFeatures:SetSmartAuctionHouse(button:GetChecked() and true or false)
+        button:SetChecked(BetaFeatures:IsSmartPostingChecked())
     end)
 
-    local category = blizzSettings.RegisterCanvasLayoutCategory(panel, "Pocket CFO")
-    blizzSettings.RegisterAddOnCategory(category)
-    self.categoryID = category:GetID()
-end
-
--- Settings-style check button with a label and an optional description line.
-local function CreateSettingsCheck(panel, anchor, label, description, offsetY, offsetX)
-    local checkButton = CreateFrame("CheckButton", nil, panel, "SettingsCheckBoxTemplate")
-    checkButton:SetSize(21, 20)
-    checkButton:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", offsetX or 0, offsetY or -18)
-    checkButton.HoverBackground = nil
-    checkButton.text = checkButton:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    checkButton.text:SetPoint("LEFT", checkButton, "RIGHT", 4, 0)
-    checkButton.text:SetText(label)
-    checkButton:SetHitRectInsets(0, -checkButton.text:GetStringWidth() - 4, 0, 0)
-    local bottom = checkButton
-    if description then
-        local text = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-        text:SetPoint("TOPLEFT", checkButton, "BOTTOMLEFT", 25, -2)
-        text:SetWidth(535)
-        text:SetJustifyH("LEFT")
-        text:SetText(description)
-        bottom = text
-    end
-    return checkButton, bottom
+    return { Refresh = Refresh }
 end
 
 local ACTIVITY_COLUMNS = 3
 local ACTIVITY_COLUMN_WIDTH = 190
 local ACTIVITY_ROW_HEIGHT = 24
 
--- Gold per Hour section. Returns { Refresh = fn } (called when the panel shows).
-function BetaFeatures:BuildGoldPerHourSection(panel, anchor, anchorX)
+-- Gold per Hour sections. Returns { Refresh = fn, bottom = frame }; bottom
+-- is a spacer under the activity list, resized in Refresh so the Beta
+-- Features section always sits below however many activity rows there are.
+function BetaFeatures:BuildGoldPerHourSection(panel, anchor)
     local function Control()
         return PocketCFO.ActivityControl
     end
 
     local header = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    -- Beta descriptions sit 25px in from the panel's text edge; line the
-    -- header up with the title instead.
-    header:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", anchorX or 0, -28)
+    header:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -18)
     header:SetText("Gold per Hour")
 
     local autoShow, bottom = CreateSettingsCheck(panel, header, "Show the tracker when tracking starts",
@@ -225,17 +325,22 @@ function BetaFeatures:BuildGoldPerHourSection(panel, anchor, anchorX)
         end
     end)
 
-    local listHeader = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    listHeader:SetPoint("TOPLEFT", bottom, "BOTTOMLEFT", -25, -20)
+    local listHeader = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    listHeader:SetPoint("TOPLEFT", bottom, "BOTTOMLEFT", -25, -24)
     listHeader:SetText("Show in Gold per Hour")
     local listHint = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     listHint:SetPoint("TOPLEFT", listHeader, "BOTTOMLEFT", 0, -4)
     listHint:SetWidth(560)
     listHint:SetJustifyH("LEFT")
-    listHint:SetText("Uncheck to hide an activity. Tracking continues. Running the same dungeon over and over for gold? Start a custom session first so it gets its own row.")
+    listHint:SetText("Uncheck to hide an activity. Tracking continues. Running the same dungeon over and over for gold? Start a session first so it gets its own row.")
     local listEmpty = panel:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
     listEmpty:SetPoint("TOPLEFT", listHint, "BOTTOMLEFT", 0, -10)
     listEmpty:SetText("Nothing tracked automatically yet.")
+
+    -- Spacer under the activity grid (height set in Refresh).
+    local spacer = CreateFrame("Frame", nil, panel)
+    spacer:SetPoint("TOPLEFT", listHint, "BOTTOMLEFT", 0, 0)
+    spacer:SetSize(1, 24)
 
     local activityChecks = {}
 
@@ -288,9 +393,11 @@ function BetaFeatures:BuildGoldPerHourSection(panel, anchor, anchorX)
             activityChecks[index]:Hide()
         end
         listEmpty:SetShown(#list == 0)
+        local rows = math.ceil(#list / ACTIVITY_COLUMNS)
+        spacer:SetHeight(rows > 0 and (10 + rows * ACTIVITY_ROW_HEIGHT) or 24)
     end
 
-    return { Refresh = Refresh }
+    return { Refresh = Refresh, bottom = spacer }
 end
 
 function BetaFeatures:OpenSettings()
@@ -304,6 +411,7 @@ function BetaFeatures:OpenSettings()
 end
 
 function BetaFeatures:OnEnable()
+    self:RetireOldSmartViewKey()
     self:CreateSettingsPanel()
 end
 

@@ -347,16 +347,26 @@ local function SortEvaluatedRows(rows)
         {},
         {},
         {},
+        {},
+        {},
     }
 
+    -- Smart view groups (Brian, 2026-11-04): Ready to post; Your call (Needs
+    -- Price, errors, then Too Cheap); Probably not (Listed, Skipped, Posted).
+    -- The rules view keeps Posted above Skipped as before.
     local function GetSortBucket(row)
         local status = row and row.evaluation and row.evaluation.status or row and row.status
+        local smart = row and row.resolvedRule and row.resolvedRule.smart == true
         if status == "Ready" then
             return 1
-        elseif status == "Posted" then
+        elseif status == "Too Cheap" then
             return 3
-        elseif status == "Skipped" then
+        elseif status == "Listed" then
             return 4
+        elseif status == "Posted" then
+            return smart and 6 or 5
+        elseif status == "Skipped" then
+            return smart and 5 or 6
         end
         return 2
     end

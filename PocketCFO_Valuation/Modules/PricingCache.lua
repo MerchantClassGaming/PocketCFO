@@ -199,6 +199,11 @@ function PricingCache:SetPricingRow(marketKey, row)
         itemLevel = tonumber(row.itemLevel) or row.itemLevel,
         statFingerprint = row.statFingerprint,
         depthUsed = tonumber(row.depthUsed) or row.depthUsed,
+        -- How much evidence the price came from (2026-11-04, value
+        -- confidence): listings and units seen for this market. nil on
+        -- prices saved before this existed.
+        listingCount = tonumber(row.listingCount),
+        unitCount = tonumber(row.unitCount),
         valuationDiagnostics = row.valuationDiagnostics,
         value = value,
         freshness = row.freshness or "fresh",

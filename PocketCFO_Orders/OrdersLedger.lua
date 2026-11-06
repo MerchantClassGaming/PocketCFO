@@ -206,6 +206,60 @@ function OrdersLedger:OnCraftResult(event, result)
     entry.returnsValue = (entry.returnsValue or 0) + value
     SessionLog("craft result orderID=%s resourcefulness qty=%d value=%s",
         tostring(orderID), quantity, FormatCopper(value))
+    self:WriteCraftToLedger(orderID, entry, result)
+end
+
+-- Item Ledger (Going Out step 1, 2026-11-05): an order craft is a craft. Your
+-- own mats (crafter-provided + finishing reagents, the same rows Order
+-- Analysis prices) go out, resourcefulness returns come in, and no output is
+-- written: the crafted item goes straight to the customer. Mats the customer
+-- provided were never yours. With no evaluation (mats unknown) nothing is
+-- written rather than guessing. The only writer of order craft facts
+-- (CraftEventCapture skips order crafts). Flavor: Retail-only (Orders does
+-- not load on Forever).
+function OrdersLedger:WriteCraftToLedger(orderID, entry, result)
+    local ledger = PocketCFO and PocketCFO.ItemLedger
+    local economics = entry and entry.economics
+    if not ledger or not ledger.WriteCraft then
+        SessionLog("ledger craft skipped orderID=%s reason=item-ledger-unavailable", tostring(orderID))
+        return
+    end
+    if type(economics) ~= "table" then
+        SessionLog("ledger craft skipped orderID=%s reason=no-evaluation", tostring(orderID))
+        return
+    end
+    local used = {}
+    for _, list in ipairs({ economics.crafterMaterialRows, economics.finishingReagentRows }) do
+        for _, row in ipairs(type(list) == "table" and list or {}) do
+            local qty = tonumber(row and row.quantity) or 0
+            if row and row.itemID and qty > 0 then
+                used[#used + 1] = { itemID = row.itemID, quantity = qty }
+            end
+        end
+    end
+    local returned = {}
+    for _, returnEntry in ipairs(type(result.resourcesReturned) == "table" and result.resourcesReturned or {}) do
+        local itemID = tonumber(returnEntry and returnEntry.reagent and returnEntry.reagent.itemID)
+        local qty = tonumber(returnEntry and returnEntry.quantity) or 0
+        if itemID and qty > 0 then
+            returned[#returned + 1] = { itemID = itemID, quantity = qty }
+        end
+    end
+    -- src = the order's recipe (CraftingOrderInfo.spellID; Theoretical that
+    -- it is always filled). Only a label; nil is fine.
+    local order = CurrentOrder()
+    local craftRecipeID = order and tonumber(order.spellID) or nil
+    local professionKey = ProfessionKey(nil)
+    local ok, craftID = pcall(ledger.WriteCraft, ledger, {
+        recipeID = craftRecipeID,
+        prof = professionKey ~= "none" and professionKey or nil,
+        used = used,
+        returned = returned,
+        order = true,
+    })
+    SessionLog("ledger craft orderID=%s recipe=%s craft=%s used=%d returned=%d",
+        tostring(orderID), tostring(craftRecipeID), tostring(ok and craftID or ("error: " .. tostring(craftID))),
+        #used, #returned)
 end
 
 function OrdersLedger:OnFulfillOrder(orderID, _, professionEnum)

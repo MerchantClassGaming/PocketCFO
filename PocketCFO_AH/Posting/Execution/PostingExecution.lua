@@ -254,7 +254,12 @@ local function BagSlotStillMatches(row, bagSlot)
         return false, "bag slot itemID changed", info
     end
 
-    local expectedLink = ExpectedItemLink(row)
+    -- Compare with the link of the slot we picked, not the row's: copies of
+    -- one configKey can have different links (e.g. a bound copy first in the
+    -- bag snapshot), and FindMatchingBagItem now skips bound copies, so the
+    -- row's link could belong to another copy (false "no longer contains the
+    -- expected item", 2026-11-04).
+    local expectedLink = bagSlot.itemLink or ExpectedItemLink(row)
     local currentLink = info.hyperlink
     if expectedLink and currentLink and tostring(expectedLink) ~= tostring(currentLink) then
         return false, "bag slot itemLink changed", info
@@ -387,6 +392,18 @@ function PostingExecution:SetRowPostError(row, message)
     end
 end
 
+-- Skip copies the Auction House won't take (bound tooltip / IsSellItemValid):
+-- a crafter's own bound profession tool can share a configKey with BoE copies
+-- and must never be the one picked (Brian, 2026-11-04).
+local function IsSlotPostable(containerID, slot, itemID)
+    local eligibility = PocketCFO_AH and PocketCFO_AH.GetModule and PocketCFO_AH:GetModule("PostingEligibilityService", true)
+    if not eligibility or type(eligibility.IsBagSlotAHPostable) ~= "function" then
+        return true
+    end
+    local ok, postable = pcall(eligibility.IsBagSlotAHPostable, eligibility, containerID, slot, itemID)
+    return not ok or postable == true
+end
+
 function PostingExecution:FindMatchingBagItem(row, requiredQuantity)
     requiredQuantity = PositiveQuantity(requiredQuantity)
     if requiredQuantity <= 0 then
@@ -401,7 +418,8 @@ function PostingExecution:FindMatchingBagItem(row, requiredQuantity)
         if okSlots and slots and slots > 0 then
             for slot = 1, slots do
                 local bagSlot = BuildBagSlotCandidate(containerID, slot)
-                if bagSlot and bagSlot.quantity >= requiredQuantity and RowMatchesBagSlot(row, bagSlot) then
+                if bagSlot and bagSlot.quantity >= requiredQuantity and RowMatchesBagSlot(row, bagSlot)
+                    and IsSlotPostable(containerID, slot, bagSlot.itemID) then
                     return bagSlot, nil
                 end
             end
@@ -988,6 +1006,10 @@ function PostingExecution:ApplyPostConfirmation(auctionID)
     if posting.remainingToPost > 0 then
         row.evaluation.status = "Ready"
         row.evaluation.note = string.format("%d of %d posted.", posting.postedCount, toPost)
+        if row.resolvedRule and row.resolvedRule.smart then
+            -- Gear posts one per click (Brian, 2026-11-04).
+            row.evaluation.note = row.evaluation.note .. " Click Post Selected for the next one."
+        end
     else
         row.evaluation.status = "Posted"
         row.evaluation.shouldPost = false

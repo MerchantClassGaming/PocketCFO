@@ -75,7 +75,8 @@ end
 
 -- Beta feature toggles (PocketCFO/Infrastructure/BetaFeatures.lua). Both
 -- default off: with Inventory Manager off, Analysis is the only view; with
--- Auction House off, the Posting Rules/Profiles windows stay closed.
+-- Auction House off (or Smart Posting on, which uses no rules; 2026-11-06),
+-- the Posting Rules/Profiles windows stay closed.
 local function GetBetaFeatures()
     return PocketCFO and PocketCFO.GetModule and PocketCFO:GetModule("BetaFeatures", true)
 end
@@ -88,6 +89,7 @@ end
 local function IsAuctionHouseBetaEnabled()
     local beta = GetBetaFeatures()
     return beta ~= nil and beta:IsAuctionHouseEnabled() == true
+        and beta:IsSmartAuctionHouseOn() ~= true
 end
 
 local function SessionLog(fmt, ...)

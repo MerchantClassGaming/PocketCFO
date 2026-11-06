@@ -50,6 +50,8 @@ local PAGE_ORDER = {
     { key = "recipes", title = "Recipe Rules", short = "Recipe Rules", frameKey = "RecipeRulesPage" },
     { key = "noncrafted", title = "Item Rules", short = "Item Rules", frameKey = "NonCraftedRulesPage" },
     { key = "ignore", title = "Ignore List", short = "Ignore List", frameKey = "IgnoreListPage" },
+    -- Smart AH view only (replaces the four rule pages; SmartPricing.lua).
+    { key = "keep", title = "Keep List", short = "Keep List", frameKey = "KeepListPage" },
 }
 
 local PAGE_BY_KEY = {}
@@ -65,9 +67,11 @@ local PAGE_TAB_WIDTHS = {
     recipes = 94,
     noncrafted = 88,
     ignore = 88,
+    keep = 82,
 }
 
 local PAGE_DESCRIPTIONS = {
+    keep = "Items this character won't sell. Leave Keep blank to keep them all, or type a number to sell only what's over it.",
     recipes = "Review and manage posting profiles and custom rules assigned to crafted items. For detailed recipe configuration, use the profession recipe window.",
     noncrafted = "Configure auction posting rules for non-crafted items such as gathered materials, world drops, transmog, and other sellable inventory.",
 }
@@ -696,25 +700,8 @@ local function IsKnownRecipeOutputItem(itemID, itemName)
     return false
 end
 
-local function ItemVariantSuffix(row)
-    local quality = row and (row.craftingQuality or row.itemQuality or row.quality)
-    quality = tonumber(quality)
-    if quality and quality > 0 then
-        return " Q" .. tostring(quality)
-    end
-    return ""
-end
-
-local function ItemDisplayName(row)
-    if type(row) ~= "table" then
-        return ""
-    end
-    local name = row.itemName
-    if (not name or name == "") and row.itemID then
-        name = "Item " .. tostring(row.itemID)
-    end
-    return tostring(name or "") .. ItemVariantSuffix(row)
-end
+-- Shared AH item name (Init.lua).
+local ItemDisplayName = PocketCFO_AH.ItemDisplayName
 
 local function RecipeVariantSuffix(rule, config, output)
     local quality = rule and (rule.craftingQuality or rule.itemQuality or rule.quality)
@@ -1188,7 +1175,23 @@ local function IsAuctionHouseBetaEnabled()
     return beta ~= nil and beta:IsAuctionHouseEnabled() == true
 end
 
+-- Smart AH view (SmartPricing.lua, not a beta feature): Dashboard, Post,
+-- Cancel and Keep List only. The rules view keeps its pages and stays
+-- behind the beta toggle, unchanged.
+local SMART_PAGES = { dashboard = true, post = true, cancel = true, keep = true }
+
+local function IsSmartView()
+    local smart = PocketCFO_AH and PocketCFO_AH.GetModule and PocketCFO_AH:GetModule("SmartPricing", true)
+    return smart ~= nil and smart:IsSmartView() == true
+end
+
 function AHPostingUI:IsPageAllowed(pageKey)
+    if IsSmartView() then
+        return SMART_PAGES[pageKey] == true
+    end
+    if pageKey == "keep" then
+        return false
+    end
     return pageKey == "dashboard" or IsAuctionHouseBetaEnabled()
 end
 
@@ -1197,14 +1200,28 @@ function AHPostingUI:ApplyBetaPageVisibility()
     if not main or not main.InternalTabs then
         return
     end
-    local showTabs = IsAuctionHouseBetaEnabled()
-    for _, tab in pairs(main.InternalTabs) do
-        tab:SetShown(showTabs)
+    local showTabs = IsSmartView() or IsAuctionHouseBetaEnabled()
+    local tabX = 12
+    for _, page in ipairs(PAGE_ORDER) do
+        local tab = main.InternalTabs[page.key]
+        if tab then
+            local shown = showTabs and self:IsPageAllowed(page.key)
+            tab:SetShown(shown)
+            if shown then
+                tab:ClearAllPoints()
+                tab:SetPoint("BOTTOMLEFT", main, "BOTTOMLEFT", tabX, 10)
+                tabX = tabX + (PAGE_TAB_WIDTHS[page.key] or 98) + 6
+            end
+        end
     end
 end
 
 function AHPostingUI:OnSettingsChanged()
     self:ApplyBetaPageVisibility()
+    -- The Post page is drawn for one view; redraw it on next open.
+    if self.pagesRendered then
+        self.pagesRendered.post = nil
+    end
     if self.currentPage and not self:IsPageAllowed(self.currentPage) and self.mainFrame and self.mainFrame:IsShown() then
         self:SelectPage("dashboard")
     end
@@ -1244,7 +1261,7 @@ function AHPostingUI:RenderAllPages()
         self:RenderDashboard(main.DashboardPage)
         self.pagesRendered.dashboard = true
     end
-    if not self.pagesRendered.profiles then
+    if not self.pagesRendered.profiles and self:IsPageAllowed("profiles") then
         self:RenderProfiles(main.ProfilesPage)
         self.pagesRendered.profiles = true
     end
@@ -1252,15 +1269,15 @@ function AHPostingUI:RenderAllPages()
         self:RenderCancelAuctions(main.CancelAuctionsPage)
         self.pagesRendered.cancel = true
     end
-    if not self.pagesRendered.recipes then
+    if not self.pagesRendered.recipes and self:IsPageAllowed("recipes") then
         self:RenderRecipes(main.RecipeRulesPage)
         self.pagesRendered.recipes = true
     end
-    if not self.pagesRendered.noncrafted then
+    if not self.pagesRendered.noncrafted and self:IsPageAllowed("noncrafted") then
         self:RenderNonCrafted(main.NonCraftedRulesPage)
         self.pagesRendered.noncrafted = true
     end
-    if not self.pagesRendered.ignore then
+    if not self.pagesRendered.ignore and self:IsPageAllowed("ignore") then
         self:RenderIgnoreList(main.IgnoreListPage)
         self.pagesRendered.ignore = true
     end
@@ -1288,6 +1305,8 @@ function AHPostingUI:RefreshPage(pageKey)
         self:RenderNonCrafted(frame)
     elseif pageKey == "ignore" then
         self:RenderIgnoreList(frame)
+    elseif pageKey == "keep" then
+        self:RenderKeepList(frame)
     elseif pageKey == "post" then
         self:RenderPostAuctions(frame)
     elseif pageKey == "cancel" then
@@ -1306,7 +1325,9 @@ end
 function AHPostingUI:RefreshSelectedPage(pageKey)
     if pageKey == "post" then
         local postingUI = GetPostingUIModule()
-        if postingUI and postingUI.RefreshQueue then
+        if postingUI and postingUI.CanReuseList and postingUI:CanReuseList() then
+            postingUI:ShowSavedList()
+        elseif postingUI and postingUI.RefreshQueue then
             postingUI:RefreshQueue("post-page-activated")
         end
     elseif pageKey == "cancel" then
@@ -1333,7 +1354,11 @@ function AHPostingUI:SelectPage(pageKey)
 
     if page.key ~= "post" then
         local controller = GetPostingController()
-        if controller and controller.InvalidateEvaluation then
+        -- Smart view: a finished list is kept for when the player comes back
+        -- (PostingUI:CanReuseList). An unfinished one stops, as before.
+        local keepList = IsSmartView() and controller and controller.IsEvaluationInProgress
+            and not controller:IsEvaluationInProgress()
+        if controller and controller.InvalidateEvaluation and not keepList then
             controller:InvalidateEvaluation("page-left")
         end
     end
@@ -2018,6 +2043,181 @@ function AHPostingUI:RenderIgnoreList(parent)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Keep List (smart view). Per character (SmartPricing.lua). Same layout as
+-- the Ignore List, plus an editable Keep quantity (blank = keep all).
+-- ---------------------------------------------------------------------------
+
+local function GetSmartPricing()
+    return PocketCFO_AH and PocketCFO_AH.GetModule and PocketCFO_AH:GetModule("SmartPricing", true)
+end
+
+function AHPostingUI:GetKeepRows()
+    local rows = {}
+    local smart = GetSmartPricing()
+    for itemKey, entry in pairs(smart and smart:GetKeepList() or {}) do
+        local copy = {}
+        if type(entry) == "table" then
+            for key, value in pairs(entry) do
+                copy[key] = value
+            end
+        end
+        copy.key = tostring(itemKey)
+        copy.itemKey = copy.key
+        copy.displayName = ItemDisplayName(copy)
+        rows[#rows + 1] = copy
+    end
+    table.sort(rows, function(a, b)
+        local aName = tostring(a.displayName or a.itemName or "")
+        local bName = tostring(b.displayName or b.itemName or "")
+        if aName == bName then
+            return tostring(a.key) < tostring(b.key)
+        end
+        return aName < bName
+    end)
+    return rows
+end
+
+local function KeepLabel(row)
+    local name = tostring(row.displayName or row.itemName or row.key or "")
+    if row.keep == nil then
+        return name .. "  |cff999999(all)|r"
+    end
+    return name .. "  |cff999999(keep " .. tostring(row.keep) .. ")|r"
+end
+
+function AHPostingUI:RefreshKeepListRows()
+    local list = self.keepList
+    if not list then
+        return
+    end
+    local rows = list.rows or {}
+    local offset = FauxScrollFrame_GetOffset and FauxScrollFrame_GetOffset(list.scrollFrame) or 0
+    local visibleRows = GetVisibleListRows(list.listBox, IGNORE_LIST_VISIBLE_ROWS, IGNORE_LIST_ROW_HEIGHT, 4, 4)
+    if FauxScrollFrame_Update then
+        FauxScrollFrame_Update(list.scrollFrame, #rows, visibleRows, IGNORE_LIST_ROW_HEIGHT)
+    end
+    for index, button in ipairs(list.buttons or {}) do
+        if index > visibleRows then
+            button:Hide()
+        else
+            local row = rows[offset + index]
+            if row then
+                button.itemKey = row.key
+                button.itemRow = row
+                button.ItemText:SetText(KeepLabel(row))
+                button:Enable()
+                button:Show()
+                if tostring(row.key) == tostring(self.selectedKeepKey) then
+                    button:SetBackdropColor(0.18, 0.24, 0.34, 0.95)
+                else
+                    button:SetBackdropColor(0.06, 0.06, 0.06, 0.82)
+                end
+            else
+                button.itemKey = nil
+                button.itemRow = nil
+                button.ItemText:SetText("")
+                button:Disable()
+                button:SetBackdropColor(0.04, 0.04, 0.04, 0.45)
+                button:Show()
+            end
+        end
+    end
+end
+
+function AHPostingUI:RenderKeepList(parent)
+    local smart = GetSmartPricing()
+    local rows = self:GetKeepRows()
+
+    AddChild(parent, CreateLabel(parent, "Kept Items (this character)", 10, -12, 260, "GameFontNormal"))
+    local listBox = AddChild(parent, CreateFrame("Frame", nil, parent, "BackdropTemplate"))
+    listBox:SetPoint("TOPLEFT", parent, "TOPLEFT", 10, -36)
+    listBox:SetPoint("BOTTOMRIGHT", parent, "BOTTOMLEFT", 384, 16)
+    listBox:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        edgeSize = 12,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    listBox:SetBackdropColor(0.025, 0.025, 0.025, 0.9)
+    listBox:SetBackdropBorderColor(0.45, 0.45, 0.45, 0.85)
+
+    local buttons = {}
+    for index = 1, IGNORE_LIST_VISIBLE_ROWS do
+        local button = AddChild(parent, self:CreateIgnoredItemListRow(listBox, 4, -4 - ((index - 1) * IGNORE_LIST_ROW_HEIGHT), 346, IGNORE_LIST_ROW_HEIGHT - 2))
+        button:SetScript("OnClick", function(clicked)
+            self.selectedKeepKey = clicked.itemKey
+            self:RefreshPage("keep")
+        end)
+        buttons[index] = button
+    end
+
+    local scrollFrame = AddChild(parent, CreateFrame("ScrollFrame", nil, listBox, "FauxScrollFrameTemplate"))
+    scrollFrame:SetPoint("TOPLEFT", listBox, "TOPLEFT", 0, -4)
+    scrollFrame:SetPoint("BOTTOMRIGHT", listBox, "BOTTOMRIGHT", -26, 4)
+    scrollFrame:SetScript("OnVerticalScroll", function(frame, offset)
+        if FauxScrollFrame_OnVerticalScroll then
+            FauxScrollFrame_OnVerticalScroll(frame, offset, IGNORE_LIST_ROW_HEIGHT, function()
+                self:RefreshKeepListRows()
+            end)
+        end
+    end)
+
+    self.keepList = { rows = rows, buttons = buttons, scrollFrame = scrollFrame, listBox = listBox }
+    self:RefreshKeepListRows()
+
+    local selected = nil
+    for _, row in ipairs(rows) do
+        if tostring(row.key) == tostring(self.selectedKeepKey) then
+            selected = row
+            break
+        end
+    end
+    if not selected then
+        self.selectedKeepKey = nil
+    end
+
+    AddChild(parent, CreateLabel(parent, "Selected Item: " .. tostring(selected and (selected.displayName or selected.itemName) or ""), 414, -36, 300, "GameFontNormalSmall"))
+    AddChild(parent, CreateLabel(parent, "Item ID: " .. tostring(selected and selected.itemID or ""), 414, -62, 220, "GameFontHighlightSmall"))
+    AddChild(parent, CreateLabel(parent, "Item Key: " .. tostring(selected and selected.key or ""), 414, -84, 320, "GameFontHighlightSmall"))
+
+    AddChild(parent, CreateLabel(parent, "Keep:", 414, -114, 40, "GameFontHighlightSmall"))
+    local keepInput = AddChild(parent, CreateInput(parent, 456, -110, 60))
+    keepInput:SetNumeric(true)
+    keepInput:SetText(selected and selected.keep and tostring(selected.keep) or "")
+    AddChild(parent, CreateLabel(parent, "Blank = keep all", 524, -114, 160, "GameFontDisableSmall"))
+    local function SaveKeep()
+        if smart and self.selectedKeepKey then
+            smart:SetKeepAmount(self.selectedKeepKey, keepInput:GetText())
+            self:RefreshPage("keep")
+        end
+    end
+    keepInput:SetScript("OnEnterPressed", function(edit)
+        edit:ClearFocus()
+        SaveKeep()
+    end)
+    keepInput:SetScript("OnEscapePressed", function(edit)
+        edit:ClearFocus()
+    end)
+    local saveButton = AddChild(parent, CreateButton(parent, "Save", 414, -140, 80, SaveKeep))
+    local removeButton = AddChild(parent, CreateButton(parent, "Remove from Keep List", 502, -140, 170, function()
+        if smart and self.selectedKeepKey then
+            smart:RemoveKeep(self.selectedKeepKey)
+            self.selectedKeepKey = nil
+            self:RefreshPage("keep")
+        end
+    end))
+    if not selected then
+        keepInput:Disable()
+        saveButton:Disable()
+        removeButton:Disable()
+    end
+
+    if #rows == 0 then
+        AddChild(parent, CreateListEmptyLabel(listBox, "Nothing kept yet. Select an item on Post Auctions and click Keep.", 4))
+    end
+end
+
 function AHPostingUI:GetRecipeRows()
     local rows = {}
     local rules = GlobalDB().recipePostingRules or {}
@@ -2353,6 +2553,10 @@ function AHPostingUI:OnAuctionHouseShow()
 end
 
 function AHPostingUI:OnAuctionHouseClosed()
+    local postingUI = GetPostingUIModule()
+    if postingUI and postingUI.OnAuctionHouseClosed then
+        postingUI:OnAuctionHouseClosed()
+    end
     local exec = PocketCFO_AH:GetModule("PostingExecution", true)
     if exec and exec.ClearPending then
         exec:ClearPending()

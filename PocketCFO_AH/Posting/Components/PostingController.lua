@@ -102,61 +102,6 @@ local function RuleSummary(rule)
     return tostring(rule.mode or "")
 end
 
-local function FormatStatFingerprint(statFingerprint)
-    if statFingerprint == nil or tostring(statFingerprint) == "" then
-        return nil
-    end
-
-    local labels = {}
-    for rawPart in string.gmatch(tostring(statFingerprint), "([^|]+)") do
-        local part = rawPart
-        part = part:gsub("^ITEM_MOD_", "")
-        part = part:gsub("_SHORT$", "")
-        part = part:gsub("_STAT$", "")
-        part = part:gsub("_", " "):lower()
-        part = part:gsub("(%a)([%w']*)", function(first, rest)
-            return first:upper() .. rest
-        end)
-        if part ~= "" then
-            labels[#labels + 1] = part
-        end
-    end
-
-    if #labels == 0 then
-        return nil
-    end
-    return table.concat(labels, " / ")
-end
-
--- Returns the matchingPath set on the candidate's effective rule, if any.
-local function CandidateMatchingPath(candidate)
-    return (candidate and candidate.effectiveRule and candidate.effectiveRule.matchingPath)
-        or (candidate and candidate.rule and candidate.rule.matchingPath)
-        or (candidate and candidate.target and candidate.target.matchingPath)
-        or candidate and candidate.matchingPath
-end
-
--- Display name includes the stat label suffix only when the rule's matching path
--- requires stat-variant differentiation.
-local function GetPostingDisplayName(candidate)
-    local name = candidate and candidate.itemName
-    if (not name or name == "") and candidate and candidate.itemID then
-        name = "Item " .. tostring(candidate.itemID)
-    end
-    name = tostring(name or "")
-
-    local matchingPath = CandidateMatchingPath(candidate)
-    local showStatVariant = tostring(matchingPath or "") == "itemID_ilvl_stat"
-    if not showStatVariant then
-        return name
-    end
-
-    local statLabel = FormatStatFingerprint(candidate and candidate.statFingerprint)
-    if statLabel and name:find(" - " .. statLabel, 1, true) == nil then
-        return name .. " - " .. statLabel
-    end
-    return name
-end
 
 -- Builds the posting target descriptor from a queue candidate.
 -- isCommodity and identity fields (itemClassID, equipLoc, effectiveItemLevel,
@@ -246,6 +191,10 @@ local function BuildResolvedRule(rule)
         minPrice = Copper(rule and rule.minPrice) or 0,
         maxPrice = Copper(rule and rule.maxPrice),
         duration = NormalizeDuration(rule and rule.duration, GetGlobalDuration()),
+        -- Smart AH view (SmartPricing.lua): floor/ceiling details for the
+        -- evaluator's smart branch and the row Notes.
+        smart = rule and rule.smart == true or nil,
+        bounds = rule and rule.bounds or nil,
     }
 end
 
@@ -351,7 +300,7 @@ function PostingController:BuildInitialQueue()
             itemName = candidate.itemName,
             itemLink = candidate.itemLink,
             itemKey = candidate.itemKey,
-            item = GetPostingDisplayName(candidate),
+            item = PocketCFO_AH.ItemDisplayName(candidate),
             inBags = inBags,
             have = inBags,
             isStackable = candidate.isStackable == true,
@@ -414,6 +363,12 @@ function PostingController:ApplyEvaluation(row, result)
     row.evaluation.lowestMatchingPrice = result and result.lowestMatchingPrice or nil
     row.evaluation.ownedCoverage = result and result.ownedCoverage or nil
     row.evaluation.remainingToPost = result and result.remainingToPost or nil
+    -- Smart view: starting price shown on skipped rows; a fresh evaluation
+    -- clears any in-place overrides.
+    row.evaluation.suggestedPrice = result and result.suggestedPrice or nil
+    row.evaluation.suggestedQuantity = result and result.suggestedQuantity or nil
+    row.overrides = nil
+    row.smartEvaluation = nil
     row.posting.postedCount = 0
     row.posting.remainingToPost = row.evaluation.toPost
     row.posting.pending = false
@@ -421,10 +376,292 @@ function PostingController:ApplyEvaluation(row, result)
 end
 
 function PostingController:MarketSettingsForRow(row)
+    local rule = row and row.resolvedRule
+    if rule and rule.smart then
+        -- Smart view: real market value, so listings far below it are
+        -- treated as bait, not competition.
+        return {
+            marketValue = rule.bounds and rule.bounds.marketValue or nil,
+            protectionPct = GetProtectionPct(),
+        }
+    end
     return {
         marketValue = GetMarketValue(row),
         protectionPct = GetProtectionPct(),
     }
+end
+
+-- ---------------------------------------------------------------------------
+-- Smart view: in-place overrides (this post only, never saved) and Keep.
+-- ---------------------------------------------------------------------------
+
+local function FormatGold(copper)
+    copper = tonumber(copper)
+    if not copper then
+        return ""
+    end
+    -- Two biggest coins (core PocketCFO:FormatMoney, 2026-11-05).
+    return PocketCFO:FormatMoney(copper)
+end
+
+local function OverrideNote(row)
+    local overrides = row.overrides or {}
+    local parts = {}
+    if overrides.price then parts[#parts + 1] = "price" end
+    if overrides.quantity then parts[#parts + 1] = "quantity" end
+    if overrides.duration then parts[#parts + 1] = "duration" end
+    if #parts == 0 then
+        return nil
+    end
+    local note = "Your " .. table.concat(parts, " and ") .. "."
+    local floor = row.resolvedRule and row.resolvedRule.bounds and row.resolvedRule.bounds.floor
+    local price = tonumber(row.evaluation and row.evaluation.price)
+    if overrides.price and floor and price and price < floor then
+        local source = row.resolvedRule.bounds.floorSource
+        if source == "disenchant" then
+            note = note .. " Below disenchant value (" .. FormatGold(floor) .. ")."
+        elseif source == "vendor" then
+            note = note .. " Below vendor price."
+        else
+            note = note .. " Below what it costs to make (" .. FormatGold(floor) .. ")."
+        end
+    end
+    return note
+end
+
+-- field = "price" (copper) | "quantity" | "duration" (12/24/48). value nil =
+-- put the smart value back. Returns true when the row changed.
+function PostingController:ApplyOverride(row, field, value)
+    if type(row) ~= "table" or type(row.evaluation) ~= "table" then
+        return false
+    end
+    if row.posting and row.posting.pending == true then
+        return false
+    end
+    row.overrides = row.overrides or {}
+    row.smartEvaluation = row.smartEvaluation or {
+        price = row.evaluation.price,
+        toPost = row.evaluation.toPost,
+        status = row.evaluation.status,
+        note = row.evaluation.note,
+        shouldPost = row.evaluation.shouldPost,
+        duration = row.resolvedRule and row.resolvedRule.duration,
+    }
+    local smartEval = row.smartEvaluation
+    local inBags = PositiveQuantity(row.inBags)
+
+    if field == "price" then
+        local copper = Copper(value)
+        -- Whole silver: PostItem drops prices with copper left over.
+        copper = copper and math.floor(copper / 100 + 0.5) * 100 or nil
+        if copper and copper > 0 then
+            row.evaluation.price = copper
+            row.overrides.price = true
+        else
+            row.evaluation.price = smartEval.price
+            row.overrides.price = nil
+        end
+    elseif field == "quantity" then
+        local quantity = math.floor(tonumber(value) or 0)
+        if value ~= nil and quantity > 0 then
+            -- Post Now is what's left to post: already-posted copies of this
+            -- row (1 of 2 for gear) count on top of it.
+            local alreadyPosted = PositiveQuantity(row.posting and row.posting.postedCount)
+            row.evaluation.toPost = math.min(alreadyPosted + quantity, inBags)
+            row.overrides.quantity = true
+        else
+            row.evaluation.toPost = smartEval.toPost
+            row.overrides.quantity = nil
+        end
+    elseif field == "duration" then
+        local duration = value and NormalizeDuration(value, 12) or smartEval.duration
+        row.resolvedRule.duration = duration
+        row.duration = duration
+        row.overrides.duration = (value ~= nil and duration ~= smartEval.duration) or nil
+    else
+        return false
+    end
+
+    local hasPrice = tonumber(row.evaluation.price) ~= nil and tonumber(row.evaluation.price) > 0
+    if row.overrides.price or row.overrides.quantity then
+        -- An override on a skipped row un-skips it once it has a price.
+        if hasPrice then
+            if PositiveQuantity(row.evaluation.toPost) <= 0 then
+                -- One stack by default (1 if it doesn't stack).
+                local stackSize = PositiveQuantity(row.resolvedRule and row.resolvedRule.bounds
+                    and row.resolvedRule.bounds.stackSize)
+                row.evaluation.toPost = PositiveQuantity(row.evaluation.suggestedQuantity) > 0
+                    and row.evaluation.suggestedQuantity
+                    or math.min(inBags, stackSize > 0 and stackSize or 1)
+            end
+            row.evaluation.status = "Ready"
+            row.evaluation.shouldPost = PositiveQuantity(row.evaluation.toPost) > 0
+            row.userSkipped = nil
+        end
+    else
+        row.evaluation.status = smartEval.status
+        row.evaluation.shouldPost = smartEval.shouldPost
+        row.evaluation.toPost = smartEval.toPost
+    end
+
+    if not hasPrice and (row.overrides.quantity) then
+        row.evaluation.note = "Type a price to post."
+    else
+        row.evaluation.note = OverrideNote(row) or smartEval.note
+    end
+    if row.overrides.duration and not (row.overrides.price or row.overrides.quantity) then
+        row.evaluation.note = smartEval.note .. " Your duration."
+    end
+
+    row.posting.remainingToPost = math.max(0, PositiveQuantity(row.evaluation.toPost) - PositiveQuantity(row.posting.postedCount))
+    ApplyEvaluationAliases(row)
+    self:NotifyQueueChanged("override")
+    return true
+end
+
+-- Skip (smart view): not now, but next time. The row moves to the bottom as
+-- Skipped; nothing is saved, so the next Refresh or AH visit offers it again.
+-- Typing a price on it un-skips it like any skipped row (Brian, 2026-11-04).
+function PostingController:SkipRow(row)
+    if type(row) ~= "table" or type(row.evaluation) ~= "table" then
+        return false
+    end
+    if row.posting and row.posting.pending == true then
+        return false
+    end
+    row.overrides = nil
+    row.smartEvaluation = nil
+    row.evaluation.status = "Skipped"
+    row.evaluation.shouldPost = false
+    row.evaluation.toPost = 0
+    row.evaluation.note = "Skipped by you."
+    if PositiveQuantity(row.evaluation.suggestedQuantity) <= 0 then
+        local stackSize = PositiveQuantity(row.resolvedRule and row.resolvedRule.bounds
+            and row.resolvedRule.bounds.stackSize)
+        row.evaluation.suggestedQuantity = math.min(PositiveQuantity(row.inBags), stackSize > 0 and stackSize or 1)
+    end
+    row.userSkipped = true
+    if row.posting then
+        row.posting.remainingToPost = 0
+    end
+    ApplyEvaluationAliases(row)
+    local moved = {}
+    for _, other in ipairs(self.rows or {}) do
+        if other ~= row then
+            moved[#moved + 1] = other
+        end
+    end
+    moved[#moved + 1] = row
+    self.rows = moved
+    -- Skipped sits above Posted in Probably not.
+    local evalService = PocketCFO_AH:GetModule("PostingEvaluationPipeline", true)
+    if evalService and evalService.SortRows then
+        evalService:SortRows(self.rows)
+    end
+    SessionLog("PostingController: skipped by player item=%s", tostring(row.itemName))
+    self:NotifyQueueChanged("skip")
+    return true
+end
+
+-- Usually Post (smart view): saved per item for the whole account (Brian,
+-- 2026-11-04). value nil/0 = back to the default. Rows that are Ready or
+-- Listed with no edits re-figure Post Now right away: Usually Post minus ours
+-- already selling next. Other rows just get the new starting Post Now.
+function PostingController:SetUsuallyPost(row, value)
+    local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+    if not smart or type(row) ~= "table" or type(row.evaluation) ~= "table" then
+        return false
+    end
+    if row.posting and row.posting.pending == true then
+        return false
+    end
+    local candidate = row.candidate or {}
+    local itemKey = row.configKey or candidate.configKey or tostring(candidate.itemID or "")
+    if itemKey == "" then
+        return false
+    end
+    smart:SetUsuallyPost(itemKey, value)
+    local saved = smart:GetUsuallyPost(itemKey)
+    local bounds = row.resolvedRule and row.resolvedRule.bounds
+    if bounds then
+        bounds.usuallyPost = saved
+    end
+    local usual = saved or smart:DefaultUsuallyPost(bounds and bounds.stackSize)
+    local evaluation = row.evaluation
+    local inBags = PositiveQuantity(row.inBags)
+    local status = evaluation.status
+    local untouched = not (row.overrides and (row.overrides.price or row.overrides.quantity))
+        and PositiveQuantity(row.posting and row.posting.postedCount) == 0
+    local price = tonumber(evaluation.price) or tonumber(evaluation.suggestedPrice)
+
+    if untouched and (status == "Ready" or status == "Listed") and price and price > 0 then
+        local coverage = PositiveQuantity(evaluation.ownedCoverage)
+        local postNow = math.min(inBags, math.max(0, usual - coverage))
+        evaluation.price = price
+        if postNow > 0 then
+            evaluation.status = "Ready"
+            evaluation.shouldPost = true
+            evaluation.toPost = postNow
+            if status == "Listed" then
+                evaluation.note = "Matched your price. " .. tostring(coverage) .. " of yours already up."
+            end
+        else
+            evaluation.status = "Listed"
+            evaluation.shouldPost = false
+            evaluation.toPost = 0
+            evaluation.suggestedPrice = price
+            evaluation.note = "Yours sells next (" .. FormatGold(price) .. "). Type in Post Now to add more."
+        end
+        -- New starting point for "put the smart value back".
+        row.smartEvaluation = nil
+        if row.posting then
+            row.posting.remainingToPost = evaluation.toPost
+        end
+    else
+        evaluation.suggestedQuantity = math.min(inBags, usual)
+    end
+    ApplyEvaluationAliases(row)
+    local evalService = PocketCFO_AH:GetModule("PostingEvaluationPipeline", true)
+    if evalService and evalService.SortRows then
+        evalService:SortRows(self.rows)
+    end
+    SessionLog("PostingController: usually post item=%s key=%s value=%s", tostring(row.itemName), tostring(itemKey), tostring(saved))
+    self:NotifyQueueChanged("usually-post")
+    return true
+end
+
+-- Adds the row's item to this character's Keep list (keep all) and drops
+-- every row for it from the current list.
+function PostingController:KeepRow(row)
+    local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+    if not smart or type(row) ~= "table" then
+        return false
+    end
+    if row.posting and row.posting.pending == true then
+        return false
+    end
+    local candidate = row.candidate or {}
+    local itemKey = row.configKey or candidate.configKey or tostring(candidate.itemID or "")
+    if itemKey == "" then
+        return false
+    end
+    smart:AddKeep(itemKey, {
+        itemID = candidate.itemID,
+        itemName = candidate.itemName or row.itemName,
+        itemLink = candidate.itemLink or row.itemLink,
+        configKey = itemKey,
+    })
+    local kept = {}
+    for _, other in ipairs(self.rows or {}) do
+        local otherKey = other.configKey or (other.candidate and other.candidate.configKey)
+        if otherKey ~= itemKey then
+            kept[#kept + 1] = other
+        end
+    end
+    self.rows = kept
+    SessionLog("PostingController: kept item=%s key=%s", tostring(row.itemName), tostring(itemKey))
+    self:NotifyQueueChanged("keep")
+    return true
 end
 
 function PostingController:EvaluateRow(index, generation)

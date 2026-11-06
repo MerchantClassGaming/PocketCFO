@@ -331,7 +331,7 @@ function CancelAuctionsController:BuildRowsFromOwnedAuctions(ownedRows)
                         identity = identity,
                         auctionPath = identity and identity.auctionPath or auction.auctionPath,
                         itemName = auction.itemName or auction.name or ("Item " .. tostring(auction.itemID or "")),
-                        item = auction.itemName or auction.name or ("Item " .. tostring(auction.itemID or "")),
+                        item = PocketCFO_AH.ItemDisplayName(auction),
                         itemID = auction.itemID,
                         itemLink = auction.itemLink,
                         itemQuality = auction.itemQuality or auction.craftingQuality or auction.qualityTier,
@@ -439,6 +439,7 @@ function CancelAuctionsController:EvaluateNext(generation)
         SortRows(self.rows)
         self:NotifyRowsChanged("complete")
         SessionLog("CancelAuctionsController: evaluation complete rows=%d", #(self.rows or {}))
+        self:ScheduleUnconfirmedRecheck(generation)
         return
     end
 
@@ -479,6 +480,100 @@ function CancelAuctionsController:EvaluateNext(generation)
         SortRows(self.rows)
         self:NotifyRowsChanged("row")
         self:EvaluateNext(generation)
+    end)
+end
+
+-- First load after login (Brian, 2026-11-04): gear the game hasn't loaded yet
+-- comes back with no name or stats, so its search finds nothing ("Unable to
+-- confirm"). A moment later the data is there. So once a pass finishes with
+-- unconfirmed rows, re-read just those auctions from a fresh owned-auction
+-- list and check just those rows again. The rest of the list is left alone.
+-- Never twice in a row, so it can't loop.
+local UNCONFIRMED_NOTE = "Unable to confirm in current auction ladder."
+local RECHECK_DELAY_SECONDS = 1
+
+function CancelAuctionsController:ScheduleUnconfirmedRecheck(generation)
+    if self.inUnconfirmedRecheck then
+        self.inUnconfirmedRecheck = nil
+        return
+    end
+    local unconfirmed = {}
+    for _, row in ipairs(self.rows or {}) do
+        if row.note == UNCONFIRMED_NOTE then
+            unconfirmed[#unconfirmed + 1] = row
+        end
+    end
+    local ahManager = PocketCFO_AH:GetModule("AHManager", true)
+    if #unconfirmed == 0 or not (C_Timer and C_Timer.After)
+        or not (ahManager and ahManager.RequestOwnedAuctionsRefresh) then
+        return
+    end
+    -- Theoretical (untested here): ask the game to load these items while we wait.
+    for _, row in ipairs(unconfirmed) do
+        local itemID = tonumber(row.itemID)
+        if itemID and C_Item and C_Item.RequestLoadItemDataByID then
+            pcall(C_Item.RequestLoadItemDataByID, itemID)
+        end
+    end
+    SessionLog("CancelAuctionsController: %d unconfirmed rows; rechecking them in %ds", #unconfirmed, RECHECK_DELAY_SECONDS)
+    C_Timer.After(RECHECK_DELAY_SECONDS, function()
+        if generation ~= self.generation or self.evaluating then
+            return
+        end
+        ahManager:RequestOwnedAuctionsRefresh("cancel-unconfirmed-recheck", function(ok, observation)
+            if generation ~= self.generation or self.evaluating then
+                return
+            end
+            local freshByID = {}
+            for _, auction in ipairs(observation and observation.rows or {}) do
+                local auctionID = GetAuctionID(auction)
+                if auctionID ~= nil then
+                    freshByID[tostring(auctionID)] = auction
+                end
+            end
+            local queued = 0
+            for _, row in ipairs(unconfirmed) do
+                local fresh = {}
+                for _, auction in ipairs(row.auctions or {}) do
+                    local freshAuction = freshByID[tostring(GetAuctionID(auction))]
+                    if freshAuction then
+                        freshAuction.isOwned = true
+                        freshAuction.owned = true
+                        freshAuction.ownerIsPlayer = true
+                        freshAuction.ownerKey = freshAuction.ownerKey or row.ownerKey
+                        freshAuction.owner = freshAuction.owner or row.owner
+                        fresh[#fresh + 1] = freshAuction
+                    end
+                end
+                -- Sold or cancelled since: leave the row as it is.
+                if #fresh > 0 then
+                    local configKey, identity = ConfigKeyForOwnedAuction(fresh[1])
+                    local first = fresh[1]
+                    row.auctions = fresh
+                    row.configKey = configKey or row.configKey
+                    row.identity = identity or row.identity
+                    row.auctionPath = identity and identity.auctionPath or first.auctionPath or row.auctionPath
+                    row.itemLink = first.itemLink or row.itemLink
+                    row.statFingerprint = first.statFingerprint or (identity and identity.statFingerprint) or row.statFingerprint
+                    row.ilvl = first.ilvl or first.itemLevel or row.ilvl
+                    row.isCommodity = first.isCommodity == true or (identity and identity.auctionPath == "commodity") or row.isCommodity
+                    ApplyRowTotals(row)
+                    row.status = "Evaluating"
+                    row.note = ""
+                    row.notes = ""
+                    queued = queued + 1
+                end
+            end
+            SessionLog("CancelAuctionsController: rechecking %d unconfirmed rows ok=%s", queued, tostring(ok))
+            if queued == 0 then
+                return
+            end
+            self.inUnconfirmedRecheck = true
+            self.evaluating = true
+            SortRows(self.rows)
+            self:NotifyRowsChanged("recheck-started")
+            self:EvaluateNext(generation)
+        end, OWNED_AUCTION_REFRESH_TIMEOUT_SECONDS)
     end)
 end
 

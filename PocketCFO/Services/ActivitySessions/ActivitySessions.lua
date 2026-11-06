@@ -37,12 +37,20 @@
 --     contents minus the bag.
 --   - Currencies (Moxie etc.): gained minus spent, valued where a currency
 --     value exists (none yet: shown as a count).
---   - Not counted: "transfer" (moved between your own characters) and "craft"
---     output (crafts don't record the mats they use yet; counting the output
---     alone would inflate a crafting session).
---   - Sold during the session = what you got. A vendor or AH sale whose item
---     name matches loot from this session (not yet sold) replaces that loot's
---     value with the sale gold. Selling 3 of 5 replaces 3.
+--   - Not counted: "transfer" (moved between your own characters).
+--   - Going out (2026-11-05): mats used in crafts and items disenchanted
+--     subtract their book value (the value they came in at, from the Item
+--     Ledger's book value record); units with no book value subtract at
+--     today's price. BoP items (bound on pickup) are worth 0 while held; what
+--     they bring when they leave is the gain.
+--   - Crafts (Going Out step 1, 2026-11-05): output and resourcefulness
+--     returns count as items in; mats used count as used (craft out entries),
+--     so a craft adds output minus mats. A craft whose mats couldn't be read
+--     (x.noMats) is not counted at all, so it never looks like pure profit.
+--   - Sold during the session (vendor, AH; 2026-11-05): the sale gold counts
+--     as gold in and the item comes off at its book value (an item looted
+--     this session nets to the sale gold; one held from before nets to the
+--     sale gold minus what it was worth). Replaced the name-matching rule.
 --   - Still held at the end = what it's worth, at today's price when shown.
 --     Sales after the session ends never change it.
 --   - Item value: tradeable items use the valuation engine (via
@@ -65,8 +73,8 @@
 --   seconds (counted so far), activeSince (time() the clock last resumed; nil
 --   while paused or outside), outsideSince (instance only), lastBankAt,
 --   entries (instance), enchanter,
---   gold = { [category] = { income, spend } },   -- gold not matched to a sale
---   items = { [link] = { itemID, name, looted (came in), sold, soldCopper, used (containers opened) } },
+--   gold = { [category] = { income, spend } },
+--   items = { [link] = { itemID, name, looted (came in), sold, soldCopper, used (containers opened, mats used in crafts) } },
 --   currencies = { [currencyID] = { gained, spent } } }
 --
 -- Messages: MCG_SESSIONS_UPDATED (live numbers), MCG_SESSIONS_FILED (session
@@ -110,7 +118,22 @@ local eventFrame = CreateFrame("Frame")
 local messenger = LibStub and LibStub("AceEvent-3.0", true) and LibStub("AceEvent-3.0"):Embed({}) or nil
 
 -- Item Ledger categories a session never counts (see header).
-local NOT_COUNTED = { transfer = true, craft = true }
+local NOT_COUNTED = { transfer = true }
+
+-- Items going out that a session counts (Going Out, 2026-11-05): mats used in
+-- crafts, items disenchanted and items sold to a vendor. Each subtracts its book value (the value it
+-- came in at, entry.bv for entry.bvq units); units with no book value
+-- subtract at today's price.
+local OUT_COUNTED = { craft = true, disenchant = true, vendor = true, auction = true, used = true }
+
+-- Item entries a session counts: everything coming in, plus mats used in a
+-- craft going out. Craft entries without mats (x.noMats) are skipped.
+local function CountsItem(entry)
+    if entry.kind ~= "item" or (type(entry.x) == "table" and entry.x.noMats) then
+        return false
+    end
+    return entry.dir == "in" or OUT_COUNTED[entry.cat] == true
+end
 
 -- ---------------------------------------------------------------------------
 -- Helpers
@@ -645,6 +668,24 @@ local function AddItem(session, entry)
     Log("%s %s x%d", tostring(entry.cat), tostring(item.name or key), tonumber(entry.qty) or 1)
 end
 
+-- Mats used in a craft during the session (craft out entry): counted as used,
+-- so their value comes off what the session made.
+local function AddUsed(session, entry)
+    local key = entry.link or ("item:" .. tostring(entry.iid))
+    local item = session.items[key] or { looted = 0, sold = 0, soldCopper = 0 }
+    session.items[key] = item
+    item.itemID = entry.iid
+    item.name = item.name or ItemName(key)
+    local qty = tonumber(entry.qty) or 1
+    local booked = math.min(qty, tonumber(entry.bvq) or 0)
+    item.used = (item.used or 0) + (qty - booked)
+    if booked > 0 then
+        item.usedBook = (item.usedBook or 0) + (tonumber(entry.bv) or 0)
+    end
+    Log("%s used %s x%d (book value %d units %s)", tostring(entry.cat), tostring(item.name or key), qty,
+        booked, FormatCopper(tonumber(entry.bv) or 0))
+end
+
 local function AddCurrency(session, entry)
     session.currencies = session.currencies or {}
     local row = session.currencies[entry.iid] or { gained = 0, spent = 0 }
@@ -665,7 +706,7 @@ function ActivitySessions:OnLedgerEntry(entry)
     end
     -- Paused: only something this session would count asks to resume.
     local counts = (entry.kind == "gold" and entry.cat ~= "transfer")
-        or (not NOT_COUNTED[entry.cat] and ((entry.kind == "item" and entry.dir == "in") or entry.kind == "currency"))
+        or (not NOT_COUNTED[entry.cat] and (CountsItem(entry) or entry.kind == "currency"))
     if counts and self:HoldIfPaused(function() ActivitySessions:OnLedgerEntry(entry) end) then
         return
     end
@@ -678,8 +719,10 @@ function ActivitySessions:OnLedgerEntry(entry)
     if NOT_COUNTED[entry.cat] or (tonumber(entry.at) or Now()) < (session.startedAt or 0) then
         return
     end
-    if entry.kind == "item" and entry.dir == "in" then
+    if CountsItem(entry) and entry.dir == "in" then
         AddItem(session, entry)
+    elseif CountsItem(entry) then
+        AddUsed(session, entry)
     elseif entry.kind == "currency" then
         AddCurrency(session, entry)
     else
@@ -718,36 +761,6 @@ function ActivitySessions:OnContainerOpening(opening)
     self:SendMessage("MCG_SESSIONS_UPDATED")
 end
 
--- Sale of loot from this session: replaces that loot's value with the gold.
--- Returns the copper that matched (the rest of the sale counts as plain gold).
-local function MatchSale(session, item, delta)
-    local name = item and item.name
-    local quantity = tonumber(item and item.quantity) or 0
-    if not name or quantity <= 0 then
-        return 0
-    end
-    local left = quantity
-    local matched = 0
-    for link, entry in pairs(session.items) do
-        if left <= 0 then
-            break
-        end
-        if entry.name == nil then
-            entry.name = ItemName(link)
-        end
-        local remaining = (entry.looted or 0) - (entry.sold or 0)
-        if entry.name == name and remaining > 0 then
-            local take = math.min(remaining, left)
-            local copper = math.floor(delta * take / quantity + 0.5)
-            entry.sold = (entry.sold or 0) + take
-            entry.soldCopper = (entry.soldCopper or 0) + copper
-            matched = matched + copper
-            left = left - take
-        end
-    end
-    return matched
-end
-
 -- One gold change (from the ledger entry, see OnLedgerEntry).
 function ActivitySessions:OnGoldRecorded(_, delta, category, professionKey, item, timestamp)
     local session = self:GetCurrent()
@@ -759,11 +772,11 @@ function ActivitySessions:OnGoldRecorded(_, delta, category, professionKey, item
         Log("gold %s %s earned before the session, not counted", FormatCopper(delta), tostring(category))
         return
     end
-    local matched = 0
-    if delta > 0 and (category == "vendor" or category == "auction") then
-        matched = MatchSale(session, item, delta)
-    end
-    local rest = delta - matched
+    -- Vendor and AH sales (2026-11-05) write the item out themselves (book
+    -- value comes off), so sale gold is plain gold in. The old name-matching
+    -- rule (sale gold replacing the loot's value) is gone: with both, the item
+    -- would be subtracted twice.
+    local rest = delta
     if rest ~= 0 then
         local row = session.gold[category] or { income = 0, spend = 0 }
         session.gold[category] = row
@@ -773,8 +786,7 @@ function ActivitySessions:OnGoldRecorded(_, delta, category, professionKey, item
             row.spend = row.spend - rest
         end
     end
-    Log("gold %s %s%s", FormatCopper(delta), tostring(category),
-        matched > 0 and string.format(" (%s for loot from this session)", FormatCopper(matched)) or "")
+    Log("gold %s %s", FormatCopper(delta), tostring(category))
     self:SendMessage("MCG_SESSIONS_UPDATED")
 end
 
@@ -793,18 +805,10 @@ function ActivitySessions:GetUnitValue(link, itemID, enchanter, priceCache)
     sellPrice = ok and tonumber(sellPrice) or 0
     local value
     if ok and name and BOUND[tonumber(bindType)] then
-        value = sellPrice > 0 and sellPrice or nil
-        if enchanter then
-            local valuation = _G.PocketCFO_Valuation
-            local disenchant = valuation and valuation.GetModule and valuation:GetModule("DisenchantValue", true)
-            if disenchant then
-                local okDE, estimate = pcall(disenchant.GetEstimate, disenchant, link)
-                estimate = okDE and tonumber(estimate) or nil
-                if estimate and estimate > (value or 0) then
-                    value = math.floor(estimate + 0.5)
-                end
-            end
-        end
+        -- BoP (Brian 2026-11-05): no gold value while held. What it brings
+        -- when it leaves (vendor gold, disenchant mats) is the gain. Was
+        -- vendor price (or disenchant estimate for enchanters).
+        value = 0
     else
         local runs = PocketCFO:GetModule("ActivityRuns", true)
         value = runs and runs.GetUnitValue and runs:GetUnitValue(itemID, link) or nil
@@ -850,6 +854,7 @@ function ActivitySessions:GetStats(session, priceCache, now)
     end
     for link, entry in pairs(session.items or {}) do
         stats.soldCopper = stats.soldCopper + (tonumber(entry.soldCopper) or 0)
+        stats.keptCopper = stats.keptCopper - (tonumber(entry.usedBook) or 0)
         local kept = (tonumber(entry.looted) or 0) - (tonumber(entry.sold) or 0) - (tonumber(entry.used) or 0)
         if kept ~= 0 then
             local unit = self:GetUnitValue(link, entry.itemID, session.enchanter, priceCache)
@@ -902,10 +907,15 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     end
 end)
 
--- Logging off (2026-10-31, agreed with Brian):
+-- Logging off (2026-10-31, agreed with Brian; custom sessions changed 2026-11-05):
 --   An intentional logout / exit (core ActivityControl sees Logout() / Quit()
---   or the logout countdown) ends the session, filed at that moment (EndForLogout).
---   A disconnect doesn't: the clock was banked, and logging back in continues it.
+--   or the logout countdown) ends an instance session, filed at that moment
+--   (EndForLogout). A custom (manual) session is NOT ended by a logout: a
+--   restart to install an addon or patch looks the same as being done, so a
+--   logout is treated like a disconnect. The clock was banked at logout, time
+--   offline isn't counted, and logging back in within ABANDONED_SECONDS
+--   continues it; otherwise FileAbandoned files it, ended at the logout.
+--   A disconnect doesn't end any session: logging back in continues it.
 --   Safety: on login, any character's session that has been offline longer
 --   than ABANDONED_SECONDS (a disconnect you never came back from, Alt-F4, a
 --   custom session left on another character) is filed, ended when it went
@@ -915,6 +925,11 @@ local ABANDONED_SECONDS = 1800
 function ActivitySessions:EndForLogout()
     local guid = PlayerGUID()
     local session = guid and self:GetCurrent(guid)
+    if session and session.kind == "manual" then
+        -- Custom sessions survive a logout (2026-11-05); the clock was banked.
+        Log("logged out: %s kept (custom session)", tostring(session.name))
+        return
+    end
     if session then
         Log("logged out: %s ended", tostring(session.name))
         self:File(guid, session.pausedAt or Now())

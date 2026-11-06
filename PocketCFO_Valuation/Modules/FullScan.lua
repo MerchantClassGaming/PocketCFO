@@ -255,9 +255,22 @@ local function GetMarketOptions(bucket)
     return { market = params, marketRuleIDs = ruleIDs }
 end
 
+-- Listings and units behind a market's price (value confidence, 2026-11-04).
+local function EvidenceCounts(bucket)
+    local listings, units = 0, 0
+    for _, observation in ipairs(bucket and bucket.observations or {}) do
+        listings = listings + 1
+        units = units + (tonumber(observation.quantity) or 1)
+    end
+    return listings, units
+end
+
 local function BuildPricingRow(bucket, value, depthUsed, diagnostics)
     local identity = bucket and bucket.identity or {}
+    local listingCount, unitCount = EvidenceCounts(bucket)
     return {
+        listingCount = listingCount,
+        unitCount = unitCount,
         itemID = identity.itemID,
         itemName = identity.itemName,
         qualityTier = identity.qualityTier,
@@ -462,6 +475,7 @@ function FullScan:ProcessFinalizeChunk()
         return
     end
 
+    local history = PocketCFO_Valuation:GetModule("ScanHistory", true)
     local keys = self.finalizeKeys or {}
     local startIndex = self.finalizeIndex or 1
     local stopIndex = math.min(startIndex + FINALIZE_CHUNK_SIZE - 1, #keys)
@@ -478,6 +492,12 @@ function FullScan:ProcessFinalizeChunk()
 
         if value and cache:SetPricingRow(marketKey, BuildPricingRow(bucket, value, depthUsed, diagnostics)) then
             self.status.marketsPriced = (tonumber(self.status.marketsPriced) or 0) + 1
+        end
+
+        -- Price history capture (ScanHistory.lua). Never throws; a failure
+        -- is logged and skipped so the scan always finishes.
+        if history and bucket then
+            history:RecordFromBucket(marketKey, bucket, value)
         end
     end
 

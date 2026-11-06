@@ -67,12 +67,9 @@ local function FormatMoneyExact(copper)
     return string.format("|cffffd700%sg|r |cffc7c7cf%02ds|r |cffeda55f%02dc|r", goldText, silver, cop)
 end
 
--- Income amounts round to whole gold (coin icons) once they reach 1 gold.
+-- Income amounts show the two biggest coins (coin icons), 2026-11-05.
 local function FormatIncome(copper)
-    copper = math.floor(tonumber(copper) or 0)
-    if copper >= 10000 then
-        copper = math.floor(copper / 10000) * 10000
-    end
+    copper = _G.PocketCFO:RoundMoney(copper)
     if GetMoneyString then
         return GetMoneyString(copper, true)
     end

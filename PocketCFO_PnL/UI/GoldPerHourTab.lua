@@ -58,21 +58,18 @@ local function Tracker()
     return PocketCFO_PnL:GetModule("GoldPerHourWindow", true)
 end
 
--- Losses show in red with a "-" (2026-10-28). Whole gold from 1g up.
+-- Losses show in red with a "-" (2026-10-28). Two biggest coins (2026-11-05).
 local function FormatMoney(copper)
-    copper = math.floor(tonumber(copper) or 0)
+    copper = _G.PocketCFO:RoundMoney(copper)
     local negative = copper < 0
     if negative then
         copper = -copper
-    end
-    if copper >= 10000 then
-        copper = math.floor(copper / 10000) * 10000
     end
     local text
     if GetMoneyString then
         text = GetMoneyString(copper, true)
     else
-        text = tostring(math.floor(copper / 10000)) .. "g"
+        text = _G.PocketCFO:FormatMoney(copper)
     end
     if negative then
         return "|cffff6060-" .. text .. "|r"

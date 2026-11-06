@@ -170,9 +170,22 @@ local function GetMarketOptions(bucket)
     return { market = params, marketRuleIDs = ruleIDs }
 end
 
+-- Listings and units behind a market's price (value confidence, 2026-11-04).
+local function EvidenceCounts(bucket)
+    local listings, units = 0, 0
+    for _, observation in ipairs(bucket and bucket.observations or {}) do
+        listings = listings + 1
+        units = units + (tonumber(observation.quantity) or 1)
+    end
+    return listings, units
+end
+
 local function BuildPricingRow(bucket, value, depthUsed, diagnostics)
     local identity = bucket and bucket.identity or {}
+    local listingCount, unitCount = EvidenceCounts(bucket)
     return {
+        listingCount = listingCount,
+        unitCount = unitCount,
         itemID = identity.itemID,
         itemName = identity.itemName,
         qualityTier = identity.qualityTier,
@@ -194,6 +207,7 @@ function SearchRefresh:ApplyBuckets(buckets)
         return 0
     end
 
+    local history = PocketCFO_Valuation:GetModule("ScanHistory", true)
     local updated = 0
     local observed = 0
     for marketKey, bucket in pairs(buckets or {}) do
@@ -207,6 +221,12 @@ function SearchRefresh:ApplyBuckets(buckets)
 
         if value and cache:SetPricingRow(marketKey, BuildPricingRow(bucket, value, depthUsed, diagnostics)) then
             updated = updated + 1
+        end
+
+        -- Price history capture (ScanHistory.lua); same day replaces the
+        -- day's price. Never throws.
+        if history then
+            history:RecordFromBucket(marketKey, bucket, value)
         end
     end
 

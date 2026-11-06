@@ -21,6 +21,15 @@
 --      Processing consumed inputs come from pre-operation primary-input capture.
 --   4. Optional processing capture hook (ProcessingCaptureController).
 --      Inert until capture mode is implemented.
+--   5. Item Ledger (Going Out step 1, 2026-11-05): the craft is written with
+--      ItemLedger:WriteCraft - mats used out, resourcefulness returns and
+--      output in. Crafting operations: from this event's inventory adjustment
+--      rows. Processing operations: once per operation at batch flush, from
+--      the composite observation (pre-operation inputs, filtered outputs and
+--      returns). Order crafts never reach this module (CraftEventCapture skips
+--      them); PocketCFO_Orders writes those. Flavor: Both (Theoretical on
+--      Forever: mats come from the recipe schematic and may be empty there;
+--      then the output is written with x.noMats).
 
 -- Patch compat: Blizzard removed the global item APIs; route to C_Item.
 local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
@@ -176,6 +185,26 @@ local function ResolveOutputRow(adjResult)
     return row
 end
 
+-- A resourcefulness return row (adjResult.returnRows) in the observation's
+-- resourcefulnessReturns shape, with its configKey (same lookup as outputs).
+local function ResolveReturnRow(returnRow)
+    if type(returnRow) ~= "table" or not returnRow.itemID then return nil end
+    local row = {
+        itemID          = returnRow.itemID,
+        itemName        = returnRow.itemName,
+        quantity        = returnRow.quantity,
+        craftingQuality = returnRow.craftingQuality,
+    }
+    local identityService = PocketCFO and PocketCFO.ItemIdentityService or _G.ItemIdentityService
+    if identityService and identityService.FromItemID then
+        local ok, identity = pcall(function() return identityService:FromItemID(row.itemID) end)
+        if ok and type(identity) == "table" and not identity.unresolved then
+            row.configKey = identity.configKey
+        end
+    end
+    return row
+end
+
 local function ResolveInputRow(input)
     if type(input) ~= "table" or not input.itemID then
         return nil
@@ -320,6 +349,54 @@ local function RecordObservedPrimaryInputIfApplicable(batch)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Step 5 - Item Ledger (Going Out step 1, 2026-11-05)
+-- ---------------------------------------------------------------------------
+
+-- { itemID, quantity, itemLink } rows for ItemLedger:WriteCraft. Inventory
+-- adjustment rows keep the asked-for quantity in requestedQuantity.
+local function LedgerRows(rows)
+    local out = {}
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+        local qty = tonumber(row and row.requestedQuantity) or tonumber(row and row.quantity)
+        if row and row.itemID and qty and qty > 0 then
+            out[#out + 1] = { itemID = row.itemID, quantity = qty, itemLink = row.itemLink }
+        end
+    end
+    return out
+end
+
+local function CurrentProfessionID()
+    local service = PocketCFO_Crafting:GetModule("ProfessionContextService", true)
+    if service and service.GetCurrentProfessionContext then
+        local ok, context = pcall(service.GetCurrentProfessionContext, service)
+        if ok and type(context) == "table" then
+            return context.professionID
+        end
+    end
+    return nil
+end
+
+local function WriteCraftToLedger(recipeID, professionID, used, returned, output)
+    local ledger = PocketCFO and PocketCFO.ItemLedger
+    if not ledger or not ledger.WriteCraft then
+        SessionLog("CraftCompletionDispatcher: ledger craft skipped reason=item-ledger-unavailable recipeID=%s",
+            tostring(recipeID))
+        return
+    end
+    local craft = {
+        recipeID = recipeID,
+        prof = professionID,
+        used = LedgerRows(used),
+        returned = LedgerRows(returned),
+        output = LedgerRows(output),
+    }
+    local ok, craftID = pcall(ledger.WriteCraft, ledger, craft)
+    SessionLog("CraftCompletionDispatcher: ledger craft recipeID=%s prof=%s craft=%s used=%d returned=%d output=%d%s",
+        tostring(recipeID), tostring(professionID), tostring(ok and craftID or ("error: " .. tostring(craftID))),
+        #craft.used, #craft.returned, #craft.output, #craft.used == 0 and " (no mats read: output not counted)" or "")
+end
+
 local function FlushProcessingBatch()
     if not _processingBatch then return end
     local batch = _processingBatch
@@ -363,6 +440,18 @@ local function FlushProcessingBatch()
         observation.producedOutputs[#observation.producedOutputs + 1] = extraRow
     end
 
+    -- Returns reported on later output events of the same operation
+    -- (2026-11-05). Previously dropped, so Processing Analysis undercounted
+    -- resourcefulness returns; the Item Ledger write below reads them here too.
+    if #batch.extraReturnRows > 0 then
+        observation.resourcefulnessReturns = observation.resourcefulnessReturns or {}
+        for _, returnRow in ipairs(batch.extraReturnRows) do
+            observation.resourcefulnessReturns[#observation.resourcefulnessReturns + 1] = returnRow
+        end
+        SessionLog("CraftCompletionDispatcher: processing batch later-event returns added recipeID=%s count=%d",
+            tostring(batch.recipeID), #batch.extraReturnRows)
+    end
+
     -- For processing operations, any output whose itemID matches the primary input
     -- is a resourcefulness return (e.g. ore returned to the player), not a crafted
     -- output. Move such items from producedOutputs into resourcefulnessReturns so
@@ -403,6 +492,11 @@ local function FlushProcessingBatch()
         SessionLog("CraftCompletionDispatcher: processing batch consumedInputs empty recipeID=%s reason=no-pre-capture-available",
             tostring(batch.recipeID))
     end
+
+    -- Step 5: one ledger craft per processing operation (returns from every
+    -- event of the operation, added to the observation above).
+    WriteCraftToLedger(batch.recipeID, observation.professionID or CurrentProfessionID(),
+        observation.consumedInputs, observation.resourcefulnessReturns, observation.producedOutputs)
 
     SessionLog("CraftCompletionDispatcher: processing batch flushed recipeID=%s primaryInputConfigKey=%s eventCount=%d outputCount=%d observationProfileKey=%s",
         tostring(batch.recipeID), tostring(batch.primaryInputConfigKey), batch.eventCount,
@@ -584,6 +678,16 @@ function CraftCompletionDispatcher:BufferProcessingEvent(context, adjResult)
         if row then
             _processingBatch.extraOutputRows[#_processingBatch.extraOutputRows + 1] = row
         end
+        -- Resourcefulness returns can arrive on a later output event of the
+        -- same operation (in-game 2026-11-05: the ore came back on the second
+        -- event of a prospect). Only the first event's returns used to reach
+        -- the observation; these are added to it at flush.
+        for _, returnRow in ipairs((adjResult and adjResult.returnRows) or {}) do
+            local resolved = ResolveReturnRow(returnRow)
+            if resolved then
+                _processingBatch.extraReturnRows[#_processingBatch.extraReturnRows + 1] = resolved
+            end
+        end
         _processingBatch.eventCount = _processingBatch.eventCount + 1
         SessionLog("CraftCompletionDispatcher: processing batch appended recipeID=%s primaryInputConfigKey=%s batchDiscriminator=%s eventCount=%d",
             tostring(recipeID), tostring(primaryInputConfigKey), tostring(batchDiscriminator), _processingBatch.eventCount)
@@ -607,6 +711,7 @@ function CraftCompletionDispatcher:BufferProcessingEvent(context, adjResult)
             firstContext         = context,
             firstAdjResult       = adjResult,
             extraOutputRows      = {},
+            extraReturnRows      = {},
             eventCount           = 1,
             preOperationInputs   = context.preOperationInputs,
         }
@@ -647,7 +752,12 @@ function CraftCompletionDispatcher:Dispatch(context)
     else
         SessionLog("CraftCompletionDispatcher: dispatch route=crafting recipeID=%s",
             tostring(context.recipeID))
-        self:BuildAndRecordObservation(context, adjResult)
+        local observation = self:BuildAndRecordObservation(context, adjResult)
+        -- Step 5: this craft in the Item Ledger.
+        local output = adjResult and adjResult.outputRow and { adjResult.outputRow } or nil
+        WriteCraftToLedger(context.recipeID,
+            (type(observation) == "table" and observation.professionID) or CurrentProfessionID(),
+            adjResult and adjResult.consumedRows, adjResult and adjResult.returnRows, output)
     end
 
     SessionLog("CraftCompletionDispatcher: dispatched recipeID=%s configID=%s",

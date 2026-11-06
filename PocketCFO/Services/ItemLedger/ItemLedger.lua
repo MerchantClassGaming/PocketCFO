@@ -5,6 +5,8 @@
 -- Step 1 (2026-10-30): the ledger itself, written by LootReader (items and
 -- currencies coming in, currency spends). No feature reads it yet. Gold joins
 -- at step 2 (GoldLedger becomes a writer); items going out join later.
+-- Going out step 1 (2026-11-05): crafts (WriteCraft) - mats out, returns and
+-- output in. Other exits: claude/Going_Out_Design.md.
 --
 -- Rules:
 --   - One ledger, several readers, one writer per fact. Readers decide the
@@ -24,7 +26,10 @@
 --   days   = { ["YYYY-MM-DD"] = { rows = { [key] = row }, activity = { [key] = row } } },
 --   months = { ["YYYY-MM"]    = { rows = {...}, activity = {...} } },
 --   housekeptOn = "YYYY-MM-DD",
+--   holdings = { [key] = { qty, value } },  -- book value record (see Book value)
 -- }
+-- Item entries also carry hk (book value key) and bop (bound on pickup) on
+-- the way in, and bv / bvq (book value copper / units) on the way out.
 -- entry = { id, at, day, c, dir, cat, src, prof, kind, iid, link, qty, units, base, val, x }
 --   dir "in" / "out"; cat = shared category (CATEGORIES); src = the ID behind
 --   it where one exists (node object ID, mob npcID, container itemID,
@@ -72,6 +77,7 @@ ItemLedger.CATEGORIES = {
     transfer = "Moved between your characters",
     received = "Received (reason unknown)",
     spent = "Spent (reason unknown)",
+    used = "Used up (food, potions, lures, knowledge)",
     -- Gold categories (GoldLedger; written from step 2).
     order_patron = "Patron orders",
     order_personal = "Personal orders",
@@ -88,6 +94,298 @@ ItemLedger.CATEGORIES = {
 
 local sessionUnpriced = {}   -- entries written before Valuation was listening
 local charIndexByGUID = nil  -- built from characters on first use
+
+-- ---------------------------------------------------------------------------
+-- Book value (Going Out step 2, 2026-11-05; claude/Going_Out_Design.md
+-- "Book value"). Account-wide record of what held items were worth when they
+-- came in, so an item going out leaves at the value it came in at (not
+-- today's price, which would make every sale net about zero). Kept because
+-- ledger detail is only DETAIL_DAYS long.
+--   ledger.holdings[key] = { qty, value }   -- value = copper for qty units
+--   key = "i:<itemID>" for stackables (average, project rule: average for
+--   mats); "g:<configKey>" for non-stackable items (ItemIdentityService
+--   identity incl. item level and stat fingerprint, so stat versions stay
+--   apart; no identity = not tracked).
+-- In (not transfer): priced units add qty and value when the price arrives
+-- (SetValue); BoP items (bound on pickup, Brian 2026-11-05: no gold value)
+-- add qty with value 0 at write. Unpriced units never enter the record.
+-- Out (not transfer): takes book value at the record's average for as many
+-- units as it holds; stored on the entry as bv (copper) for bvq units. Units
+-- with no record (acquired before tracking, unpriced) leave at their value
+-- at that moment (readers use val): no gain, no loss.
+-- Transfers between your own characters don't touch it (account-wide).
+-- Theoretical: GetItemInfo / GetDetailedItemLevelInfo answer at write time;
+-- when the item isn't cached the stackable key / not-BoP is assumed.
+-- Cost (what you paid) is added with the P&L work.
+-- ---------------------------------------------------------------------------
+local GetItemInfoAPI = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+local BIND_ON_ACQUIRE = (Enum and Enum.ItemBind and Enum.ItemBind.OnAcquire) or 1
+
+local function Holdings(ledger)
+    ledger.holdings = ledger.holdings or {}
+    return ledger.holdings
+end
+
+-- key, isBoP for an item entry.
+local function HoldingKey(iid, link)
+    iid = tonumber(iid)
+    if not iid then
+        return nil, false
+    end
+    local ref = (type(link) == "string" and link) or iid
+    local maxStack, bindType
+    if GetItemInfoAPI then
+        local ok, _, _, _, _, _, _, _, stack, _, _, _, _, _, bind = pcall(GetItemInfoAPI, ref)
+        if ok then
+            maxStack, bindType = tonumber(stack), tonumber(bind)
+        end
+    end
+    local isBoP = bindType == BIND_ON_ACQUIRE
+    if maxStack == 1 then
+        -- Gear: the same item identity Valuation prices by (configKey, which
+        -- carries item level and stat fingerprint; project rule: never
+        -- itemID alone). Fix 2026-11-05: keying by itemID + item level merged
+        -- stat versions (in-game: a haste binding at 799g and versatility
+        -- ones at 77g in one bucket, so a disenchant took the 799g book
+        -- value). No identity = not tracked (leaves at its value then).
+        local service = PocketCFO.ItemIdentityService
+        if type(link) ~= "string" or not service or not service.FromItemLink then
+            return nil, isBoP
+        end
+        local ok, identity = pcall(service.FromItemLink, service, link)
+        if ok and type(identity) == "table" and not identity.unresolved and identity.configKey then
+            return "g:" .. tostring(identity.configKey), isBoP
+        end
+        return nil, isBoP
+    end
+    return "i:" .. iid, isBoP
+end
+
+-- ---------------------------------------------------------------------------
+-- Cost (2026-11-05, Brian: "any profit calculation has to come from the cost
+-- of acquisition, not the value when it was acquired"). Kept next to value in
+-- the same record: row.cost = copper for row.qty units; entry.cost = the
+-- in entry's acquisition cost / the out entry's cost of what left.
+--   Free (looted, gathered, fished, containers, quests, order rewards, mail,
+--   trade, received): 0.
+--   Bought (vendor, auction_buy): the gold paid, matched by item name to
+--   GoldLedger's purchase gold-out entry (src = name, units), either order.
+--   Crafted / disenchant mats: assigned by their writer (AllocateCost): the
+--   cost of what went in, split by value.
+--   Until a cost is known (purchase not matched yet, assigned later) the
+--   entry counts at its value (provisional), replaced when the cost arrives.
+-- Out entries take book cost like book value; units with no record cost
+-- their value at that moment (no gain, no loss).
+-- Day rows keep row.cost too (copper), for the P&L.
+-- ---------------------------------------------------------------------------
+local FREE_COST = {
+    gathering = true, fishing = true, looted = true, container = true, other = true,
+    quest = true, received = true, mail = true, trade = true,
+    order_patron = true, order_personal = true, order_public = true, order_guild = true,
+}
+local PURCHASE = { vendor = true, auction_buy = true }
+local VENDOR_MATCH_SECONDS = 60          -- vendor: gold and item arrive together
+local PURCHASE_KEEP_SECONDS = 30 * 86400 -- AH: the item comes by mail, maybe days later
+local recentPurchaseIns = {}             -- unmatched bought items this session
+
+local AddRowCost  -- (ledger, entry, delta) defined after the row helpers
+
+local function HoldingRow(ledger, key)
+    local holdings = Holdings(ledger)
+    local row = holdings[key]
+    if not row then
+        row = { qty = 0, value = 0, cost = 0 }
+        holdings[key] = row
+    end
+    row.cost = row.cost or 0
+    return row
+end
+
+-- Called from Write for item entries (not transfers), before the entry is
+-- announced (so out entries carry bv / cost when readers see them).
+local function ApplyHoldings(ledger, entry, fields)
+    if entry.kind ~= "item" or entry.cat == "transfer" then
+        return
+    end
+    local key, isBoP = HoldingKey(entry.iid, entry.link)
+    if entry.dir == "in" then
+        if fields.cost ~= nil then
+            entry.cost = tonumber(fields.cost)
+        elseif FREE_COST[entry.cat] and not fields.costPending then
+            entry.cost = 0
+        else
+            entry.costPending = true
+        end
+        if not key then
+            return
+        end
+        entry.hk = key
+        if isBoP then
+            entry.bop = true
+            local row = HoldingRow(ledger, key)
+            row.qty = row.qty + entry.qty
+            entry.provCost = entry.cost or 0
+            row.cost = row.cost + entry.provCost
+            entry.inHoldings = true
+        end
+        return
+    end
+    local holdings = Holdings(ledger)
+    local row = key and holdings[key]
+    if not row or (row.qty or 0) <= 0 then
+        return
+    end
+    local take = math.min(entry.qty, row.qty)
+    local unitValue = (row.value or 0) / row.qty
+    local unitCost = (row.cost or 0) / row.qty
+    entry.bv = math.floor(unitValue * take + 0.5)
+    entry.bvq = take
+    entry.cost = math.floor(unitCost * take + 0.5)
+    row.qty = row.qty - take
+    row.value = math.max(0, (row.value or 0) - unitValue * take)
+    row.cost = math.max(0, (row.cost or 0) - unitCost * take)
+    if row.qty <= 0 then
+        holdings[key] = nil
+    end
+end
+
+-- Called from SetValue. A priced item in adds its units, value and cost
+-- (provisional = its value while the cost is pending). An out entry's units
+-- with no record cost their value now.
+local function AddPricedHolding(ledger, entry)
+    if entry.kind ~= "item" or entry.cat == "transfer" then
+        return
+    end
+    local val = tonumber(entry.val) or 0
+    if entry.dir == "out" then
+        local unbased = entry.qty - (tonumber(entry.bvq) or 0)
+        if unbased > 0 then
+            local extra = val * unbased
+            entry.cost = (entry.cost or 0) + extra
+            AddRowCost(ledger, entry, extra)
+        end
+        return
+    end
+    if entry.bop or not entry.hk or entry.inHoldings then
+        return
+    end
+    local row = HoldingRow(ledger, entry.hk)
+    row.qty = row.qty + entry.qty
+    row.value = row.value + val * entry.qty
+    entry.provCost = entry.cost or (val * entry.qty)
+    row.cost = row.cost + entry.provCost
+    entry.inHoldings = true
+end
+
+-- Sets an in entry's acquisition cost (replaces the provisional one).
+local function AssignCost(ledger, entry, cost)
+    cost = math.max(0, math.floor((tonumber(cost) or 0) + 0.5))
+    entry.costPending = nil
+    local before = entry.cost or 0
+    entry.cost = cost
+    AddRowCost(ledger, entry, cost - before)
+    if entry.inHoldings and entry.hk then
+        local row = Holdings(ledger)[entry.hk]
+        if row then
+            row.cost = math.max(0, (row.cost or 0) + cost - (entry.provCost or 0))
+        end
+        entry.provCost = cost
+    end
+end
+
+local function ItemNameOf(iid, link)
+    if not GetItemInfoAPI then
+        return nil
+    end
+    local ok, name = pcall(GetItemInfoAPI, link or iid)
+    return ok and type(name) == "string" and name or nil
+end
+
+-- Purchases: a bought item and the gold paid for it, matched by name.
+local function PendingBuys(ledger)
+    ledger.pendingBuys = ledger.pendingBuys or {}
+    return ledger.pendingBuys
+end
+
+local function MatchBoughtItem(ledger, entry)
+    local name = ItemNameOf(entry.iid, entry.link)
+    if not name then
+        return
+    end
+    entry.buyName = name
+    local buys = PendingBuys(ledger)
+    local need = entry.qty - (entry.matchedQty or 0)
+    local i = 1
+    while i <= #buys and need > 0 do
+        local buy = buys[i]
+        if buy.cat == entry.cat and buy.name == name and buy.c == entry.c and (buy.units or 0) > 0 then
+            local take = math.min(need, buy.units)
+            local copper = buy.copper * take / buy.units
+            entry.matchedQty = (entry.matchedQty or 0) + take
+            entry.matchedCost = (entry.matchedCost or 0) + copper
+            buy.units = buy.units - take
+            buy.copper = buy.copper - copper
+            need = need - take
+            if buy.units <= 0 then
+                table.remove(buys, i)
+            else
+                i = i + 1
+            end
+        else
+            i = i + 1
+        end
+    end
+    if (entry.matchedQty or 0) >= entry.qty then
+        AssignCost(ledger, entry, entry.matchedCost)
+    else
+        recentPurchaseIns[#recentPurchaseIns + 1] = entry
+    end
+end
+
+local function MatchPurchaseGold(ledger, entry)
+    local name, units = entry.src, tonumber(entry.units) or 1
+    if type(name) ~= "string" or units <= 0 then
+        return
+    end
+    local copper = entry.qty
+    local now = time()
+    local i = 1
+    while i <= #recentPurchaseIns and units > 0 do
+        local item = recentPurchaseIns[i]
+        if (now - (item.at or 0)) > VENDOR_MATCH_SECONDS and item.cat == "vendor" then
+            table.remove(recentPurchaseIns, i)
+        elseif item.cat == entry.cat and item.buyName == name and item.c == entry.c then
+            local need = item.qty - (item.matchedQty or 0)
+            local take = math.min(need, units)
+            local part = copper * take / units
+            item.matchedQty = (item.matchedQty or 0) + take
+            item.matchedCost = (item.matchedCost or 0) + part
+            units, copper = units - take, copper - part
+            if item.matchedQty >= item.qty then
+                AssignCost(ledger, item, item.matchedCost)
+                table.remove(recentPurchaseIns, i)
+            else
+                i = i + 1
+            end
+        else
+            i = i + 1
+        end
+    end
+    if units > 0 then
+        local buys = PendingBuys(ledger)
+        buys[#buys + 1] = { cat = entry.cat, name = name, units = units, copper = copper, at = now, c = entry.c }
+        -- Keep the list short: old vendor buys never get an item now.
+        local j = 1
+        while j <= #buys do
+            local age = now - (buys[j].at or now)
+            if (buys[j].cat == "vendor" and age > VENDOR_MATCH_SECONDS) or age > PURCHASE_KEEP_SECONDS then
+                table.remove(buys, j)
+            else
+                j = j + 1
+            end
+        end
+    end
+end
 
 -- ---------------------------------------------------------------------------
 -- Storage
@@ -190,6 +488,19 @@ local function AddToRow(rows, key, source, qty, n, value, vq, units)
     return row
 end
 
+-- Cost on an entry's day row (copper; the P&L reads it).
+AddRowCost = function(ledger, entry, delta)
+    delta = tonumber(delta) or 0
+    if delta == 0 or not entry.day then
+        return
+    end
+    local bucket = ledger.days[entry.day]
+    local row = bucket and bucket.rows[EntryKey(entry)]
+    if row then
+        row.cost = (row.cost or 0) + delta
+    end
+end
+
 -- Entry by id: detail is in id order (appended), so binary search.
 local function FindEntry(ledger, id)
     local list = ledger.detail
@@ -247,9 +558,13 @@ function ItemLedger:Write(fields)
         entry.val = 1
     end
     ledger.nextID = ledger.nextID + 1
+    ApplyHoldings(ledger, entry, fields)
     ledger.detail[#ledger.detail + 1] = entry
     local bucket = Bucket(ledger.days, entry.day)
     AddToRow(bucket.rows, EntryKey(entry), entry, qty, 1, entry.val and qty or 0, entry.val and qty or 0, entry.units)
+    if entry.cost and entry.cost ~= 0 then
+        AddRowCost(ledger, entry, entry.cost)
+    end
 
     self:SendMessage("MCG_ITEM_LEDGER_ENTRY", entry)
     -- Kept for Valuation only while it isn't listening yet (pricingReady is
@@ -257,7 +572,120 @@ function ItemLedger:Write(fields)
     if entry.val == nil and not self.pricingReady then
         sessionUnpriced[#sessionUnpriced + 1] = entry
     end
-    return entry.id
+    -- Purchases (cost): bought item <-> gold paid, matched by name.
+    if entry.kind == "item" and entry.dir == "in" and PURCHASE[entry.cat] and entry.costPending then
+        MatchBoughtItem(ledger, entry)
+    elseif entry.kind == "gold" and entry.dir == "out" and PURCHASE[entry.cat] then
+        MatchPurchaseGold(ledger, entry)
+    end
+    return entry.id, entry
+end
+
+--- Writes one craft (Going Out step 1, 2026-11-05; claude/Going_Out_Design.md):
+-- mats used as out, resourcefulness returns and the output as in. All
+-- category craft, src = recipeID, prof = base profession key, linked by
+-- x.craft (the id of the craft's first entry). Writers: PocketCFO_Crafting's
+-- CraftCompletionDispatcher (normal crafts and processing) and PocketCFO_Orders'
+-- OrdersLedger (order crafts: your own mats only, no output, since the item
+-- goes to the customer). LootReader no longer writes items in craft context.
+-- craft = { recipeID, prof, used = rows, returned = rows, output = rows,
+--   order = true|nil }; row = { itemID, quantity, itemLink }.
+-- When no mats could be read, returns and output carry x.noMats so sessions
+-- don't count the craft as pure profit (detail only; day rows don't keep x).
+-- Returns the craft id, or nil when nothing was written.
+function ItemLedger:WriteCraft(craft)
+    local ledger = DB()
+    if not ledger or type(craft) ~= "table" then
+        return nil
+    end
+    local craftID = ledger.nextID
+    local src = tonumber(craft.recipeID)
+    local prof = craft.prof ~= nil and tostring(craft.prof) or nil
+    local written = 0
+    local function WriteRows(rows, dir, flags, costFor)
+        local entries = {}
+        for _, row in ipairs(type(rows) == "table" and rows or {}) do
+            local iid = tonumber(row and row.itemID)
+            local qty = tonumber(row and row.quantity) or 0
+            if iid and qty > 0 then
+                local x = { craft = craftID }
+                for key, value in pairs(flags) do
+                    x[key] = value
+                end
+                local fields = { dir = dir, cat = "craft", src = src, prof = prof, kind = "item",
+                    iid = iid, link = row.itemLink, qty = qty, x = x }
+                if dir == "in" then
+                    local cost = costFor and costFor(iid, qty)
+                    if cost then
+                        fields.cost = cost
+                    else
+                        fields.costPending = true
+                    end
+                end
+                local id, entry = self:Write(fields)
+                if id then
+                    entries[#entries + 1] = entry
+                end
+            end
+        end
+        written = written + #entries
+        return entries
+    end
+    -- Mats out first: each takes its book value and cost (priced as written).
+    local usedEntries = WriteRows(craft.used, "out", { order = craft.order or nil })
+    local noMats = #usedEntries == 0 or nil
+    local usedCost, unitCost = 0, {}
+    for _, entry in ipairs(usedEntries) do
+        local cost = tonumber(entry.cost) or 0
+        usedCost = usedCost + cost
+        local per = unitCost[entry.iid] or { qty = 0, cost = 0 }
+        unitCost[entry.iid] = per
+        per.qty = per.qty + entry.qty
+        per.cost = per.cost + cost
+    end
+    -- Resourcefulness returns come back at the mats' own cost per unit.
+    local returnsCost = 0
+    WriteRows(craft.returned, "in", { returned = true, order = craft.order or nil, noMats = noMats },
+        function(iid, qty)
+            local per = unitCost[iid]
+            local cost = (per and per.qty > 0) and (per.cost / per.qty * qty) or 0
+            returnsCost = returnsCost + cost
+            return cost
+        end)
+    -- Output: what the mats cost, less the returns, split by value.
+    local outputEntries = WriteRows(craft.output, "in", { output = true, noMats = noMats })
+    self:AllocateCost(outputEntries, math.max(0, usedCost - returnsCost))
+    if written == 0 then
+        return nil
+    end
+    return craftID
+end
+
+--- Splits a total cost (copper) across in entries by value (val x qty);
+-- by quantity when none is priced. For crafts and disenchant mats.
+function ItemLedger:AllocateCost(entries, total)
+    local ledger = DB()
+    if not ledger or type(entries) ~= "table" or #entries == 0 then
+        return
+    end
+    total = tonumber(total) or 0
+    local weights, sum = {}, 0
+    for i, entry in ipairs(entries) do
+        weights[i] = (tonumber(entry.val) or 0) * (tonumber(entry.qty) or 0)
+        sum = sum + weights[i]
+    end
+    if sum <= 0 then
+        sum = 0
+        for i, entry in ipairs(entries) do
+            weights[i] = tonumber(entry.qty) or 0
+            sum = sum + weights[i]
+        end
+    end
+    for i, entry in ipairs(entries) do
+        if entry.dir == "in" then
+            AssignCost(ledger, entry, sum > 0 and (total * weights[i] / sum) or 0)
+        end
+    end
 end
 
 --- Counts one occurrence of an activity (a gathering window, a kill, a
@@ -292,6 +720,7 @@ function ItemLedger:SetValue(id, unitValue)
         return false
     end
     entry.val = unitValue
+    AddPricedHolding(ledger, entry)
     local bucket = ledger.days[entry.day]
     local row = bucket and bucket.rows[EntryKey(entry)]
     if row then
@@ -485,7 +914,10 @@ function ItemLedger:Housekeep(now)
         if dayKey < cutoff then
             local month = Bucket(ledger.months, string.sub(dayKey, 1, 7))
             for key, row in pairs(bucket.rows or {}) do
-                AddToRow(month.rows, key, row, row.qty, row.n, row.value, row.vq)
+                local target = AddToRow(month.rows, key, row, row.qty, row.n, row.value, row.vq)
+                if row.cost then
+                    target.cost = (target.cost or 0) + row.cost
+                end
             end
             for key, row in pairs(bucket.activity or {}) do
                 local target = month.activity[key]
@@ -796,10 +1228,24 @@ function ItemLedger:BuildReport(arg)
         lines[#lines + 1] = "=== Recent entries (newest first) ==="
         for index = #ledger.detail, math.max(1, #ledger.detail - count + 1), -1 do
             local e = ledger.detail[index]
-            lines[#lines + 1] = string.format("  #%d  %s  %s  %s %-12s src=%s  %s x%d%s  value=%s%s",
+            -- cost / book value (debug, 2026-11-05): cost = total copper
+            -- (in: acquisition cost, "pending" until known; out: cost of what
+            -- left); book = book value taken by an out entry.
+            local costText = ""
+            if e.kind == "item" then
+                if e.cost ~= nil then
+                    costText = "  cost=" .. FormatCopper(e.cost)
+                elseif e.costPending then
+                    costText = "  cost=pending"
+                end
+                if e.bv ~= nil then
+                    costText = costText .. string.format("  book=%s (%d)", FormatCopper(e.bv), tonumber(e.bvq) or 0)
+                end
+            end
+            lines[#lines + 1] = string.format("  #%d  %s  %s  %s %-12s src=%s  %s x%d%s  value=%s%s%s",
                 e.id, date("%m-%d %H:%M:%S", e.at), CharacterName(ledger, e.c), e.dir, e.cat, tostring(e.src),
                 ThingName(e.kind, e.iid, e.link, e.src), e.qty, e.base and ("  base=" .. e.base) or "",
-                e.val and (FormatCopper(e.val) .. " each") or "unpriced",
+                e.val and (FormatCopper(e.val) .. " each") or "unpriced", costText,
                 e.x and e.x.spell and ("  spell=" .. tostring(e.x.spell)) or "")
         end
     elseif command == "item" or command == "category" then

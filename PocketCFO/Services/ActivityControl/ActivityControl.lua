@@ -32,6 +32,14 @@
 -- Theoretical: a disconnect never calls Logout() / Quit(); Alt-F4 counts as a
 -- disconnect (the 30-minute abandoned-session safety covers it).
 --
+-- "Still gathering?" (agreed with Brian 2026-11-05): when the gathering run
+-- has gone GAP_CAP_SECONDS without loot (rule: ActivityRuns
+-- NeedsStillGatheringPrompt), ask once per gap. Held while in combat, shown
+-- as soon as combat ends. Only when no session is running (automatic
+-- gathering runs only). Still gathering -> ActivityRuns:KeepGathering;
+-- I'm done -> the run is filed ending at its last loot. Closed (no answer
+-- needed) when loot comes in or the run ends on its own.
+--
 -- Messages: MCG_ACTIVITY_PAUSE_CHANGED (pause state changed).
 -- Flavor: Both.
 
@@ -42,10 +50,13 @@ local ActivityControl = PocketCFO:NewModule("ActivityControl", "AceEvent-3.0")
 PocketCFO.ActivityControl = ActivityControl
 
 local POPUP = "MCGCFO_RESUME_PAUSED"
+local STILL_POPUP = "MCGCFO_STILL_GATHERING"
+local STILL_CHECK_SECONDS = 2
 
 local pending = {}        -- { { kind = "run" | "session", fn } } held while paused (not saved)
 local loggingOut = false  -- an intentional logout / exit is under way
 local autoShownFor = nil  -- key of the run / session the tracker was auto-shown for
+local stillAskedFor = nil -- "startedAt:lastLootAt" of the gap already asked about (not saved)
 
 local function Runs()
     return PocketCFO:GetModule("ActivityRuns", true)
@@ -241,6 +252,100 @@ if StaticPopupDialogs then
 end
 
 -- ---------------------------------------------------------------------------
+-- "Still gathering?" prompt
+-- ---------------------------------------------------------------------------
+
+local function GapKey(run)
+    return tostring(run.startedAt or "?") .. ":" .. tostring(run.lastLootAt or "?")
+end
+
+local function InCombat()
+    return UnitAffectingCombat and UnitAffectingCombat("player") and true or false
+end
+
+-- The run the prompt is about: the character's gathering run, only when no
+-- session is running. nil otherwise.
+local function PromptRun()
+    local sessions = Sessions()
+    if sessions and sessions:GetCurrent() then
+        return nil
+    end
+    local runs = Runs()
+    return runs and runs:GetCurrentRun() or nil
+end
+
+local function HideStillPopup()
+    if StaticPopup_Visible and StaticPopup_Visible(STILL_POPUP) and StaticPopup_Hide then
+        StaticPopup_Hide(STILL_POPUP)
+    end
+end
+
+-- Runs every STILL_CHECK_SECONDS and on leaving combat.
+function ActivityControl:CheckStillGathering()
+    local run = PromptRun()
+    local runs = Runs()
+    if not run or not runs then
+        stillAskedFor = nil
+        HideStillPopup()
+        return
+    end
+    -- Loot came in or the gap was answered: the open prompt is stale.
+    if stillAskedFor and stillAskedFor ~= GapKey(run) then
+        stillAskedFor = nil
+        HideStillPopup()
+    end
+    if stillAskedFor or InCombat() or not runs:NeedsStillGatheringPrompt(run) then
+        return
+    end
+    stillAskedFor = GapKey(run)
+    if StaticPopup_Show then
+        StaticPopup_Show(STILL_POPUP)
+    end
+end
+
+-- The prompt's run, if it is still the gap that was asked about.
+local function AnsweredRun()
+    local run = PromptRun()
+    if run and stillAskedFor and stillAskedFor == GapKey(run) then
+        return run
+    end
+    return nil
+end
+
+function ActivityControl:AnswerStillGathering()
+    if AnsweredRun() then
+        Runs():KeepGathering(PlayerGUID())
+    end
+end
+
+function ActivityControl:AnswerDoneGathering()
+    if AnsweredRun() then
+        stillAskedFor = nil
+        Runs():StopRun(PlayerGUID())
+        self:SendMessage("MCG_ACTIVITY_PAUSE_CHANGED")
+    end
+end
+
+if StaticPopupDialogs then
+    StaticPopupDialogs[STILL_POPUP] = {
+        text = "You haven't gathered anything in 3 minutes. Still at it?\n\n"
+            .. "|cffffd100Still gathering:|r the time spent looking counts.\n"
+            .. "|cffffd100I'm done:|r your run is saved, ending at your last gather.",
+        button1 = "Still gathering",
+        button2 = "I'm done",
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = false,
+        OnAccept = function()
+            ActivityControl:AnswerStillGathering()
+        end,
+        OnCancel = function()
+            ActivityControl:AnswerDoneGathering()
+        end,
+    }
+end
+
+-- ---------------------------------------------------------------------------
 -- Tracker auto-show (the tracker window lives in PocketCFO_PnL)
 -- ---------------------------------------------------------------------------
 
@@ -298,7 +403,9 @@ end
 -- callback arguments; same pattern as ActivitySessions).
 local logoutFrame = CreateFrame("Frame")
 logoutFrame:SetScript("OnEvent", function(_, event)
-    if event == "LOGOUT_CANCEL" then
+    if event == "PLAYER_REGEN_ENABLED" then
+        ActivityControl:CheckStillGathering()
+    elseif event == "LOGOUT_CANCEL" then
         loggingOut = false
     elseif event == "PLAYER_LOGOUT" then
         ActivityControl:OnPlayerLogout()
@@ -308,7 +415,8 @@ logoutFrame:SetScript("OnEvent", function(_, event)
 end)
 
 function ActivityControl:OnEnable()
-    for _, event in ipairs({ "PLAYER_CAMPING", "PLAYER_QUITING", "LOGOUT_CANCEL", "PLAYER_LOGOUT" }) do
+    for _, event in ipairs({ "PLAYER_CAMPING", "PLAYER_QUITING", "LOGOUT_CANCEL", "PLAYER_LOGOUT",
+                             "PLAYER_REGEN_ENABLED" }) do
         pcall(logoutFrame.RegisterEvent, logoutFrame, event)
     end
     if hooksecurefunc then
@@ -321,4 +429,12 @@ function ActivityControl:OnEnable()
     self:RegisterMessage("MCG_ACTIVITY_RUNS_UPDATED", "OnTrackingChanged")
     self:RegisterMessage("MCG_SESSIONS_FILED", "OnTrackingChanged")
     self:RegisterMessage("MCG_SESSIONS_UPDATED", "OnTrackingChanged")
+    -- "Still gathering?" prompt: closes when the run is filed or loot lands.
+    self:RegisterMessage("MCG_ACTIVITY_RUNS_FILED", "CheckStillGathering")
+    self:RegisterMessage("MCG_ACTIVITY_RUNS_UPDATED", "CheckStillGathering")
+    if C_Timer and C_Timer.NewTicker then
+        self.stillTicker = C_Timer.NewTicker(STILL_CHECK_SECONDS, function()
+            ActivityControl:CheckStillGathering()
+        end)
+    end
 end

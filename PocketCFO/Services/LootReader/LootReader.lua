@@ -69,7 +69,9 @@
 --     attached thing is written on its own with its own context instead.
 --   - "You receive" lines and currency gains not attached to a container:
 --     written when they arrive, category from what was happening (ContextFor):
---     a craft result in the last CRAFT_CONTEXT_SECONDS = craft; an item taken
+--     a craft result in the last CRAFT_CONTEXT_SECONDS = craft (items: not
+--     written here since 2026-11-05, the craft capture writes them through
+--     ItemLedger:WriteCraft; currencies still are); an item taken
 --     from the mail = transfer (your own character, or an AH cancel / expire
 --     / returned mail), auction_buy (AH invoice "buyer"), order_patron
 --     (patron reward mail, by subject) or mail (AH purchases
@@ -198,6 +200,31 @@ local GATHER_SPELLS = {
     [32605]  = { profession = "182", source = "corpse" }, -- Herb Gathering (creatures)
     [1239682] = { profession = "lumber", source = "node", hidden = true }, -- Woodchopping (housing lumber)
 }
+-- WoW Forever gathering spells (Forever-only, gated). Each rank
+-- (Apprentice / Journeyman / Expert / Artisan) casts with its own spell ID,
+-- so every rank is listed. Confirmed in-game 2026-11-05 from /mcg gatherlog:
+-- 2575 Mining on Copper Vein (GameObject source), 8613 Skinning, and 8617
+-- Skinning once the character reached Journeyman (skins were ignored until
+-- this was added). The other rank IDs are the classic-client values:
+-- Theoretical for Forever until seen. Herb Gathering ranks are Theoretical
+-- too; an unknown ID lands in the miss log (/mcg gatherlog).
+if PocketCFO.flavor == "forever" then
+    -- Mining: Apprentice, Journeyman, Expert, Artisan
+    GATHER_SPELLS[2575]  = { profession = "186", source = "node" }
+    GATHER_SPELLS[2576]  = { profession = "186", source = "node" }
+    GATHER_SPELLS[3564]  = { profession = "186", source = "node" }
+    GATHER_SPELLS[10248] = { profession = "186", source = "node" }
+    -- Skinning: Apprentice, Journeyman, Expert, Artisan
+    GATHER_SPELLS[8613]  = { profession = "393", source = "corpse" }
+    GATHER_SPELLS[8617]  = { profession = "393", source = "corpse" }
+    GATHER_SPELLS[8618]  = { profession = "393", source = "corpse" }
+    GATHER_SPELLS[10768] = { profession = "393", source = "corpse" }
+    -- Herb Gathering: Apprentice, Journeyman, Expert, Artisan
+    GATHER_SPELLS[2366]  = { profession = "182", source = "node" }
+    GATHER_SPELLS[2368]  = { profession = "182", source = "node" }
+    GATHER_SPELLS[3570]  = { profession = "182", source = "node" }
+    GATHER_SPELLS[11993] = { profession = "182", source = "node" }
+end
 LootReader.GATHER_SPELLS = GATHER_SPELLS
 
 -- Fished-up chests (moved here from GatheringCapture 2026-10-30, the one
@@ -464,6 +491,14 @@ local function WriteGain(pending)
     end
     local heldAt = GetTime()
     C_Timer.After(QUEST_LOOKBACK_SECONDS, function()
+        -- Craft output whose line arrived just BEFORE the craft result event
+        -- (in-game 2026-11-05: a prospect's Dusk-Shrouded Stone line came
+        -- first and was written as received on top of the craft capture's
+        -- entry). A craft result within CRAFT_CONTEXT_SECONDS either side of
+        -- the line means it's craft output: written by the craft capture.
+        if pending.kind == "item" and lastCraftAt and lastCraftAt >= heldAt - CRAFT_CONTEXT_SECONDS then
+            return
+        end
         if lastQuestAt and lastQuestAt >= heldAt then
             pending.cat = "quest"
         end
@@ -515,6 +550,49 @@ local function WriteWindowItems(window, cat, src, countActivity)
             })
             if id then
                 ids[#ids + 1] = id
+            end
+        end
+    end
+    -- Disenchant (Going Out step 2, 2026-11-05): the item destroyed is the
+    -- window's Item source (id and link resolved while the window was open,
+    -- confirmed 2026-10-25). Written once as disenchant out, src = its itemID,
+    -- with the mats, so one window = one writer. Book value is taken by the
+    -- Item Ledger. Flavor: Both (Theoretical on Forever).
+    if cat == "disenchant" and #ids > 0 then
+        local destroyed
+        for _, slot in ipairs(window.slots or {}) do
+            for _, source in ipairs(slot.sources or {}) do
+                if source.type == "Item" and source.id then
+                    destroyed = source
+                    break
+                end
+            end
+            if destroyed then
+                break
+            end
+        end
+        if destroyed then
+            local matIDs = { unpack(ids) }
+            local id = SafeWrite({
+                dir = "out", cat = "disenchant", src = destroyed.id, kind = "item", iid = destroyed.id,
+                link = destroyed.link, qty = 1, x = extra,
+            })
+            if id then
+                ids[#ids + 1] = id
+                -- Cost: the mats cost what the destroyed item cost, split by
+                -- value (ItemLedger:AllocateCost, 2026-11-05).
+                local ledger = Ledger()
+                local out = ledger and ledger.GetEntry and ledger:GetEntry(id)
+                if out and ledger.AllocateCost then
+                    local mats = {}
+                    for _, matID in ipairs(matIDs) do
+                        local entry = ledger:GetEntry(matID)
+                        if entry then
+                            mats[#mats + 1] = entry
+                        end
+                    end
+                    pcall(ledger.AllocateCost, ledger, mats, tonumber(out.cost) or 0)
+                end
             end
         end
     end
@@ -743,7 +821,12 @@ local function OnLootLine(text)
         line.ctx = cat
         local pending = { kind = "item", iid = itemID, link = link, qty = tonumber(quantity) or 1,
             dir = "in", cat = cat, src = src }
-        if (LootReader:AttachLineToOpening(line, pending) or 0) == 0 then
+        if cat == "craft" then
+            -- Going Out step 1 (2026-11-05): craft facts (output, returns,
+            -- mats used) are written by the craft capture (ItemLedger:WriteCraft),
+            -- one writer per fact. A line in craft context is only logged.
+            line.ctx = "craft (written by craft capture)"
+        elseif (LootReader:AttachLineToOpening(line, pending) or 0) == 0 then
             WriteGain(pending)
         else
             line.ctx = "container (else " .. cat .. ")"
@@ -1183,6 +1266,68 @@ function LootReader:CompleteOpening(record)
 end
 
 -- ---------------------------------------------------------------------------
+-- Consumed (Going Out, 2026-11-05): an item used up (food, drink, potion,
+-- lure, knowledge item) is written as "used" out, 1 per use, so sessions take
+-- its value off (Brian: consumables used in a session are part of the
+-- activity). Confirmed in-game 2026-11-05 (/mcgd events, a drink and a food):
+-- UNIT_SPELLCAST_SUCCEEDED (player, spell S), then SPELL_UPDATE_COOLDOWN with
+-- arg1 = S and arg5 = the item's ID, and ITEM_COUNT_CHANGED for that item,
+-- all within half a second (either order). All three within USE_SECONDS =
+-- one used. A hearthstone gets a cooldown but no count change: not used.
+-- Skipped: containers being opened (counted by their opening), crafts (mats
+-- written by the craft capture).
+-- Theoretical: one use = 1 item; the same signals on Forever.
+-- ---------------------------------------------------------------------------
+local USE_SECONDS = 2
+local spellSucceeded = {}   -- spellID -> GetTime()
+local useCooldown = {}      -- itemID -> { at, spellID }
+local countChanged = {}     -- itemID -> GetTime()
+
+local function TryConsume(itemID)
+    local cooldown, changedAt = useCooldown[itemID], countChanged[itemID]
+    local now = GetTime()
+    if not cooldown or not changedAt or (now - cooldown.at) > USE_SECONDS or (now - changedAt) > USE_SECONDS then
+        return
+    end
+    useCooldown[itemID], countChanged[itemID] = nil, nil
+    if lastCraftAt and (now - lastCraftAt) <= CRAFT_CONTEXT_SECONDS then
+        return
+    end
+    if lastUse and lastUse.itemID == itemID and lastUse.hasLoot and (now - (lastUse.at or 0)) <= USE_SECONDS then
+        return
+    end
+    local link
+    if C_Item and type(C_Item.GetItemInfo) == "function" then
+        local ok, _, itemLink = pcall(C_Item.GetItemInfo, itemID)
+        link = ok and type(itemLink) == "string" and itemLink or nil
+    end
+    SafeWrite({ dir = "out", cat = "used", src = cooldown.spellID, kind = "item", iid = itemID, link = link, qty = 1 })
+end
+
+local function OnSpellCooldown(...)
+    local spellID = tonumber((Plain((select(1, ...)))))
+    local itemID = tonumber((Plain((select(5, ...)))))
+    if not spellID or not itemID then
+        return
+    end
+    local castAt = spellSucceeded[spellID]
+    if not castAt or (GetTime() - castAt) > USE_SECONDS then
+        return
+    end
+    useCooldown[itemID] = { at = GetTime(), spellID = spellID }
+    TryConsume(itemID)
+end
+
+local function OnItemCountChanged(itemID)
+    itemID = tonumber((Plain(itemID)))
+    if not itemID then
+        return
+    end
+    countChanged[itemID] = GetTime()
+    TryConsume(itemID)
+end
+
+-- ---------------------------------------------------------------------------
 -- Events
 -- ---------------------------------------------------------------------------
 
@@ -1213,6 +1358,10 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         if window then
             SetWindow(window, event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
         end
+    elseif event == "SPELL_UPDATE_COOLDOWN" then
+        OnSpellCooldown(...)
+    elseif event == "ITEM_COUNT_CHANGED" then
+        OnItemCountChanged((...))
     elseif event == "QUEST_TURNED_IN" then
         lastQuestAt = GetTime()
     elseif event == "TRADE_SKILL_ITEM_CRAFTED_RESULT" then
@@ -1240,6 +1389,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
             end
             castStart, lastSent = nil, nil
             lastCast = cast
+            spellSucceeded[spellID] = now
         end
     end
 end)
@@ -1268,6 +1418,8 @@ function LootReader:OnEnable()
     pcall(eventFrame.RegisterEvent, eventFrame, "PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
     pcall(eventFrame.RegisterEvent, eventFrame, "QUEST_TURNED_IN")
     pcall(eventFrame.RegisterEvent, eventFrame, "TRADE_SKILL_ITEM_CRAFTED_RESULT")
+    pcall(eventFrame.RegisterEvent, eventFrame, "SPELL_UPDATE_COOLDOWN")
+    pcall(eventFrame.RegisterEvent, eventFrame, "ITEM_COUNT_CHANGED")
     if not self.mailHooked and hooksecurefunc then
         if type(_G.TakeInboxItem) == "function" then
             hooksecurefunc("TakeInboxItem", OnMailTake)

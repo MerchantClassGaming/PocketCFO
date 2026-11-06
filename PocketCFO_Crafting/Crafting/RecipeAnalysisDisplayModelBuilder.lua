@@ -293,7 +293,7 @@ function RecipeAnalysisDisplayModelBuilder:Build(economicsResult)
                 infoTitle = "Concentration",
                 infoTooltip = string.format(
                     "Using %s Concentration adds %s to what this craft sells for, compared with crafting it without Concentration.",
-                    pointsText, (economics.concentrationGain and string.format("%.2fg", economics.concentrationGain / 10000)) or "?"),
+                    pointsText, (economics.concentrationGain and _G.PocketCFO:FormatMoney(economics.concentrationGain)) or "?"),
             }
         else
             model.concentrationRow = {

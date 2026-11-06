@@ -2,7 +2,7 @@
 ## Title: PocketCFO AH
 ## Notes: Auction House scanner and listing reconciler - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.2.1
+## Version: v1.2.2
 ## SavedVariables: PocketCFO_AH_DB
 ## LoadOnDemand: 1
 ## LoadWith: Blizzard_AuctionHouseUI
@@ -39,6 +39,7 @@ Services\MarketLadderService\MarketLadderService.lua
 Services\PostingEligibilityService\PostingEligibilityService.lua
 
 ## Posting
+Posting\Smart\SmartPricing.lua
 Posting\Evaluation\PostingEvaluator.lua
 Posting\Evaluation\PostingEvaluationPipeline.lua
 Posting\Execution\PostingExecution.lua

@@ -377,6 +377,48 @@ function GoldLedger:Record(delta, category, professionKey, reason, timestamp, it
             units = item and (tonumber(item.quantity) or 1) or nil,
             at = timestamp,
         })
+        -- Going Out (2026-11-05): a vendor sale whose claim matched (exact
+        -- sell price x stack, read at the sell click) also writes the item
+        -- leaving. Same moment, one writer. No match = no item out.
+        -- Both item-out writes are pcall-wrapped (2026-11-06) so a failure
+        -- there can never stop the gold record above or the rest of Record.
+        if category == "vendor" and delta > 0 and item and item.saleItemID then
+            pcall(itemLedger.Write, itemLedger, {
+                dir = "out",
+                cat = "vendor",
+                prof = professionKey ~= "none" and professionKey or nil,
+                kind = "item",
+                iid = item.saleItemID,
+                link = item.saleLink,
+                qty = tonumber(item.quantity) or 1,
+                src = item.saleItemID,
+                at = timestamp,
+            })
+        end
+        -- AH sale (2026-11-05): the sold item leaves as auction out, at the
+        -- sale time. If AHMailboxReconciler resolved this sale (same name,
+        -- same copper) to one listing, its link is used, so gear leaves at
+        -- its own book value and stackables at the right quality. Otherwise:
+        -- name -> itemID via ResolveItemID, quantity from the invoice /
+        -- subject (1 for gear, api-findings), no link (gear goes out
+        -- unpriced). Name not resolved and no resolved sale = no item out.
+        if category == "auction" and delta > 0 and item then
+            local sale = self:ResolvedSale(item.name, delta)   -- pcall-wrapped inside
+            local itemID = (sale and tonumber(sale.itemID)) or tonumber(item.itemID)
+            if itemID then
+                pcall(itemLedger.Write, itemLedger, {
+                    dir = "out",
+                    cat = "auction",
+                    prof = professionKey ~= "none" and professionKey or nil,
+                    kind = "item",
+                    iid = itemID,
+                    link = sale and sale.itemLink or nil,
+                    qty = (sale and tonumber(sale.quantity)) or tonumber(item.quantity) or 1,
+                    src = itemID,
+                    at = timestamp,
+                })
+            end
+        end
     end
 
     local itemText = ""
@@ -1068,6 +1110,17 @@ function GoldLedger:MatchWaitingMail(amount, refresh)
     return true
 end
 
+-- The listing AHMailboxReconciler matched to this AH sale (item name + mail
+-- money), taken so it is used once. nil = not resolved (2026-11-05).
+function GoldLedger:ResolvedSale(itemName, money)
+    local reconciler = PocketCFO:GetModule("AHMailboxReconciler", true)
+    if not itemName or not reconciler or not reconciler.TakeResolvedSale then
+        return nil
+    end
+    local ok, sale = pcall(reconciler.TakeResolvedSale, reconciler, itemName, money)
+    return ok and sale or nil
+end
+
 -- AH sale mail is held for AH_MAIL_DAYS from the moment of the sale, so the
 -- sale happened (AH_MAIL_DAYS - daysLeft) days before now.
 -- Returns timestamp (nil = use collection time), reason text.
@@ -1232,7 +1285,10 @@ function GoldLedger:ClaimVendorSale(info)
         category = "vendor",
         amount = sellPrice * quantity,
         profession = professionKey,
-        item = itemName and { name = itemName, quantity = quantity } or nil,
+        -- saleItemID / saleLink (2026-11-05): the item leaves as vendor out
+        -- when this claim matches (Record).
+        item = itemName and { name = itemName, quantity = quantity,
+            saleItemID = tonumber(info.itemID), saleLink = info.hyperlink } or nil,
         reason = "vendor:sell profession-by=" .. tostring(how),
     })
 end

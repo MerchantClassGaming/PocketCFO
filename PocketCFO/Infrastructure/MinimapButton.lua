@@ -18,15 +18,13 @@ local BUTTON_NAME = "PocketCFO"
 -- made from Brian's Icon.png (circle cut out, checkerboard background removed).
 local ICON = "Interface\\AddOns\\PocketCFO\\Media\\PocketCFO_Icon.tga"
 
+-- Two biggest coins (core PocketCFO:RoundMoney, 2026-11-05).
 local function FormatMoney(copper)
-    copper = math.floor(tonumber(copper) or 0)
-    if copper >= 10000 then
-        copper = math.floor(copper / 10000) * 10000
-    end
+    copper = PocketCFO:RoundMoney(copper)
     if GetMoneyString then
         return GetMoneyString(copper, true)
     end
-    return tostring(math.floor(copper / 10000)) .. "g"
+    return PocketCFO:FormatMoney(copper)
 end
 
 local function FormatDuration(seconds)
@@ -132,5 +130,24 @@ function MinimapButton:OnEnable()
     PocketCFO.db.global.minimap = PocketCFO.db.global.minimap or { hide = false }
     if not icon:IsRegistered(BUTTON_NAME) then
         icon:Register(BUTTON_NAME, dataObject, PocketCFO.db.global.minimap)
+    end
+
+    -- Fit our round icon to LibDBIcon's dark background circle (2026-11-05).
+    -- LibDBIcon 55 sizes the icon smaller than the background (built for
+    -- square Blizzard icons): Classic/Forever 17x17 at (7,-6) on a 20x20 at
+    -- (7,-5) leaves a gap right and bottom; retail 18x18 centered on 24x24
+    -- leaves an even ring. Match the background on each flavor.
+    -- Library left unedited (shared lib; another addon may load a newer copy).
+    local button = icon.GetMinimapButton and icon:GetMinimapButton(BUTTON_NAME)
+    if button and button.icon then
+        button.icon:ClearAllPoints()
+        if WOW_PROJECT_ID == WOW_PROJECT_MAINLINE then
+            button.icon:SetSize(24, 24)
+            button.icon:SetPoint("CENTER", button, "CENTER")
+        else
+            button.icon:SetSize(20, 20)
+            -- -6 not -5: at -5 the border covered the icon's top edge (Brian, in-game).
+            button.icon:SetPoint("TOPLEFT", button, "TOPLEFT", 7, -6)
+        end
     end
 end

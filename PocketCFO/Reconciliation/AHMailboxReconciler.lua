@@ -140,6 +140,18 @@ local function ResolveIdentity(evidence, source)
     return identity, configKey, (identity and identity.unresolvedReason) or (configKey and nil or "configKeyUnavailable")
 end
 
+-- Sale price of a sold mail (2026-11-05): money - deposit + AH cut
+-- (api-findings formula). nil when the invoice parts are missing.
+local function SalePrice(evidence)
+    local money = tonumber(evidence and evidence.money)
+    local deposit = tonumber(evidence and evidence.deposit)
+    local cut = tonumber(evidence and evidence.consignment)
+    if not money or not deposit or not cut then
+        return nil
+    end
+    return money - deposit + cut
+end
+
 local function BuildEvidenceEntry(evidence, index)
     if type(evidence) ~= "table" then
         return nil
@@ -155,6 +167,7 @@ local function BuildEvidenceEntry(evidence, index)
         type = evidence.type,
         outcome = EvidenceIsSold(evidence) and "sold" or (EvidenceIsReturned(evidence) and ReturnedOutcome(evidence) or "unresolved"),
         unresolvedReason = unresolvedReason,
+        salePrice = EvidenceIsSold(evidence) and SalePrice(evidence) or nil,
     }
 end
 
@@ -365,6 +378,39 @@ local function ResolveAgainstListings(state, entry, listings, reason, fallback)
     return (entry.quantity or 0) - remaining, remaining
 end
 
+-- Price match (2026-11-05): open listings with this name whose posted price
+-- equals the sale price (buyout, or unit price x quantity sold). Used only
+-- when every match is the same variant (one configKey) and they cover the
+-- whole sale, so it never splits a sale or guesses between variants.
+local function PriceMatches(entry, listings)
+    local price = tonumber(entry and entry.salePrice)
+    local quantity = tonumber(entry and entry.quantity) or 1
+    if not price or price <= 0 then
+        return nil
+    end
+    local matches, configKey, total = {}, nil, 0
+    for _, listing in ipairs(listings or {}) do
+        local remaining = tonumber(listing.remaining) or 0
+        if remaining > 0 and listing.configKey then
+            local row = listing.row or {}
+            local buyout = tonumber(row.buyout)
+            local unitPrice = tonumber(row.unitPrice)
+            if buyout == price or (unitPrice and unitPrice * quantity == price) then
+                if configKey and configKey ~= listing.configKey then
+                    return nil
+                end
+                configKey = listing.configKey
+                matches[#matches + 1] = listing
+                total = total + remaining
+            end
+        end
+    end
+    if #matches == 0 or total < quantity then
+        return nil
+    end
+    return matches
+end
+
 local function ResolveEntry(state, entry, byConfigKey, byName)
     if not entry or entry.quantity <= 0 then
         return
@@ -379,6 +425,18 @@ local function ResolveEntry(state, entry, byConfigKey, byName)
 
     if remaining <= 0 then
         return
+    end
+
+    -- Price match before the name rules (2026-11-05). Only when nothing has
+    -- been applied yet, so ResolveAgainstListings starts from the full sale.
+    if resolved == 0 and not entry.configKey and entry.nameKey and EvidenceIsSold(entry.evidence) then
+        local ok, priceMatches = pcall(PriceMatches, entry, byName[entry.nameKey])
+        if ok and priceMatches then
+            resolved, remaining = ResolveAgainstListings(state, entry, priceMatches, "price-match", false)
+            if remaining <= 0 then
+                return
+            end
+        end
     end
 
     if not entry.configKey and entry.nameKey then
@@ -422,6 +480,108 @@ local function ResolveEntry(state, entry, byConfigKey, byName)
         AddReportEntry(state.report, "unresolvedGroups", unresolved)
         AddUnresolvedEvidence(state, entry, reason, remaining)
     end
+end
+
+-- Resolved sales for the Item Ledger (2026-11-05). When a sold mail resolves
+-- to one variant, keep its link so GoldLedger can write the auction out with
+-- it when the gold is collected (gear then leaves at its own book value).
+-- Keyed by item name + mail money (exact copper). Kept in the saved DB so a
+-- reload between opening the mailbox and collecting doesn't lose it; pruned
+-- after 31 days (AH mail is held 30).
+local RESOLVED_SALE_DAYS = 31
+
+local function ResolvedSalesTable()
+    local global = PocketCFO and PocketCFO.db and PocketCFO.db.global
+    if not global then
+        return nil
+    end
+    global.ahResolvedSales = global.ahResolvedSales or {}
+    return global.ahResolvedSales
+end
+
+local function ResolvedSaleKey(name, money)
+    local nameKey = NameKey(name)
+    money = tonumber(money)
+    if not nameKey or not money then
+        return nil
+    end
+    return nameKey .. "|" .. tostring(money)
+end
+
+local function RememberResolvedSale(entry, results, firstIndex)
+    local evidence = entry and entry.evidence
+    if not evidence or not EvidenceIsSold(evidence) then
+        return
+    end
+    local key = ResolvedSaleKey(evidence.itemName, evidence.money)
+    local store = key and ResolvedSalesTable()
+    if not store then
+        return
+    end
+    local configKey, itemLink, itemID, quantity = nil, nil, nil, 0
+    for index = firstIndex, #results do
+        local result = results[index]
+        if not result.configKey or not result.itemLink then
+            return
+        end
+        if configKey and configKey ~= result.configKey then
+            return
+        end
+        configKey = result.configKey
+        itemLink = itemLink or result.itemLink
+        itemID = itemID or tonumber(result.itemID)
+        quantity = quantity + (tonumber(result.quantity) or 0)
+    end
+    if not configKey or quantity ~= (tonumber(entry.quantity) or 0) then
+        return
+    end
+
+    local now = Now()
+    local cutoff = now - RESOLVED_SALE_DAYS * 86400
+    for saleKey, list in pairs(store) do
+        for i = #list, 1, -1 do
+            if (tonumber(list[i].at) or 0) < cutoff then
+                table.remove(list, i)
+            end
+        end
+        if #list == 0 then
+            store[saleKey] = nil
+        end
+    end
+
+    local list = store[key] or {}
+    for _, sale in ipairs(list) do
+        if evidence.evidenceKey and sale.evidenceKey == evidence.evidenceKey then
+            return
+        end
+    end
+    list[#list + 1] = {
+        itemLink = itemLink,
+        itemID = itemID,
+        configKey = configKey,
+        quantity = quantity,
+        evidenceKey = evidence.evidenceKey,
+        at = now,
+    }
+    store[key] = list
+    SessionLog("AHMailboxReconciler: resolved sale kept item=%s money=%s configKey=%s qty=%d",
+        tostring(evidence.itemName), tostring(evidence.money), tostring(configKey), quantity)
+end
+
+-- GoldLedger asks for (and takes) the resolved sale matching a collected AH
+-- sale mail. Returns { itemLink, itemID, configKey, quantity } or nil.
+function AHMailboxReconciler:TakeResolvedSale(name, money)
+    local key = ResolvedSaleKey(name, money)
+    local store = key and ResolvedSalesTable()
+    local list = store and store[key]
+    if not list or #list == 0 then
+        return nil
+    end
+    local sale = table.remove(list, 1)
+    if #list == 0 then
+        store[key] = nil
+    end
+    return sale
 end
 
 local function NotifyListingService(results)
@@ -800,7 +960,12 @@ function AHMailboxReconciler.Resolve(selfOrEvidence, maybeEvidence)
     for index, evidence in ipairs(mailEvidence or {}) do
         local entry = BuildEvidenceEntry(evidence, index)
         if entry then
+            local firstResult = #state.results + 1
             ResolveEntry(state, entry, byConfigKey, byName)
+            local ok, err = pcall(RememberResolvedSale, entry, state.results, firstResult)
+            if not ok then
+                SessionLog("AHMailboxReconciler: RememberResolvedSale error=%s", tostring(err))
+            end
         end
     end
 
@@ -962,6 +1127,8 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
                 itemName  = soldItemName,
                 quantity  = soldQuantity,
                 money     = obs.money,
+                deposit   = invoice and invoice.deposit or nil,
+                consignment = invoice and invoice.consignment or nil,
                 mailIndex = obs.mailIndex,
                 subject   = obs.subject,
                 sender    = obs.sender,

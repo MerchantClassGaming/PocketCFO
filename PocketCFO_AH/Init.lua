@@ -46,6 +46,69 @@ local function SessionLog(msg, ...)
     PocketCFO:AppendSessionLog("[MCG] " .. tostring(msg))
 end
 
+-- The one item name used by every AH screen (Post, Cancel, Item Rules):
+-- "Item Name Q3 - Crit / Haste". Q tag when the item has a crafting quality;
+-- stats when it has a stat version, filtered by core IdentityAdapters
+-- (primaries, stamina and armor dropped). Display only: never a lookup key.
+local function ItemStatLabel(statFingerprint)
+    if statFingerprint == nil or tostring(statFingerprint) == "" then
+        return nil
+    end
+    local adapters = _G.PocketCFO and _G.PocketCFO.ItemIdentityAdapters
+    if adapters and adapters.NormalizeVariantStatFingerprint then
+        local ok, filtered = pcall(adapters.NormalizeVariantStatFingerprint, adapters, statFingerprint)
+        if ok then
+            statFingerprint = filtered
+        end
+    end
+    if statFingerprint == nil or tostring(statFingerprint) == "" then
+        return nil
+    end
+
+    local labels = {}
+    for rawPart in string.gmatch(tostring(statFingerprint), "([^|]+)") do
+        local part = rawPart
+        part = part:gsub("^ITEM_MOD_", "")
+        part = part:gsub("_SHORT$", "")
+        part = part:gsub("_STAT$", "")
+        -- "Haste Rating" -> "Haste" (Brian, 2026-11-04).
+        part = part:gsub("_RATING$", "")
+        part = part:gsub("_", " "):lower()
+        part = part:gsub("(%a)([%w']*)", function(first, rest)
+            return first:upper() .. rest
+        end)
+        if part ~= "" and not part:find("^Modified Crafting") then
+            labels[#labels + 1] = part
+        end
+    end
+    if #labels == 0 then
+        return nil
+    end
+    return table.concat(labels, " / ")
+end
+
+function PocketCFO_AH.ItemDisplayName(row)
+    if type(row) ~= "table" then
+        return ""
+    end
+    local name = row.itemName or row.name
+    if (not name or name == "") and row.itemID then
+        name = "Item " .. tostring(row.itemID)
+    end
+    name = tostring(name or "")
+
+    local quality = tonumber(row.craftingQuality or row.itemQuality or row.quality)
+    if quality and quality > 0 then
+        name = name .. " Q" .. tostring(quality)
+    end
+
+    local statLabel = ItemStatLabel(row.statFingerprint)
+    if statLabel then
+        name = name .. " - " .. statLabel
+    end
+    return name
+end
+
 local function CountTableEntries(value)
     if type(value) ~= "table" then
         return 0
@@ -56,6 +119,20 @@ local function CountTableEntries(value)
         count = count + 1
     end
     return count
+end
+
+-- True when a rules table holds at least one rule. A value that is an empty
+-- table (e.g. an empty per-owner bucket) doesn't count.
+local function HasAnyRule(rules)
+    if type(rules) ~= "table" then
+        return false
+    end
+    for _, value in pairs(rules) do
+        if type(value) ~= "table" or next(value) ~= nil then
+            return true
+        end
+    end
+    return false
 end
 
 local function IsCodexSeededConservativeProfile(profile)
@@ -197,6 +274,19 @@ function PocketCFO_AH:OnInitialize()
     end
 
     local PocketCFO = _G.PocketCFO
+
+    -- One-time (Brian, 2026-11-06): players who already built posting rules
+    -- get the Auction House Posting beta turned on; Smart Posting stays off.
+    -- Runs after the seeded Conservative profile cleanup above, so only real
+    -- rules count. Core BetaFeatures does nothing on Forever.
+    local beta = PocketCFO and PocketCFO.GetModule and PocketCFO:GetModule("BetaFeatures", true)
+    if beta and beta.ApplyExistingRulesCheck then
+        local hasRules = HasAnyRule(globalDB.postingProfiles)
+            or HasAnyRule(globalDB.recipePostingRules)
+            or HasAnyRule(globalDB.nonCraftedPostingRules)
+        beta:ApplyExistingRulesCheck(hasRules)
+    end
+
     if PocketCFO then
         PocketCFO:Debug("PocketCFO_AH init loaded")
     end

@@ -73,13 +73,11 @@ end
 _G.PocketCFO_CraftAnalysisEligibilityPolicy = CraftAnalysisEligibilityPolicy
 
 -- ---------------------------------------------------------------------------
--- Pilot recipes (Midnight Inscription reagents)
+-- Pilot recipes
 -- ---------------------------------------------------------------------------
--- Confirmed recipeIDs (supplied 2026-07-11). Not registered in
--- ProcessingOperationRegistry - these are ordinary Crafting Operations, and
--- OperationProfileKeyService already treats any unregistered recipeID as
--- "crafting" by default.
-CraftAnalysisEligibilityPolicy:Register(1230018, "Codified Azeroot")
-CraftAnalysisEligibilityPolicy:Register(1230019, "Soul Cipher")
-CraftAnalysisEligibilityPolicy:Register(1230016, "Sienna Ink")
-CraftAnalysisEligibilityPolicy:Register(1230017, "Munsell Ink")
+-- None registered. The Midnight Inscription pilot (Codified Azeroot 1230018,
+-- Soul Cipher 1230019, Sienna Ink 1230016, Munsell Ink 1230017) was removed
+-- 2026-11-04 (Brian): Craft Analysis prices the mats past crafts used, not
+-- the mats loaded in the form, so swapping a reagent quality never moved the
+-- profit. These recipes now use Live Recipe Analysis like every other
+-- recipe. Registry and CraftAnalysisController are kept, unused.

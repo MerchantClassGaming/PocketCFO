@@ -124,23 +124,9 @@ local function GetEconomicsService()
     return PocketCFO_Orders:GetModule("OrderEconomicsService", true)
 end
 
+-- Money shows the two biggest coins (core PocketCFO:FormatMoney, 2026-11-05).
 local function FormatGold(copperValue, signed)
-    copperValue = tonumber(copperValue) or 0
-    local negative = copperValue < 0
-    local absValue = math.floor(math.abs(copperValue) + 0.5)
-    local gold = math.floor(absValue / 10000)
-    local silver = math.floor((absValue % 10000) / 100)
-    local goldText = tostring(gold):reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    if goldText:sub(1, 1) == "," then
-        goldText = goldText:sub(2)
-    end
-    local sign = ""
-    if signed then
-        sign = negative and "-" or "+"
-    elseif negative then
-        sign = "-"
-    end
-    return string.format("%s%sg %02ds", sign, goldText, silver)
+    return _G.PocketCFO:FormatMoney(copperValue, signed)
 end
 
 local function FormatTimeLeft(expirationTime)

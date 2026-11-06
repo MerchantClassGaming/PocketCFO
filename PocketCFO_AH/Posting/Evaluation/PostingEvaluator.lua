@@ -137,12 +137,241 @@ local function CalculateOwnedNextBuyCoverage(entries, competitionPrice)
     return coverage, coverageRows
 end
 
+-- ---------------------------------------------------------------------------
+-- Smart AH view (design: claude/AH_Smart_Posting_Design.md). Price = match
+-- the lowest real competitor, never below the floor (skip instead), never
+-- above the ceiling. Everything offered is posted: owned auctions already at
+-- the lowest price don't reduce it (FIFO puts ours behind them). The rules
+-- view below is unchanged.
+-- ---------------------------------------------------------------------------
+
+local GEAR_GAP_PCT = 0.50
+
+local function Gold(copper)
+    copper = tonumber(copper)
+    if not copper then
+        return "?"
+    end
+    -- Two biggest coins (core PocketCFO:FormatMoney, 2026-11-05).
+    return _G.PocketCFO:FormatMoney(copper)
+end
+
+local function BelowFloorNote(bounds)
+    local source = bounds and bounds.floorSource
+    if source == "disenchant" then
+        return "Worth more disenchanted."
+    elseif source == "vendor" then
+        return "Lowest price is below vendor price."
+    end
+    return "Lowest price is below what it costs to make."
+end
+
+-- Gear: a listing far below the next one up (or far below market value) is
+-- a deal to buy, not a price to match. Ignores cheap listings from the
+-- bottom while they're under 50% of the next listing or of market value.
+-- Our own listings always count.
+-- capPrice: the most this item can be worth next to its better versions
+-- (bounds.ruleCap). A listing near it is real even if the next listing up
+-- is overpriced (Brian, 2026-11-04: 350g green rod next to a 2,547g one,
+-- blues at 738g).
+-- goodPrice: a listing at or above it is real competition even when it looks
+-- like a deal (Brian, 2026-11-04: 550g rod that costs 162g to make; others
+-- at 2,900g). 2x cost to make, the lowest the max curve ever goes.
+local function DropCheapGearListings(entries, marketValue, capPrice, goodPrice)
+    local start = 1
+    local ignoredPrice = nil
+    local keptForCost = false
+    while start <= #entries do
+        local entry = entries[start]
+        if entry.owned then
+            break
+        end
+        local nextEntry = entries[start + 1]
+        local reference = nextEntry and nextEntry.price
+        if reference and capPrice and capPrice > 0 and capPrice < reference then
+            reference = capPrice
+        end
+        local belowNext = reference and entry.price < reference * GEAR_GAP_PCT
+        local belowMarket = marketValue and marketValue > 0 and entry.price < marketValue * GEAR_GAP_PCT
+        if not (belowNext or belowMarket) then
+            break
+        end
+        if goodPrice and entry.price >= goodPrice then
+            keptForCost = true
+            break
+        end
+        ignoredPrice = ignoredPrice or entry.price
+        start = start + 1
+    end
+    local kept = {}
+    for index = start, #entries do
+        kept[#kept + 1] = entries[index]
+    end
+    return kept, ignoredPrice, start - 1, keptForCost
+end
+
+local function EvaluateSmart(row, rule, ladderResult, marketSettings)
+    local bounds = type(rule.bounds) == "table" and rule.bounds or {}
+    local floor = NumberOrNil(rule.minPrice)
+    if floor and floor <= 0 then
+        floor = nil
+    end
+    local ceiling = NumberOrNil(rule.maxPrice)
+    local inBags = PositiveQuantity(row.inBags or row.bagQuantity or row.quantity)
+    -- Usually Post (Brian, 2026-11-04): how many the player wants up at once,
+    -- saved per item; default one stack (1 for anything that doesn't stack).
+    -- Post Now = Usually Post minus ours already selling next, never more
+    -- than is offered. The Post Now cell changes it for this post only.
+    local stackSize = PositiveQuantity(bounds.stackSize)
+    local usuallyPost = PositiveQuantity(bounds.usuallyPost)
+    if usuallyPost <= 0 then
+        usuallyPost = stackSize > 0 and stackSize or 1
+    end
+    local defaultQuantity = math.min(inBags, usuallyPost)
+    local postQuantity = defaultQuantity
+    local isVariant = row.target and row.target.meaningfulVariant == true
+    local marketValue = NumberOrNil(marketSettings and marketSettings.marketValue)
+    local debug = {
+        smart = true,
+        floor = floor,
+        floorSource = bounds.floorSource,
+        ceiling = ceiling,
+        ceilingBase = bounds.ceilingBase,
+        marketValue = marketValue,
+        lastSale = bounds.lastSale,
+        ladderCount = #(ladderResult and ladderResult.ladder or {}),
+        maxToPost = usuallyPost,
+        remainingToPost = defaultQuantity,
+        usuallyPost = usuallyPost,
+        ownedNextBuyCoverage = 0,
+        evaluationMode = isVariant and "smart-gear-gap" or "smart-bait-protected",
+    }
+
+    local function Result(shouldPost, price, note, lowestAuction)
+        local result = BuildResult(shouldPost, price, shouldPost and postQuantity or 0,
+            shouldPost and "Ready" or "Skipped", note, lowestAuction, 0, debug)
+        -- Skipped rows show these in the Price / Qty cells as starting values.
+        result.suggestedPrice = (not shouldPost) and floor or nil
+        result.suggestedQuantity = (not shouldPost) and defaultQuantity or nil
+        return result
+    end
+
+    if inBags <= 0 then
+        return Result(false, nil, "Skipped: none left to post.")
+    end
+
+    local entries = LadderEntries(ladderResult)
+    debug.pricedAuctionCount = #entries
+    debug.cheapestMatchedAuctions = BuildCheapestDebug(entries, 5)
+
+    local validAuctions, ignoredPrice, keptForCost
+    if isVariant then
+        local costToMake = NumberOrNil(bounds.costToMake)
+        local goodPrice = costToMake and costToMake > 0 and costToMake * 2 or nil
+        validAuctions, ignoredPrice, debug.ignoredBaitAuctionCount, keptForCost = DropCheapGearListings(entries, marketValue,
+            NumberOrNil(bounds.ruleCap), goodPrice)
+        debug.keptForCost = keptForCost
+    else
+        local threshold = MarketProtectionThreshold(marketSettings)
+        debug.protectionThreshold = threshold
+        validAuctions = {}
+        debug.ignoredBaitAuctionCount = 0
+        for _, entry in ipairs(entries) do
+            if entry.owned or not threshold or entry.price >= threshold then
+                validAuctions[#validAuctions + 1] = entry
+            else
+                debug.ignoredBaitAuctionCount = debug.ignoredBaitAuctionCount + 1
+            end
+        end
+    end
+    debug.validAuctionCount = #validAuctions
+    -- "Worth buying?" only below cost to make (Brian, 2026-11-04): above it,
+    -- the seller can just craft another and relist, so buying never pays.
+    local dealNote = ""
+    if ignoredPrice then
+        local costToMake = NumberOrNil(bounds.costToMake)
+        if costToMake and costToMake > 0 and ignoredPrice >= costToMake then
+            dealNote = " Ignored one far below the rest (" .. Gold(ignoredPrice) .. ")."
+        else
+            dealNote = " One listed far below market (" .. Gold(ignoredPrice) .. "). Worth buying?"
+        end
+    end
+
+    if #validAuctions == 0 then
+        -- Nobody else listing (Brian, 2026-11-04): only price from real
+        -- evidence. Our own sale -> 2x it; a value we're confident in ->
+        -- that value; otherwise don't guess.
+        if bounds.ceilingBase == "sale" and ceiling and ceiling > 0 then
+            return Result(true, ceiling, "No one else selling. 2x your last sale." .. dealNote)
+        end
+        local valuePrice = NumberOrNil(bounds.valuePrice)
+        if valuePrice and valuePrice > 0 then
+            local why = bounds.ceilingBase == "rule" and "Priced below the better version." or "Priced at its value."
+            return Result(true, valuePrice, "No one else selling. " .. why .. dealNote)
+        end
+        -- No starting price here: the floor (vendor / cost) isn't a price
+        -- suggestion when we know nothing about the market (Brian, 2026-11-04).
+        local result = Result(false, nil, "Not enough price data. Type a price to post." .. dealNote)
+        result.suggestedPrice = nil
+        -- Not "Skipped": the player should act on it, so it stays bright and
+        -- sorts above posted and skipped rows (Brian, 2026-11-04).
+        result.status = "Needs Price"
+        return result
+    end
+
+    local lowestPrice = validAuctions[1].price
+    local lowestAuction = validAuctions[1].auction
+    debug.selectedCompetitionPrice = lowestPrice
+    if keptForCost then
+        local times = lowestPrice / NumberOrNil(bounds.costToMake)
+        dealNote = " Below other listings, but " .. string.format("%.1f", times):gsub("%.0$", "")
+            .. "x cost." .. dealNote
+    end
+
+    -- Ours already selling next at the lowest price count toward Usually
+    -- Post (Brian, 2026-11-04). Only those at the lowest price: undercut
+    -- ones won't sell next (cancel and repost them). Once Usually Post is
+    -- up: "Listed" (Probably not); typing Post Now adds more.
+    local coverage = CalculateOwnedNextBuyCoverage(validAuctions, lowestPrice)
+    debug.ownedNextBuyCoverage = coverage
+    postQuantity = math.min(inBags, math.max(0, usuallyPost - coverage))
+    debug.remainingToPost = postQuantity
+    if coverage > 0 and postQuantity <= 0 then
+        local result = Result(false, nil, "Yours sells next (" .. Gold(lowestPrice) .. "). Type in Post Now to add more." .. dealNote, lowestAuction)
+        result.status = "Listed"
+        result.price = lowestPrice
+        result.suggestedPrice = lowestPrice
+        result.suggestedQuantity = nil
+        return result
+    end
+    if coverage > 0 then
+        dealNote = " " .. tostring(coverage) .. " of yours already up." .. dealNote
+    end
+
+    if floor and lowestPrice < floor then
+        -- "Too Cheap" (Your call): some players post anyway to free bag space.
+        local result = Result(false, nil, BelowFloorNote(bounds) .. dealNote, lowestAuction)
+        result.status = "Too Cheap"
+        return result
+    end
+    if ceiling and ceiling > 0 and lowestPrice > ceiling then
+        if bounds.ceilingBase == "rule" then
+            return Result(true, ceiling, "Priced below the better version." .. dealNote, lowestAuction)
+        end
+        return Result(true, ceiling, "Priced at the max (others are too high)." .. dealNote, lowestAuction)
+    end
+    return Result(true, lowestPrice, "Matched lowest price." .. dealNote, lowestAuction)
+end
+
 function PostingEvaluator:Evaluate(row, matchedAuctions, marketSettings, evaluationContext)
     row = type(row) == "table" and row or {}
     evaluationContext = type(evaluationContext) == "table" and evaluationContext or {}
     local ladderResult = evaluationContext.marketLadder or evaluationContext.ladderResult
 
     local rule = type(row.resolvedRule) == "table" and row.resolvedRule or {}
+    if rule.smart then
+        return EvaluateSmart(row, rule, ladderResult, marketSettings)
+    end
     local maxToPost = PositiveQuantity(rule.maxToPost or rule.targetPosted)
     local inBags = PositiveQuantity(row.inBags or row.bagQuantity or row.quantity)
     local minPrice = NumberOrNil(rule.minPrice) or 0

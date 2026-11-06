@@ -30,25 +30,9 @@ local ROWS_START_Y = -46
 local RESOURCEFULNESS_TOOLTIP =
     "Estimated from historical resourcefulness returns for comparable crafts. Quantities represent long-run averages and are not literal amounts expected from this individual craft."
 
--- Local money formatter. No shared "12,345g 67s" helper exists anywhere in
--- the codebase today (PostingUI.lua/CancelAuctionsUI.lua/PostingRuleEditor.lua/
--- PostingProfileEditorUI.lua each carry their own copy; InventoryManagerWindow.lua
--- has a separate whole-gold-only signed formatter). Adding one here only, not
--- retrofitting the others - out of scope for this build.
+-- Money shows the two biggest coins (core PocketCFO:FormatMoney, 2026-11-05).
 local function FormatSignedGoldSilver(copperValue)
-    copperValue = tonumber(copperValue) or 0
-    local negative = copperValue < 0
-    local absValue = math.floor(math.abs(copperValue) + 0.5)
-    local gold = math.floor(absValue / 10000)
-    local silver = math.floor((absValue % 10000) / 100)
-
-    local goldText = tostring(gold)
-    local withCommas = goldText:reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    if withCommas:sub(1, 1) == "," then
-        withCommas = withCommas:sub(2)
-    end
-
-    return string.format("%s%sg %02ds", negative and "-" or "+", withCommas, silver)
+    return _G.PocketCFO:FormatMoney(copperValue, true)
 end
 
 local function SetColor(fontString, color)

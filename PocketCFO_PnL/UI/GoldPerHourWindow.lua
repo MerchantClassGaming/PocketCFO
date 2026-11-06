@@ -4,7 +4,9 @@
 -- just what this character is doing right now.
 --   Line 1: what is tracked (session or run) or the last one, PAUSED when paused.
 --   Line 2: time, value, gold per hour. Updates every second while open.
---   Buttons: Stop (Ctrl-click throws a session away), Pause / Resume (core
+--   Buttons: Start session (2026-11-04; same popup and rule as the Gold per
+--   Hour tab's button: asks for a name, greyed out while a session runs),
+--   Stop (Ctrl-click throws a session away), Pause / Resume (core
 --   ActivityControl), and an open button for the Gold window.
 -- Opened from the Gold per Hour tab's Tracker button or the minimap button
 -- (right-click), and by itself when tracking starts if "Show the tracker
@@ -181,6 +183,19 @@ function GoldPerHourWindow:Build()
         return button
     end
 
+    -- Same as the Gold per Hour tab's Start session button
+    -- (GoldWindow:PromptStartSession, GoldPerHourTab.lua).
+    frame.startButton = Button(100, "Start session", function()
+        local window = GoldWindow()
+        if window and window.PromptStartSession then
+            window:PromptStartSession()
+        end
+    end, function(tooltip)
+        tooltip:AddLine("Start a session")
+        tooltip:AddLine("Track the gold from anything you do until you stop it. Gathering, dungeons, raids and delves are tracked on their own.", 1, 1, 1, true)
+    end)
+    frame.startButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -64)
+
     frame.stopButton = Button(64, "Stop", function()
         local window = GoldWindow()
         if window and window.StopTracking then
@@ -194,7 +209,7 @@ function GoldPerHourWindow:Build()
             tooltip:AddLine("Ctrl-click to throw this session away without saving.", 1, 1, 1, true)
         end
     end)
-    frame.stopButton:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -64)
+    frame.stopButton:SetPoint("LEFT", frame.startButton, "RIGHT", 4, 0)
 
     frame.pauseButton = Button(72, "Pause", function()
         local control = Control()
@@ -235,6 +250,8 @@ function GoldPerHourWindow:Draw()
     local control = Control()
     local tracking = control and control:IsTracking() or false
     local paused = control and control:IsPaused() or false
+    local sessions = PocketCFO:GetModule("ActivitySessions", true)
+    frame.startButton:SetEnabled(not (sessions and sessions:GetCurrent()))
     frame.stopButton:SetEnabled(tracking)
     frame.pauseButton:SetEnabled(tracking)
     frame.pauseButton:SetText(paused and "Resume" or "Pause")

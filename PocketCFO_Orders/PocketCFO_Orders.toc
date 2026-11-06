@@ -2,7 +2,7 @@
 ## Title: PocketCFO Orders
 ## Notes: Order tracking and order results.
 ## Author: MerchantClassGaming
-## Version: v1.2.1
+## Version: v1.2.2
 ## LoadOnDemand: 1
 ## Dependencies: PocketCFO
 ## SavedVariables: PocketCFO_Orders_DB

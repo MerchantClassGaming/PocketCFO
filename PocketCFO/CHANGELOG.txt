@@ -1,39 +1,16 @@
-NEW: Gold per Hour
-- New Gold per Hour tab in the Gold window. It answers "what should I go do for the next hour to make the most gold?"
-- Gathering (Herbalism, Mining, Skinning), Fishing and Grand Beasts lure runs are tracked automatically. No buttons, no slash commands. Just go gather and the run starts on its own. Breaks are trimmed out so a bio break doesn't wreck your rate.
-- "Best use of your time" ranks every activity by gold per hour across all your characters for the last 30 days, using today's prices so old runs at old prices don't mislead you.
-- Grand Beasts runs count from the moment you place the lure, include the kill and skin, and subtract the lure's cost to make. Skinning a beast someone else summoned costs you nothing.
-- Dungeons, raids and delves are tracked automatically as their own sessions.
-- Custom sessions: hit Start session, give it a name and track anything you want (mob farming, world quests, crafting orders, a dungeon farm). Sessions count gold earned and spent, items you pick up, currencies like Moxie, and containers you open. If you sell something during the session, it counts at what you actually sold it for.
-- Stop or Pause any session. Logging out ends your session. A disconnect picks it back up when you return.
-- Right-click a custom session to rename it. Ctrl-click any session row to delete it.
-- Use the gear icon to hide activities you don't care about (like delves you only run for gear). Tracking keeps going in the background.
-- Optional small live tracker window shows your current run or session.
-- New minimap button. Hover to see your current run, left-click for Gold per Hour, right-click for the Gold window.
+Forever and Retail
+Aligned tooltip for vendor, auction value, and disenchant value so they are easier to read
 
-NEW: Spending
-- New Spending tab in the Gold window: repairs, vendor purchases, AH purchases, AH deposits, training, flight paths, mail and more.
-- Income and Spending both show Earned / Spent / Net for the period you pick.
-- Personal spending: right-click a big purchase like a mount or toy and mark it as personal. It comes out of your earnings and spending numbers and shows on its own line, so one 5 million gold mount doesn't flatten 30 days of charts. Right-click again to put it back.
+Fixed a bug where sometimes an item sold by vendors would overstate its valuation if a vendor sold it for more than current AH listings.
 
-Gold tracking improvements
-- Looted gold and quest rewards are now separate lines.
-- Auction House income is now grouped by item type (Gear, Crafting materials, Consumables, Item enhancements, Recipes, Collectibles, Other), with the items listed under each group. If you flip gear, a Flipped breakout shows up.
-- Character list button in the Gold window. Uncheck a character to hide them from every view, or Ctrl-click to remove them.
-- Settings button in the Gold window.
-- Gold from mobs, containers and quests now lands in the right bucket instead of Unknown.
-- The Gathering tab has been replaced by Gold per Hour.
+Adjusted rounding of gold amounts to use the biggest 2 coin amounts. In other words, a value that has gold will cut off the copper where smaller amounts will show silver/copper.
 
-NEW: Disenchant and vendor values in tooltips
-- Item tooltips now show a Disenchant (Estimated) value and a Vendor value next to the PocketCFO value. Whichever is highest shows in green.
-- Disenchant estimates come from your own disenchants, so they get more accurate the more you disenchant. Every character that disenchants builds its own numbers.
+Added a Start Session button to the small, standalone gold per hour tracker window. This does the same thing as the Start Session button in the main gold window.
 
-Containers
-- Any container you open (caches, payout bags, surplus bags, bottles) is recorded, and its tooltip value is based on its average contents, including gold.
-- Fixed spam-clicking a bag counting as several openings.
-- Fixed War Within and Midnight payout bags mixing their contents.
-- Bound items from containers are valued at their vendor price.
-- Updated container data.
+Custom gold tracking sessions keep running through a logout or a reload.
 
-Valuation
-- Gray items are now valued at their vendor sell price only, never AH listings.
+You will get a “Still gathering?” prompt after 3 minutes with no gather on an automatic gathering run.
+
+Retail Only
+Adjusted custom craft analysis for Inscription reagents. These now show live recipe analysis like most recipes do.
+

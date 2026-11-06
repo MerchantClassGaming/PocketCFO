@@ -43,34 +43,36 @@ local EQUIP = Rules.EQUIP    -- luacheck: ignore
 -- ─── Market depth by rarity (stackables) ──────────────────────────────────
 -- How many of the cheapest units (after bait/clown filtering) the AH price
 -- is taken from. Rarer items have thinner markets. Brian, 2026-10-12.
+-- Cut from 200/100/25/5 to 50/20/10/2 so thin bottom ends do not pull the
+-- sample up the price ladder (Brian, 2026-11-05).
 -- Takes effect as items are rescanned or searched.
 
 Rules:Add({
     id = "depth-common",
-    note = "White stackables: sample the cheapest 200",
+    note = "White stackables: sample the cheapest 50",
     match = { isStackable = true, rarity = R.Common },
-    market = { depth = 200 },
+    market = { depth = 50 },
 })
 
 Rules:Add({
     id = "depth-uncommon",
-    note = "Green stackables: sample the cheapest 100",
+    note = "Green stackables: sample the cheapest 20",
     match = { isStackable = true, rarity = R.Uncommon },
-    market = { depth = 100 },
+    market = { depth = 20 },
 })
 
 Rules:Add({
     id = "depth-rare",
-    note = "Blue stackables: sample the cheapest 25",
+    note = "Blue stackables: sample the cheapest 10",
     match = { isStackable = true, rarity = R.Rare },
-    market = { depth = 25 },
+    market = { depth = 10 },
 })
 
 Rules:Add({
     id = "depth-epic",
-    note = "Purple stackables: sample the cheapest 5",
+    note = "Purple stackables: sample the cheapest 2",
     match = { isStackable = true, rarity = R.Epic },
-    market = { depth = 5 },
+    market = { depth = 2 },
 })
 
 -- ─── Gray items: vendor price only (Brian, 2026-10-28) ─────────────────────
@@ -110,6 +112,23 @@ Rules:Add({
 -- quality). Applies at lookup time, so the cached AH price stays as
 -- observed and the cap always uses the siblings' current values.
 
+-- The lowest "never worth more than a better version" cap a rule worked
+-- out, kept on the result even when it didn't change the value (the item's
+-- own price was already lower). Smart posting uses it as the most an item
+-- posts at (Brian, 2026-11-04: green rod's ladder cap was ~369g from the
+-- blues, but its own 350g price hid it, and posting matched a 2,547g green).
+-- Adds a field only; no value changes.
+local function NoteCap(ctx, cap)
+    cap = tonumber(cap)
+    local result = ctx and ctx.result
+    if not cap or type(result) ~= "table" then
+        return
+    end
+    if not result.ladderCap or cap < result.ladderCap then
+        result.ladderCap = cap
+    end
+end
+
 Rules:Add({
     id = "quality-sibling-cap",
     note = "Never worth more than a higher quality of the same item",
@@ -140,6 +159,7 @@ Rules:Add({
                 cap = tonumber(value)
             end
             if cap then
+                NoteCap(ctx, cap)
                 ctx:Cap(cap, string.format("Capped at the quality %s price", tostring(tier or "?")))
             end
         end
@@ -370,6 +390,7 @@ Rules:Add({
             end
         end
 
+        NoteCap(ctx, lowestCap)
         local ownCurrent = OwnCurrentPrice(RowsFor(itemID), itemID, quality, stats, cutoff)
         local target, note
         if ownCurrent and (not lowestCap or ownCurrent <= lowestCap) then
