@@ -902,26 +902,43 @@ end
 
 -- Gathering professions a character has (2026-10-31, Brian: the Gold per
 -- Hour "By profession" breakout goes by what the character has, not what a
--- run happened to find). Keys in GATHER_LABELS order: every gathering
--- profession seen in that character's gathering runs, plus the professions
--- saved for it at its last login (db.professions[guid], SaveGatheringProfessions).
+-- run happened to find). Keys in GATHER_LABELS order.
+-- 2026-11-06 (Brian: a dropped profession must not stay in the character's
+-- label): the professions saved at its last login (db.professions[guid],
+-- SaveGatheringProfessions) are what it has. Only when nothing is saved for
+-- it (never logged in since, or the login read found nothing) does this fall
+-- back to the professions seen in its gathering runs.
+-- Dropped professions: GetDroppedGatheringProfessions.
+local function NoteGatheringParts(seen, run)
+    if run and (run.activity or "gathering") == "gathering" then
+        for partKey in pairs(run.parts or {}) do
+            seen[partKey] = true
+        end
+    end
+end
+
+local function SavedGatheringProfessions(db, characterGUID)
+    local saved = db and db.professions[characterGUID or ""]
+    if saved and #saved > 0 then
+        return saved
+    end
+    return nil
+end
+
 function ActivityRuns:GetGatheringProfessions(characterGUID)
     local db = RunsDB()
     local seen = {}
-    local function Note(run)
-        if run and (run.activity or "gathering") == "gathering" then
-            for partKey in pairs(run.parts or {}) do
-                seen[partKey] = true
-            end
+    local saved = SavedGatheringProfessions(db, characterGUID)
+    if saved then
+        for _, key in ipairs(saved) do
+            seen[key] = true
         end
-    end
-    local entry = db and db.history[characterGUID]
-    for _, run in ipairs(entry and entry.runs or {}) do
-        Note(run)
-    end
-    Note(db and db.current[characterGUID])
-    for _, key in ipairs(db and db.professions[characterGUID or ""] or {}) do
-        seen[key] = true
+    else
+        local entry = db and db.history[characterGUID]
+        for _, run in ipairs(entry and entry.runs or {}) do
+            NoteGatheringParts(seen, run)
+        end
+        NoteGatheringParts(seen, db and db.current[characterGUID])
     end
     local keys = {}
     for _, gather in ipairs(GATHER_LABELS) do
@@ -930,6 +947,45 @@ function ActivityRuns:GetGatheringProfessions(characterGUID)
         end
     end
     return keys
+end
+
+-- Gathering professions in a character's runs that it no longer has
+-- (2026-11-06, Brian: dropped skinning gets its own "Skinning (dropped)" row
+-- in Gold per Hour). Set of profession keys; empty when nothing is saved for
+-- the character at login (then nothing can be called dropped).
+function ActivityRuns:GetDroppedGatheringProfessions(characterGUID)
+    local db = RunsDB()
+    local dropped = {}
+    local saved = SavedGatheringProfessions(db, characterGUID)
+    if not saved then
+        return dropped
+    end
+    local has = {}
+    for _, key in ipairs(saved) do
+        has[key] = true
+    end
+    local seen = {}
+    local entry = db.history[characterGUID]
+    for _, run in ipairs(entry and entry.runs or {}) do
+        NoteGatheringParts(seen, run)
+    end
+    NoteGatheringParts(seen, db.current[characterGUID])
+    for _, gather in ipairs(GATHER_LABELS) do
+        if seen[gather.key] and not has[gather.key] then
+            dropped[gather.key] = true
+        end
+    end
+    return dropped
+end
+
+-- Player-facing name of one gathering profession key ("Herbs", "Skinning").
+function ActivityRuns:GetGatheringLabel(professionKey)
+    for _, gather in ipairs(GATHER_LABELS) do
+        if gather.key == professionKey then
+            return gather.label
+        end
+    end
+    return tostring(professionKey)
 end
 
 -- Saves the logged-in character's gathering professions (GetProfessions ->

@@ -149,6 +149,33 @@ function AdjustmentStore:ClearForLocation(ownerKey, location, reason)
     return cleared
 end
 
+-- Cleared adjustments are only history: nothing reads them (inventory uses
+-- active ones; duplicate protection uses appliedAHMailboxReconciliations).
+-- Drop those cleared more than `days` ago (Brian, 2026-11-07: 8,330 of
+-- 8,387 were cleared, ~12 MB). Active ones are never touched. Returns the
+-- number dropped.
+function AdjustmentStore:PruneCleared(days)
+    local root = GetRoot()
+    if not root or type(root.adjustments) ~= "table" then
+        return 0
+    end
+    local now = (PocketCFO and PocketCFO.Now and PocketCFO:Now()) or time()
+    local cutoff = now - (tonumber(days) or 7) * 86400
+    local kept, dropped = {}, 0
+    for _, adjustment in ipairs(root.adjustments) do
+        local clearedAt = tonumber(adjustment.clearedAt or adjustment.createdAt) or 0
+        if adjustment.active == false and clearedAt < cutoff then
+            dropped = dropped + 1
+        else
+            kept[#kept + 1] = adjustment
+        end
+    end
+    if dropped > 0 then
+        root.adjustments = kept
+    end
+    return dropped
+end
+
 function AdjustmentStore:List(options)
     local root = GetRoot()
     local rows = root and root.adjustments or {}

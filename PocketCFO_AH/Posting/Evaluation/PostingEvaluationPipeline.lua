@@ -341,6 +341,58 @@ local function AttachCanonicalResult(row, result, matchAnalysis)
     return result
 end
 
+-- Smart view (Brian, 2026-11-07): the max must come from the same PCFO
+-- Value the item tooltip shows. Bounds were worked out when the list was
+-- built, before this row's AH search; the search then updates the price
+-- cache (SearchRefresh), so the tooltip moved on and the max didn't. Feed
+-- the search into the price cache here (the order SearchRefresh and this
+-- lookup get the search event in isn't guaranteed), then work the bounds
+-- out again. Rows without bounds (rules view) are left alone.
+local function RefreshSmartBounds(row, auctions)
+    local rule = row and row.resolvedRule
+    if type(rule) ~= "table" or type(rule.bounds) ~= "table" or not row.candidate then
+        return
+    end
+    local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+    if not smart or type(smart.GetBounds) ~= "function" then
+        return
+    end
+    local valuation = _G.PocketCFO_Valuation
+    local refresh = valuation and valuation.GetModule and valuation:GetModule("SearchRefresh", true)
+    if refresh then
+        if row.target and row.target.postAPI == "PostCommodity" then
+            local itemID = tonumber(row.candidate.itemID or row.target.targetItemID)
+            if itemID and type(refresh.ProcessCommodityResults) == "function" then
+                pcall(refresh.ProcessCommodityResults, refresh, itemID)
+            end
+        elseif type(refresh.ProcessItemResults) == "function" then
+            -- Theoretical: each result row's itemKey is the key that was
+            -- searched (one search per item key).
+            local seen = {}
+            for _, auction in ipairs(auctions or {}) do
+                local itemKey = auction and auction.rawRow and auction.rawRow.itemKey
+                if type(itemKey) == "table" then
+                    local token = table.concat({
+                        tostring(itemKey.itemID), tostring(itemKey.itemLevel),
+                        tostring(itemKey.itemSuffix), tostring(itemKey.battlePetSpeciesID),
+                    }, ":")
+                    if not seen[token] then
+                        seen[token] = true
+                        pcall(refresh.ProcessItemResults, refresh, itemKey)
+                    end
+                end
+            end
+        end
+    end
+    local ok, bounds = pcall(smart.GetBounds, smart, row.candidate)
+    if ok and type(bounds) == "table" then
+        rule.bounds = bounds
+        -- Same fields the queue sets when it builds the row.
+        rule.minPrice = bounds.floor
+        rule.maxPrice = bounds.ceiling
+    end
+end
+
 local function SortEvaluatedRows(rows)
     local buckets = {
         {},
@@ -349,26 +401,30 @@ local function SortEvaluatedRows(rows)
         {},
         {},
         {},
+        {},
     }
 
-    -- Smart view groups (Brian, 2026-11-04): Ready to post; Your call (Needs
-    -- Price, errors, then Too Cheap); Probably not (Listed, Skipped, Posted).
-    -- The rules view keeps Posted above Skipped as before.
+    -- Smart view groups (Brian, 2026-11-04, 2026-11-06): Ready to post;
+    -- Check the price (Ready with evaluation.check, until the player types a
+    -- price); Your call (Needs Price, errors, then Too Cheap); Probably not
+    -- (Listed, Skipped, Posted). The rules view keeps Posted above Skipped.
     local function GetSortBucket(row)
         local status = row and row.evaluation and row.evaluation.status or row and row.status
         local smart = row and row.resolvedRule and row.resolvedRule.smart == true
         if status == "Ready" then
-            return 1
+            local check = row.evaluation and row.evaluation.check == true
+                and not (row.overrides and row.overrides.price)
+            return check and 2 or 1
         elseif status == "Too Cheap" then
-            return 3
-        elseif status == "Listed" then
             return 4
+        elseif status == "Listed" then
+            return 5
         elseif status == "Posted" then
-            return smart and 6 or 5
+            return smart and 7 or 6
         elseif status == "Skipped" then
-            return smart and 5 or 6
+            return smart and 6 or 7
         end
-        return 2
+        return 3
     end
 
     for _, row in ipairs(rows or {}) do
@@ -416,6 +472,10 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
         SortEvaluatedRows(controller.rows)
         controller:NotifyQueueChanged("complete")
         SessionLog("PostingController: evaluation complete rows=%d", #(controller.rows or {}))
+        -- Smart view: re-check once if mat prices were still loading.
+        if type(controller.RetryLoadingPrices) == "function" then
+            pcall(controller.RetryLoadingPrices, controller)
+        end
         return
     end
 
@@ -457,6 +517,8 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
             return
         end
 
+        RefreshSmartBounds(row, auctions)
+
         local ownedIDs, ownedAuctionMapCount = BuildOwnedAuctionIDSet()
         local annotatedCount = AnnotateAuctionsWithOwnership(auctions, ownedIDs, row)
         SessionLog("PostingEvaluationPipeline: ownership annotation ownedInMap=%d annotatedInResults=%d", ownedAuctionMapCount, annotatedCount)
@@ -471,7 +533,12 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
             targetIdentity = matchAnalysis.targetIdentity,
             auctionPath = row.target and row.target.postAPI == "PostCommodity" and "commodity" or "item",
         })
-        local evaluationContext = { marketLadder = ladderResult }
+        local evaluationContext = {
+            marketLadder = ladderResult,
+            -- Search sent but never answered (timeout): the evaluator must
+            -- not treat "no rows" as "nobody is listing" (2026-11-06).
+            lookupIncomplete = type(lookupMeta) == "table" and lookupMeta.completed == false or nil,
+        }
         local result = AttachCanonicalResult(row, evaluator:Evaluate(row, matchedAuctions, marketSettings, evaluationContext), matchAnalysis)
         row.matchDebug = BuildMatchDebugReport(row, matchAnalysis, lookupMeta or {}, result, marketSettings)
         local coverageDebug = result and result.debug or {}

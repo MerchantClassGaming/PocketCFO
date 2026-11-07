@@ -5,6 +5,10 @@ local PocketCFO_AH = _G.PocketCFO_AH
 
 local PostingEvaluator = {}
 
+-- Smart view: a cheapest listing up to this much above the max is matched,
+-- not undercut (Brian, 2026-11-07).
+local NEAR_MAX_MATCH = 1.10
+
 local function NumberOrNil(value)
     value = tonumber(value)
     if value ~= nil then
@@ -210,7 +214,7 @@ local function DropCheapGearListings(entries, marketValue, capPrice, goodPrice)
     return kept, ignoredPrice, start - 1, keptForCost
 end
 
-local function EvaluateSmart(row, rule, ladderResult, marketSettings)
+local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluationContext)
     local bounds = type(rule.bounds) == "table" and rule.bounds or {}
     local floor = NumberOrNil(rule.minPrice)
     if floor and floor <= 0 then
@@ -260,9 +264,48 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings)
         return Result(false, nil, "Skipped: none left to post.")
     end
 
+    -- Craftable but no Cost to Make yet (SmartPricing bounds.needsRecipe):
+    -- no safe lowest price, so don't post (Brian, 2026-11-06). "Needs Price"
+    -- keeps it bright and on top; typing a price still posts it.
+    -- "ours": one of our characters can open the recipe. "seed": craftable,
+    -- but a mat has no price yet (often loads by the next Refresh).
+    if bounds.needsRecipe then
+        -- pricesLoading: a mat's item data was just requested; the controller
+        -- re-checks once by itself (2026-11-06).
+        local note = bounds.needsRecipe == "ours" and "Open the recipe once, then Refresh."
+            or "Can't price its materials yet. Refresh, or type a price."
+        -- After its one automatic re-check (row.loadingRetried) a row that
+        -- still can't load says what to do instead.
+        if bounds.pricesLoading and not row.loadingRetried then
+            note = "Loading prices..."
+        elseif bounds.pricesLoading then
+            note = "Prices didn't load. Refresh, or type a price."
+        end
+        local result = Result(false, nil, note)
+        result.suggestedPrice = nil
+        result.status = "Needs Price"
+        return result
+    end
+
     local entries = LadderEntries(ladderResult)
     debug.pricedAuctionCount = #entries
     debug.cheapestMatchedAuctions = BuildCheapestDebug(entries, 5)
+
+    -- The AH search didn't finish (timed out, usually when many searches run
+    -- back to back) and returned nothing: we don't know who's listing, so
+    -- never price it as "No other listings" (Brian, 2026-11-06: a Hide
+    -- Seeker's Pack listed at 3,957g was missed and the row posted at 2x
+    -- our last sale). The controller re-checks the row once by itself.
+    local context = type(evaluationContext) == "table" and evaluationContext or {}
+    if context.lookupIncomplete and #entries == 0 then
+        local note = row.searchRetried and "Couldn't check the AH. Refresh to try again."
+            or "Couldn't check the AH yet. Checking again..."
+        local result = Result(false, nil, note)
+        result.suggestedPrice = nil
+        result.status = "Needs Price"
+        result.searchIncomplete = true
+        return result
+    end
 
     local validAuctions, ignoredPrice, keptForCost
     if isVariant then
@@ -298,16 +341,47 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings)
     end
 
     if #validAuctions == 0 then
-        -- Nobody else listing (Brian, 2026-11-04): only price from real
-        -- evidence. Our own sale -> 2x it; a value we're confident in ->
-        -- that value; otherwise don't guess.
+        -- Nobody else listing (Brian, 2026-11-04): price from evidence only.
+        -- A value we're confident in -> Ready. Prices we picked ourselves
+        -- (2x our last sale, a value from few listings) -> Ready with
+        -- check = true: the "Check the price" group (Brian, 2026-11-06).
+        -- Nothing to go on -> Needs Price.
+        -- First: a listing with a similar stat (same stat group, same
+        -- quality and item level; SmartPricing bounds.groupPrice) is what a
+        -- buyer compares with, so match it (Brian, 2026-11-06). Below the
+        -- floor it's ignored (never a reason to skip), above the max it's
+        -- the max. Check the price.
+        local groupPrice = NumberOrNil(bounds.groupPrice)
+        if groupPrice and groupPrice > 0 and not (floor and groupPrice < floor) then
+            local price, note = groupPrice, "No other listings for this stat. Matched a similar stat (" .. Gold(groupPrice) .. ")."
+            if ceiling and ceiling > 0 and groupPrice > ceiling then
+                price = ceiling
+                note = "No other listings for this stat. A similar stat is listed higher (" .. Gold(groupPrice) .. "). Priced at the max."
+            end
+            local result = Result(true, price, note .. dealNote)
+            result.check = true
+            return result
+        end
         if bounds.ceilingBase == "sale" and ceiling and ceiling > 0 then
-            return Result(true, ceiling, "No one else selling. 2x your last sale." .. dealNote)
+            local result = Result(true, ceiling, "No other listings. 2x your last sale." .. dealNote)
+            result.check = true
+            return result
         end
         local valuePrice = NumberOrNil(bounds.valuePrice)
         if valuePrice and valuePrice > 0 then
             local why = bounds.ceilingBase == "rule" and "Priced below the better version." or "Priced at its value."
-            return Result(true, valuePrice, "No one else selling. " .. why .. dealNote)
+            if bounds.ceilingAtFloor then
+                why = "Its value is under the lowest we'd post, so priced there."
+            end
+            return Result(true, valuePrice, "No other listings. " .. why .. dealNote)
+        end
+        local checkPrice = NumberOrNil(bounds.checkPrice)
+        if checkPrice and checkPrice > 0 then
+            local note = bounds.valueAtFloor and "No other listings. Few listings seen, and the value is under the lowest we'd post, so priced there."
+                or "No other listings. Based on few listings, check the price."
+            local result = Result(true, checkPrice, note .. dealNote)
+            result.check = true
+            return result
         end
         -- No starting price here: the floor (vendor / cost) isn't a price
         -- suggestion when we know nothing about the market (Brian, 2026-11-04).
@@ -352,13 +426,37 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings)
         -- "Too Cheap" (Your call): some players post anyway to free bag space.
         local result = Result(false, nil, BelowFloorNote(bounds) .. dealNote, lowestAuction)
         result.status = "Too Cheap"
+        -- No starting price (Brian, 2026-11-06): the floor is a price that
+        -- won't sell when others list far below it, and what to do here is
+        -- the player's call (dump at the lowest, buy the cheap ones and
+        -- relist, or hold). Price stays blank; typing one still posts.
+        result.suggestedPrice = nil
         return result
     end
+    -- Never undercut over a small gap (Brian, 2026-11-07): the max is there
+    -- to keep us off clown prices, not to shave a silver off a normal one.
+    -- Cheapest listing within 10% above the max -> match it. Not for a
+    -- better-version cap ("rule"): we never post above a better version.
+    if ceiling and ceiling > 0 and lowestPrice > ceiling
+        and bounds.ceilingBase ~= "rule"
+        and lowestPrice <= ceiling * NEAR_MAX_MATCH then
+        return Result(true, lowestPrice, "Matched lowest price." .. dealNote, lowestAuction)
+    end
     if ceiling and ceiling > 0 and lowestPrice > ceiling then
+        -- Nobody is listed at the max: we picked it (check, 2026-11-06).
+        local note = "Others listed far higher. Priced at the max."
         if bounds.ceilingBase == "rule" then
-            return Result(true, ceiling, "Priced below the better version." .. dealNote, lowestAuction)
+            note = "Priced below the better version."
+        elseif bounds.ceilingBase == "value" or bounds.ceilingBase == "market"
+            or bounds.ceilingBase == "pastmarket" or bounds.ceilingBase == "lowvalue" then
+            note = "Others listed above its value. Priced at its value."
         end
-        return Result(true, ceiling, "Priced at the max (others are too high)." .. dealNote, lowestAuction)
+        if bounds.ceilingAtFloor then
+            note = "Others listed higher. Priced at the lowest we'd post."
+        end
+        local result = Result(true, ceiling, note .. dealNote, lowestAuction)
+        result.check = true
+        return result
     end
     return Result(true, lowestPrice, "Matched lowest price." .. dealNote, lowestAuction)
 end
@@ -370,7 +468,7 @@ function PostingEvaluator:Evaluate(row, matchedAuctions, marketSettings, evaluat
 
     local rule = type(row.resolvedRule) == "table" and row.resolvedRule or {}
     if rule.smart then
-        return EvaluateSmart(row, rule, ladderResult, marketSettings)
+        return EvaluateSmart(row, rule, ladderResult, marketSettings, evaluationContext)
     end
     local maxToPost = PositiveQuantity(rule.maxToPost or rule.targetPosted)
     local inBags = PositiveQuantity(row.inBags or row.bagQuantity or row.quantity)

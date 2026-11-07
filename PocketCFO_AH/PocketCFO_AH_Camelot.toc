@@ -3,7 +3,7 @@
 ## Title: PocketCFO AH
 ## Notes: Auction House scanner and listing reconciler - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.2.2
+## Version: v1.2.3
 ## SavedVariables: PocketCFO_AH_DB
 ## LoadOnDemand: 1
 ## LoadWith: Blizzard_AuctionHouseUI
@@ -13,6 +13,7 @@
 
 ## Libraries
 ..\PocketCFO\Libs\LibStub\LibStub.lua
+..\PocketCFO\Libs\LibAHTab\LibAHTab.lua
 ..\PocketCFO\Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
 ..\PocketCFO\Libs\AceAddon-3.0\AceAddon-3.0.lua
 ..\PocketCFO\Libs\AceEvent-3.0\AceEvent-3.0.lua

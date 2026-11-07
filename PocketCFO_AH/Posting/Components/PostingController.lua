@@ -367,6 +367,10 @@ function PostingController:ApplyEvaluation(row, result)
     -- clears any in-place overrides.
     row.evaluation.suggestedPrice = result and result.suggestedPrice or nil
     row.evaluation.suggestedQuantity = result and result.suggestedQuantity or nil
+    -- Smart view: a price we picked ourselves; "Check the price" group.
+    row.evaluation.check = result and result.check == true or nil
+    -- Smart view: the AH search didn't finish; re-checked once (RetryLoadingPrices).
+    row.evaluation.searchIncomplete = result and result.searchIncomplete == true or nil
     row.overrides = nil
     row.smartEvaluation = nil
     row.posting.postedCount = 0
@@ -484,19 +488,19 @@ function PostingController:ApplyOverride(row, field, value)
 
     local hasPrice = tonumber(row.evaluation.price) ~= nil and tonumber(row.evaluation.price) > 0
     if row.overrides.price or row.overrides.quantity then
-        -- An override on a skipped row un-skips it once it has a price.
-        if hasPrice then
-            if PositiveQuantity(row.evaluation.toPost) <= 0 then
-                -- One stack by default (1 if it doesn't stack).
-                local stackSize = PositiveQuantity(row.resolvedRule and row.resolvedRule.bounds
-                    and row.resolvedRule.bounds.stackSize)
-                row.evaluation.toPost = PositiveQuantity(row.evaluation.suggestedQuantity) > 0
-                    and row.evaluation.suggestedQuantity
-                    or math.min(inBags, stackSize > 0 and stackSize or 1)
-            end
+        -- An override un-skips a row once it has a price and a Post Now.
+        -- Post Now is the one shown on the row: the starting Post Now, never
+        -- a made-up quantity. Post Now 0 stays put (Brian, 2026-11-06).
+        if hasPrice and PositiveQuantity(row.evaluation.toPost) <= 0 then
+            row.evaluation.toPost = PositiveQuantity(row.evaluation.suggestedQuantity)
+        end
+        if hasPrice and PositiveQuantity(row.evaluation.toPost) > 0 then
             row.evaluation.status = "Ready"
-            row.evaluation.shouldPost = PositiveQuantity(row.evaluation.toPost) > 0
+            row.evaluation.shouldPost = true
             row.userSkipped = nil
+        else
+            row.evaluation.status = smartEval.status
+            row.evaluation.shouldPost = smartEval.shouldPost
         end
     else
         row.evaluation.status = smartEval.status
@@ -506,6 +510,8 @@ function PostingController:ApplyOverride(row, field, value)
 
     if not hasPrice and (row.overrides.quantity) then
         row.evaluation.note = "Type a price to post."
+    elseif hasPrice and row.overrides.price and PositiveQuantity(row.evaluation.toPost) <= 0 then
+        row.evaluation.note = (OverrideNote(row) or "Your price.") .. " Type in Post Now to post."
     else
         row.evaluation.note = OverrideNote(row) or smartEval.note
     end
@@ -515,6 +521,13 @@ function PostingController:ApplyOverride(row, field, value)
 
     row.posting.remainingToPost = math.max(0, PositiveQuantity(row.evaluation.toPost) - PositiveQuantity(row.posting.postedCount))
     ApplyEvaluationAliases(row)
+    -- A row that changed status moves to its group (e.g. a typed price puts
+    -- it in Ready to post) instead of splitting the group it was in (Brian,
+    -- 2026-11-06). Stable sort: it lands at the bottom of its new group.
+    local evalService = PocketCFO_AH:GetModule("PostingEvaluationPipeline", true)
+    if evalService and evalService.SortRows then
+        evalService:SortRows(self.rows)
+    end
     self:NotifyQueueChanged("override")
     return true
 end
@@ -770,7 +783,44 @@ function PostingController:PrepareQueueSilent(reason)
         tostring(reason or "unknown"), #(self.rows or {}))
 end
 
+-- Smart view (Brian, 2026-11-06): before building the list, wait for mat
+-- data still loading (SmartPricing:PrewarmMats), at most PREWARM_MAX_SECONDS,
+-- so Cost to Make estimates work on the first pass. "Preparing possible
+-- auctions..." stays up meanwhile. One wait per open (prewarmDone).
+local PREWARM_MAX_SECONDS = 5
+local PREWARM_POLL_SECONDS = 0.25
+
 function PostingController:OpenPostAuctions(reason)
+    if not self.queuePrepared and not self.prewarmDone and C_Timer and C_Timer.After then
+        local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+        local okWait, waiting = false, false
+        if smart and smart.PrewarmMats and smart:IsSmartView() then
+            okWait, waiting = pcall(smart.PrewarmMats, smart)
+        end
+        if okWait and waiting then
+            self.prewarmDone = true
+            local started = GetTime and GetTime() or 0
+            SessionLog("PostingController: waiting for mat data before building the list reason=%s", tostring(reason))
+            local function Poll()
+                if not (_G.AuctionHouseFrame and _G.AuctionHouseFrame:IsShown()) then
+                    self.prewarmDone = nil
+                    return
+                end
+                local now = GetTime and GetTime() or started
+                local okLoading, loading = pcall(smart.IsPrewarming, smart)
+                if okLoading and loading and now - started < PREWARM_MAX_SECONDS then
+                    C_Timer.After(PREWARM_POLL_SECONDS, Poll)
+                    return
+                end
+                SessionLog("PostingController: mat data wait done after %.1fs (still loading=%s)",
+                    now - started, tostring(okLoading and loading))
+                self:OpenPostAuctions(reason)
+            end
+            C_Timer.After(PREWARM_POLL_SECONDS, Poll)
+            return self.rows
+        end
+    end
+    self.prewarmDone = nil
     if not self.queuePrepared then
         self:BuildInitialQueue()
     end
@@ -820,6 +870,87 @@ end
 function PostingController:Refresh()
     self:ResetPostingWorkflowState("refresh")
     return self:OpenPostAuctions("refresh")
+end
+
+-- Smart view (Brian, 2026-11-06): after /reload the client hasn't loaded
+-- mats yet, so the first pass can't estimate Cost to Make ("Loading
+-- prices..."); SmartPricing asked for the item data. A moment later, re-check
+-- ONLY those rows (new bounds, re-evaluated), not the whole list. Each row is
+-- re-checked at most once per list build (row.loadingRetried), so it can
+-- never loop: a mat that still hasn't loaded leaves the row on
+-- "Loading prices..." until the player clicks Refresh. Never while the
+-- player has typed anything, while posting, or with the AH closed.
+-- (First version refreshed the whole list on a 30s timer and looped on
+-- bags whose pass took longer than 30s.)
+local LOADING_RETRY_DELAY = 1.5
+
+local function HasOverrides(rows)
+    for _, row in ipairs(rows or {}) do
+        if row.overrides and next(row.overrides) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+local function LoadingRows(rows)
+    local list = {}
+    for _, row in ipairs(rows or {}) do
+        local bounds = row.resolvedRule and row.resolvedRule.bounds
+        local loading = bounds and bounds.pricesLoading and not row.loadingRetried
+        -- Same one-time re-check for a row whose AH search didn't finish.
+        local searchFailed = row.evaluation and row.evaluation.searchIncomplete and not row.searchRetried
+        if (loading or searchFailed) and row.candidate then
+            list[#list + 1] = row
+        end
+    end
+    return list
+end
+
+function PostingController:RetryLoadingPrices()
+    if #LoadingRows(self.rows) == 0 or not (C_Timer and C_Timer.After) then
+        return
+    end
+    local generation = self.generation
+    C_Timer.After(LOADING_RETRY_DELAY, function()
+        if self.generation ~= generation then
+            return
+        end
+        if not (_G.AuctionHouseFrame and _G.AuctionHouseFrame:IsShown()) then
+            return
+        end
+        if self:IsEvaluationInProgress() or self:IsPostingInProgress() or HasOverrides(self.rows) then
+            return
+        end
+        local smart = PocketCFO_AH:GetModule("SmartPricing", true)
+        if not smart then
+            return
+        end
+        local rows = LoadingRows(self.rows)
+        if #rows == 0 then
+            return
+        end
+        for _, row in ipairs(rows) do
+            row.loadingRetried = true
+            if row.evaluation and row.evaluation.searchIncomplete then
+                row.searchRetried = true
+            end
+            local bounds = smart:GetBounds(row.candidate)
+            row.resolvedRule.bounds = bounds
+            row.resolvedRule.minPrice = tonumber(bounds.floor) or 0
+            row.resolvedRule.maxPrice = tonumber(bounds.ceiling)
+            row.evaluation.status = "Evaluating"
+            row.evaluation.note = nil
+            row.status = "Evaluating"
+            row.notes = nil
+            row.note = nil
+        end
+        SessionLog("PostingController: re-checking %d row(s) (mat prices loading or AH search unfinished)", #rows)
+        self.generation = (tonumber(self.generation) or 0) + 1
+        self.evaluating = true
+        self:NotifyQueueChanged("evaluation-started")
+        self:EvaluateRow(nil, self.generation)
+    end)
 end
 
 function PostingController:CanPostRow(row)

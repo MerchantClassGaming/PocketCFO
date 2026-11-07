@@ -150,12 +150,24 @@ function InventoryAggregator:BuildState(observations, adjustments, options)
     AddServiceObservations(state, observations)
     AddAdjustments(state, adjustments)
 
-    for _, entry in pairs(state.byConfigKey) do
-        if entry.totalQuantity < 0 then
-            entry.availableQuantity = 0
-        else
-            entry.availableQuantity = entry.totalQuantity
+    -- A location can never hold fewer than zero of an item. Floor each
+    -- location at 0 before totaling, so a stale adjustment in one location
+    -- (e.g. a sold -1 on an AH already emptied by a scan) cannot cancel out
+    -- items actually scanned in another location.
+    for configKey, entry in pairs(state.byConfigKey) do
+        local total = 0
+        for location, quantity in pairs(entry.byLocation) do
+            if quantity < 0 then
+                entry.byLocation[location] = 0
+                if state.byLocation[location] then
+                    state.byLocation[location][configKey] = 0
+                end
+                quantity = 0
+            end
+            total = total + quantity
         end
+        entry.totalQuantity = total
+        entry.availableQuantity = total
     end
 
     return state

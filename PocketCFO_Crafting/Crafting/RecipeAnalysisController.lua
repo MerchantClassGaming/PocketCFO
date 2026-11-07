@@ -94,6 +94,149 @@ local function ApplyConcentrationBaseline(recipeID, economicsResult)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Milling (Brian, 2026-11-06)
+-- ---------------------------------------------------------------------------
+-- Milling is one-to-one: each herb mills to its own pigment, and that
+-- pigment comes from nothing else. Once the herb is picked it is an ordinary
+-- recipe, so it runs through the same RecipeEconomicsService math and Recipe
+-- Analysis panel as everything else. The only milling-specific step is
+-- filling in what the crafting form can't say for a salvage-style recipe:
+--   input:  the herb slotted in the window (CraftEventCapture's live read,
+--           the same one the processing headline uses), at its quantity
+--   output: that herb's pigment and average count per mill, from your own
+--           (or starter) milling history (ProcessingAnalysisController row)
+--   Multicraft: doesn't apply to milling, so it is left off.
+-- Resourcefulness, the AH cut and Cost to Make are the shared recipe math.
+
+local MILLING_PROCESSING_TYPE = "milling"
+local PICK_HERB_TEXT = "Pick an herb to see the details."
+local NO_MILLING_HISTORY_TEXT = "No milling results for this herb yet."
+
+local function GetProcessingOperationRegistry()
+    return PocketCFO and PocketCFO.ProcessingOperationRegistry or _G.PocketCFO_ProcessingOperationRegistry
+end
+
+function RecipeAnalysisController:IsMillingRecipe(recipeID)
+    local registry = GetProcessingOperationRegistry()
+    recipeID = tonumber(recipeID)
+    local entry = registry and registry.GetEntry and recipeID and registry:GetEntry(recipeID)
+    return type(entry) == "table" and entry.processingType == MILLING_PROCESSING_TYPE
+end
+
+-- The herb slot: same pick as CraftQueueController's FindSlottedProcessingInput.
+-- Second return: every live input, so Costs is exactly what is slotted.
+local function FindSlottedHerb(recipeID)
+    local capture = PocketCFO_Crafting:GetModule("CraftEventCapture", true)
+    if not capture or not capture.GetLiveProcessingInputs then
+        return nil, nil
+    end
+    local inputs = capture:GetLiveProcessingInputs(recipeID, "MillingRecipeAnalysis")
+    inputs = type(inputs) == "table" and inputs or nil
+    local driver
+    for _, input in ipairs(inputs or {}) do
+        if type(input) == "table" and input.itemID then
+            if input.statisticalProfile == true or input.selectedCostInput == true then
+                return input, inputs
+            end
+            if not driver and input.profileDriver == true then
+                driver = input
+            end
+        end
+    end
+    return driver, inputs
+end
+
+-- The slotted herb's history row: exact quality (configKey) first, itemID
+-- only for a row with no configKey.
+local function FindHerbHistoryRow(rows, herb)
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+        if herb.configKey and row.configKey == herb.configKey then
+            return row
+        end
+    end
+    for _, row in ipairs(type(rows) == "table" and rows or {}) do
+        if not row.configKey and row.itemID == herb.itemID then
+            return row
+        end
+    end
+    return nil
+end
+
+-- The pigment and its average count per mill. One herb makes one pigment;
+-- if history ever holds more than one output, the largest is the pigment.
+local function FindPigment(row)
+    local summary = type(row) == "table" and type(row.summary) == "table" and row.summary or nil
+    if not summary or summary.unresolved then
+        return nil
+    end
+    local best
+    for _, output in ipairs(type(summary.outputValueRows) == "table" and summary.outputValueRows or {}) do
+        local quantity = tonumber(output.quantityPerRun) or 0
+        if output.itemID and quantity > 0 and (not best or quantity > best.quantity) then
+            best = { itemID = output.itemID, configKey = output.configKey, quantity = quantity }
+        end
+    end
+    return best
+end
+
+local function EvaluateMilling(recipeID, economicsService)
+    local herb, inputs = FindSlottedHerb(recipeID)
+    if not herb then
+        return nil, "noHerbSlotted"
+    end
+
+    local observationBuilder = PocketCFO_Crafting:GetModule("RecipeObservationBuilder", true)
+    local built = observationBuilder and observationBuilder:BuildCurrentRecipeObservation(recipeID)
+    if type(built) ~= "table" or built.resolved ~= true then
+        return {
+            resolved = false,
+            unresolvedReason = (type(built) == "table" and built.unresolvedReason) or "observationUnresolved",
+        }
+    end
+    local observation = built.observation
+
+    -- Input: exactly what is slotted.
+    local reagents = {}
+    for _, input in ipairs(inputs or {}) do
+        if type(input) == "table" and input.itemID then
+            reagents[#reagents + 1] = {
+                itemID = input.itemID,
+                configKey = input.configKey,
+                quantity = tonumber(input.quantity) or 0,
+            }
+        end
+    end
+    observation.reagents = reagents
+    observation.vellumRows = nil
+    observation.displayedMulticraftPct = nil
+
+    -- Output: the herb's pigment from history.
+    local processingController = PocketCFO_Crafting:GetModule("ProcessingAnalysisController", true)
+    local processingResult = processingController and processingController:EvaluateRecipe(recipeID)
+    local pigment = FindPigment(FindHerbHistoryRow(processingResult and processingResult.rows, herb))
+    observation.outputItemID = pigment and pigment.itemID or nil
+    observation.outputConfigKey = pigment and pigment.configKey or nil
+    observation.outputItemLink = nil
+    observation.baseOutputQuantity = pigment and pigment.quantity or 1
+
+    local result = economicsService:EvaluateObservation(observation)
+    result.observation = observation
+    result.noMillingHistory = pigment == nil
+
+    -- Save the pigment's mat list for Smart Posting's Cost to Make, the same
+    -- call RecipeEconomicsService:EvaluateCurrentRecipe makes for every other
+    -- recipe. Only with history (no pigment = nothing to save). Never throws.
+    local store = PocketCFO and PocketCFO.CostToMakeStore
+    if pigment and result.resolved and store and type(store.Record) == "function" then
+        store:Record(observation, result.economics)
+    end
+    SessionLog("RecipeAnalysisController: milling recipeID=%s herb=%s configKey=%s pigment=%s perMill=%s",
+        tostring(recipeID), tostring(herb.itemID), tostring(herb.configKey),
+        tostring(pigment and pigment.itemID), tostring(pigment and pigment.quantity))
+    return result
+end
+
 function RecipeAnalysisController:EvaluateRecipe(recipeID, professionID)
     local economicsService = GetEconomicsService()
     local displayBuilder = GetDisplayModelBuilder()
@@ -104,6 +247,33 @@ function RecipeAnalysisController:EvaluateRecipe(recipeID, professionID)
             rows = {},
             recipeID = recipeID,
             professionID = professionID,
+        }
+    end
+
+    if self:IsMillingRecipe(recipeID) then
+        local millingResult, millingReason = EvaluateMilling(recipeID, economicsService)
+        local displayModel
+        if millingReason == "noHerbSlotted" then
+            displayModel = { state = "prompt", promptText = PICK_HERB_TEXT }
+        else
+            displayModel = displayBuilder:Build(millingResult)
+            if millingResult and millingResult.noMillingHistory and displayModel.state == "resolved" then
+                displayModel.noPriceNote = NO_MILLING_HISTORY_TEXT
+                displayModel.outputPendingItemID = nil
+            end
+        end
+        return {
+            applicable = true,
+            reason = displayModel.state == "unavailable" and (displayModel.unresolvedReason or "recipeAnalysisUnavailable") or nil,
+            label = "Recipe Analysis",
+            recipeID = recipeID,
+            professionID = professionID,
+            rows = {},
+            hasOutputFamilies = false,
+            supportsResultsLimit = false,
+            isLiveRecipeAnalysis = true,
+            displayModel = displayModel,
+            pendingItemIDs = displayBuilder:CollectPendingItemIDs(displayModel),
         }
     end
 

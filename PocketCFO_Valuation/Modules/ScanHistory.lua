@@ -16,8 +16,9 @@
 --   lo = low days in a row, dd = today was a dump day (see dump guard)
 --
 -- A day's price: stackables = the scan's Valuation value (bait/clown
--- filtered); non-stackables = median of that market key's listings, not the
--- lowest, so one cheap listing doesn't drag the history down.
+-- filtered); non-stackables = median of that market key's listings within
+-- 3x the cheapest (clowns left out, 2026-11-06), not the lowest, so one
+-- cheap listing doesn't drag the history down.
 --
 -- Kept apart from PricingCache, which holds real AH observations only
 -- (decision 2026-10-12). Every write is wrapped in pcall by the caller path:
@@ -82,19 +83,44 @@ local function Median(values)
     return math.floor((values[count / 2] + values[count / 2 + 1]) / 2)
 end
 
+-- Gear clown cutoff (Brian, 2026-11-06): listings above this many times the
+-- cheapest are clowns and left out of the day's median. Same 3x as the
+-- stackable clown cutoff (PricingValuation UPPER_MARKET_MULTIPLIER). Found:
+-- Chef's Bright Linen Cooking Chapeau Q5, one real listing at 357g and
+-- clowns far above, recorded ~2,886g days, so history called the real
+-- 357g "far from usual".
+-- The stackable bait rule (drop the cheapest when the next is 3x higher) is
+-- NOT used for gear: with one real listing and clowns above it, it would
+-- drop the real one and keep the clowns. A real dump below the rest is
+-- handled by the dump guard below instead.
+local GEAR_CLOWN_MULTIPLIER = 3
+
 -- The day's price for one full-scan bucket (see FullScan.lua AddObservation).
 local function DayPrice(bucket, scanValue)
     if bucket.isStackable then
         return tonumber(scanValue)
     end
     local buyouts = {}
+    local cheapest
     for _, observation in ipairs(bucket.observations or {}) do
         local buyout = tonumber(observation.buyout or observation.buyoutAmount)
         if buyout and buyout > 0 then
             buyouts[#buyouts + 1] = buyout
+            if not cheapest or buyout < cheapest then
+                cheapest = buyout
+            end
         end
     end
-    return Median(buyouts)
+    if not cheapest then
+        return nil
+    end
+    local kept = {}
+    for _, buyout in ipairs(buyouts) do
+        if buyout <= cheapest * GEAR_CLOWN_MULTIPLIER then
+            kept[#kept + 1] = buyout
+        end
+    end
+    return Median(kept)
 end
 
 -- Dump guard (Brian, 2026-11-04): once an item has DUMP_MIN_DAYS of history,

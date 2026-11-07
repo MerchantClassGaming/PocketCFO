@@ -204,6 +204,38 @@ local function CurrentOwnerKey()
         or nil
 end
 
+-- Unmatched AH mail evidence can only match while the mail exists, and WoW
+-- mail lasts 30 days (Brian, 2026-11-07: 18,309 of 18,510 entries were
+-- older than that, ~37 MB). Cleared adjustments: see AdjustmentStore.
+local PENDING_EVIDENCE_DAYS = 30
+local CLEARED_ADJUSTMENT_DAYS = 7
+
+-- Drops evidence stored more than PENDING_EVIDENCE_DAYS ago, and owners
+-- left with none. byOwner: { [ownerKey] = { [evidenceKey] = row } }.
+-- Returns the number dropped.
+function InventoryStateService:PrunePendingAHMailboxEvidence(byOwner)
+    if type(byOwner) ~= "table" then
+        return 0
+    end
+    local cutoff = Now() - PENDING_EVIDENCE_DAYS * 86400
+    local dropped = 0
+    for ownerKey, rows in pairs(byOwner) do
+        if type(rows) == "table" then
+            for key, row in pairs(rows) do
+                local at = type(row) == "table" and tonumber(row.storedAt or row.timestamp) or 0
+                if at < cutoff then
+                    rows[key] = nil
+                    dropped = dropped + 1
+                end
+            end
+            if next(rows) == nil then
+                byOwner[ownerKey] = nil
+            end
+        end
+    end
+    return dropped
+end
+
 function InventoryStateService:InitializeDatabase(globalDB)
     if type(globalDB) ~= "table" then
         return {
@@ -235,6 +267,19 @@ function InventoryStateService:InitializeDatabase(globalDB)
     globalDB.inventoryStateService.appliedAHMailboxReconciliations =
         globalDB.inventoryStateService.appliedAHMailboxReconciliations or {}
     local migratedOwners, migratedRows = MigrateSnapshotRootToObservations(globalDB)
+
+    -- Saved data limits (Brian, 2026-11-07, memory): unmatched AH mail
+    -- evidence expires with the mail (30 days); cleared adjustments go after
+    -- 7 days. The old top-level evidence table gets the same limit.
+    local evidenceDropped = self:PrunePendingAHMailboxEvidence(globalDB.inventoryStateService.pendingAHMailboxEvidence)
+    if globalDB.pendingAHMailboxEvidence ~= globalDB.inventoryStateService.pendingAHMailboxEvidence then
+        evidenceDropped = evidenceDropped + self:PrunePendingAHMailboxEvidence(globalDB.pendingAHMailboxEvidence)
+    end
+    local adjustmentStore = GetAdjustmentStore()
+    local adjustmentsDropped = adjustmentStore and adjustmentStore.PruneCleared
+        and adjustmentStore:PruneCleared(CLEARED_ADJUSTMENT_DAYS) or 0
+    SessionLog("InventoryStateService: saved data trimmed - mail evidence older than %dd=%d, cleared adjustments older than %dd=%d",
+        PENDING_EVIDENCE_DAYS, evidenceDropped, CLEARED_ADJUSTMENT_DAYS, adjustmentsDropped)
 
     local snapshotOwners, snapshotRows = CountSnapshotRows(globalDB.inventorySnapshots)
     return {
@@ -567,6 +612,11 @@ function InventoryStateService:ResolvePendingAHMailboxEvidence(ownerKey, source)
         return 0
     end
     root.pendingAHMailboxEvidence = root.pendingAHMailboxEvidence or {}
+    -- Same 30-day limit after every mailbox pass, so it can't build up again.
+    self:PrunePendingAHMailboxEvidence({ [ownerKey] = root.pendingAHMailboxEvidence[ownerKey] })
+    if root.pendingAHMailboxEvidence[ownerKey] and next(root.pendingAHMailboxEvidence[ownerKey]) == nil then
+        root.pendingAHMailboxEvidence[ownerKey] = nil
+    end
     local pending = root.pendingAHMailboxEvidence[ownerKey] or {}
     local count = 0
     for _ in pairs(pending) do

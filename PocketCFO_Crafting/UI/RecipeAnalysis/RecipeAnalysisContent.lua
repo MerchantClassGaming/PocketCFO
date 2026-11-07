@@ -530,6 +530,12 @@ function RecipeAnalysisContent:Render(displayModel)
 
     if displayModel.state == "resolved" then
         self:ShowResolved(displayModel)
+    elseif displayModel.state == "prompt" then
+        -- Waiting on a choice in the crafting window (Milling: pick an herb).
+        HideAll(self)
+        self.statusText:SetText(tostring(displayModel.promptText or ""))
+        SetColor(self.statusText, COLOR_MUTED)
+        self.statusText:Show()
     else
         self:ShowUnavailable()
     end

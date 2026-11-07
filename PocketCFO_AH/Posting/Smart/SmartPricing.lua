@@ -5,11 +5,12 @@
 --
 -- Floor   = highest of today's Cost to Make, vendor sell price, disenchant
 --           value, x 1.10 (covers the 5% AH cut plus a small profit).
--- Ceiling = the most we post at, first that exists: 2x our last sale (real
---           evidence of what a buyer paid), Cost to Make x curve (market value
---           can't rein crafted items in: for gear it's the lowest buyout,
---           which can be the silly listing itself), market value x curve.
---           Never below the floor.
+-- Ceiling = the most we post at (stage 2, Brian 2026-11-06), first that
+--           applies: 1. confident market value = the max; 2. not confident:
+--           current-expansion crafted -> Cost to Make x curve, everything
+--           else -> market value (few listings or not); 3. (later) scan
+--           history, via Valuation; 4. 2x our last sale; 5. none (Your
+--           call). Lowered by Valuation's ladder cap; never below the floor.
 -- Matching the lowest real competitor, and every Note the player sees,
 -- happen in PostingEvaluator (smart branch).
 --
@@ -251,15 +252,51 @@ local function UnitValue(itemRef)
     return value, result.source, tonumber(result.unadjustedValue), result
 end
 
--- "confident" | "uncertain" for a GetItemValue result (ValuationService).
+-- "confident" | "uncertain" for a GetItemValue result (ValuationService),
+-- plus the reason (e.g. "farBelowUsual").
 local function Confidence(result)
     local valuation = _G.PocketCFO_Valuation
     local service = valuation and valuation.GetModule and valuation:GetModule("ValuationService", true)
     if not service or type(service.GetConfidence) ~= "function" then
         return "uncertain"
     end
-    local ok, level = pcall(service.GetConfidence, service, result)
-    return ok and level or "uncertain"
+    local ok, level, reason = pcall(service.GetConfidence, service, result)
+    if not ok then
+        return "uncertain"
+    end
+    return level or "uncertain", reason
+end
+
+-- True when the item comes from an expansion before the current one
+-- (GetItemInfo's expansion ID vs the client's current expansion). Unknown =
+-- false (current-expansion rules, the lower max). Theoretical: whether
+-- crafted items report their expansion correctly (2026-11-06).
+local function CurrentExpansion()
+    if type(LE_EXPANSION_LEVEL_CURRENT) == "number" then
+        return LE_EXPANSION_LEVEL_CURRENT
+    end
+    if type(GetServerExpansionLevel) == "function" then
+        local ok, level = pcall(GetServerExpansionLevel)
+        if ok and type(level) == "number" then
+            return level
+        end
+    end
+    return nil
+end
+
+local function IsPastExpansion(itemLink, itemID)
+    if type(GetItemInfo) ~= "function" then
+        return false
+    end
+    local current = CurrentExpansion()
+    if not current then
+        return false
+    end
+    local ok, expansionID = pcall(function()
+        return select(15, GetItemInfo(itemLink or itemID))
+    end)
+    expansionID = ok and tonumber(expansionID) or nil
+    return expansionID ~= nil and expansionID < current
 end
 
 local function VendorSellPrice(itemLink, itemID)
@@ -302,19 +339,112 @@ local function DisenchantValue(itemLink)
     return nil
 end
 
-local function CostToMake(configKey, itemID)
+-- Cost to Make: saved recipe at today's prices, else the recipe estimate.
+-- Both live in core CostToMakeStore (estimate moved there 2026-11-06 so
+-- Valuation can use it too; behaviour unchanged).
+-- Set when an estimate asked for item data (mat not loaded yet). GetBounds
+-- reads it into bounds.pricesLoading; the controller then re-checks once by
+-- itself (Brian, 2026-11-06: first pass after /reload said "Open the
+-- recipe" until a manual Refresh).
+local loadingRequested = false
+
+-- A mat with no price is only "loading" when the client hasn't loaded its
+-- item data yet. A loaded mat with no price just has no price: not loading
+-- (2026-11-06: treating those as loading caused an endless refresh loop).
+local function RequestItemData(itemID)
+    local cached = nil
+    if C_Item and type(C_Item.IsItemDataCachedByID) == "function" then
+        local ok, result = pcall(C_Item.IsItemDataCachedByID, itemID)
+        cached = ok and result == true or nil
+    end
+    if cached then
+        return
+    end
+    loadingRequested = true
+    if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+        pcall(C_Item.RequestLoadItemDataByID, itemID)
+    end
+end
+
+local function MatValue(matID, matConfigKey)
+    return (UnitValue({ itemID = matID, configKey = matConfigKey }))
+end
+
+-- Returns copper, source ("saved" = recipe analysis, "estimate" = recipe
+-- schematic at today's prices) or nil.
+local function CostToMake(configKey, itemID, itemName)
     local store = PocketCFO and PocketCFO.CostToMakeStore
-    if not store or type(store.GetCostToday) ~= "function" then
+    if not store or type(store.GetCost) ~= "function" then
         return nil
     end
-    local ok, cost = pcall(store.GetCostToday, store, configKey, itemID, function(matID, matConfigKey)
-        return (UnitValue({ itemID = matID, configKey = matConfigKey }))
-    end)
+    local ok, cost, source = pcall(store.GetCost, store, configKey, itemID, itemName, MatValue, RequestItemData)
     cost = ok and tonumber(cost) or nil
     if cost and cost > 0 then
-        return cost
+        return cost, source
     end
     return nil
+end
+
+-- Cheapest current listing of the same item, quality and item level with a
+-- different stat in the same stat group (Brian, 2026-11-06: Resourcefulness
+-- = Multicraft, Perception = Finesse; Ingenuity, Crafting Speed and Deftness
+-- only match themselves). Used when no one lists our exact stat: a buyer
+-- who wants the tool takes the cheapest equivalent. From PricingCache (what
+-- the last search saw), current = within 3 days of the item's newest price.
+-- Returns copper, the stat string, or nil.
+local SAME_GROUP_WINDOW = 3 * 24 * 60 * 60
+
+local function ValuationModule(name)
+    local valuation = _G.PocketCFO_Valuation
+    if not valuation or type(valuation.GetModule) ~= "function" then
+        return nil
+    end
+    local ok, module = pcall(valuation.GetModule, valuation, name, true)
+    return ok and module or nil
+end
+
+local function SameGroupListing(itemLink, itemID)
+    local groupKey = _G.PocketCFO_Valuation and _G.PocketCFO_Valuation.StatGroupKey
+    local identity = ValuationModule("PricingIdentity")
+    local cache = ValuationModule("PricingCache")
+    if type(groupKey) ~= "function" or not identity or not cache or type(itemLink) ~= "string" or not itemID then
+        return nil
+    end
+    local okKey, ownKey = pcall(identity.BuildMarketKey, identity, itemLink)
+    ownKey = okKey and type(ownKey) == "string" and ownKey or nil
+    local ownStats = ownKey and ownKey:match("|stats:(.+)$")
+    if not ownStats then
+        return nil
+    end
+    local ownQuality, ownIlvl = ownKey:match("|q(%d+)"), ownKey:match("|ilvl(%d+)")
+    local ownGroup = groupKey(ownStats)
+    local rows = cache:GetCandidatesForItemID(itemID) or {}
+    local newest
+    for _, row in ipairs(rows) do
+        local timestamp = type(row) == "table" and tonumber(row.timestamp)
+        if timestamp and (not newest or timestamp > newest) then
+            newest = timestamp
+        end
+    end
+    if not newest then
+        return nil
+    end
+    local cutoff = newest - SAME_GROUP_WINDOW
+    local cheapest, cheapestStats
+    for _, row in ipairs(rows) do
+        local key = type(row) == "table" and tostring(row.marketKey or "") or ""
+        local stats = key:match("|stats:(.+)$")
+        local value = tonumber(row.value)
+        if stats and stats ~= ownStats and value and value > 0
+            and (tonumber(row.timestamp) or 0) >= cutoff
+            and key:match("|q(%d+)") == ownQuality and key:match("|ilvl(%d+)") == ownIlvl
+            and groupKey(stats) == ownGroup then
+            if not cheapest or value < cheapest then
+                cheapest, cheapestStats = value, stats
+            end
+        end
+    end
+    return cheapest, cheapestStats
 end
 
 -- Our own most recent sale (PocketCFO_Valuation SaleIndex: one quick lookup
@@ -336,10 +466,14 @@ end
 
 -- bounds = {
 --   floor, floorSource ("cost" | "vendor" | "disenchant"), floorBase,
---   costToMake, vendorSell, disenchant, marketValue, marketSource,
---   ceiling, ceilingBase ("sale" | "cost" | "market"), multiplier,
+--   costToMake, costSource ("saved" | "estimate"), vendorSell, disenchant,
+--   marketValue, marketSource,
+--   ceiling, ceilingBase ("value" | "cost" | "lowvalue" | "market" | "pastmarket" | "sale" | "rule"), multiplier,
+--   pastExpansion, pricesLoading (estimate asked for mat data), checkPrice,
+--   valueAtFloor, needsRecipe ("ours" | "seed"),
 --   lastSale, lastSaleSource, confidence ("confident" | "uncertain"),
---   valuePrice (confident value, between floor and max), ruleCap, stackSize,
+--   valuePrice (confident value, between floor and max), ruleCap,
+--   ruleCapFrom ({ itemID, quality, price } of the better item behind ruleCap), stackSize,
 --   usuallyPost (saved Usually Post, nil = default) }
 -- Any field can be nil. Never throws.
 function SmartPricing:GetBounds(candidate)
@@ -351,14 +485,17 @@ function SmartPricing:GetBounds(candidate)
         local configKey = candidate.configKey or (candidate.identity and candidate.identity.configKey)
 
         bounds.usuallyPost = SmartPricing:GetUsuallyPost(configKey or (itemID and tostring(itemID)))
-        bounds.costToMake = CostToMake(configKey, itemID)
+        loadingRequested = false
+        bounds.costToMake, bounds.costSource = CostToMake(configKey, itemID, candidate.itemName)
+        bounds.pricesLoading = (not bounds.costToMake and loadingRequested) or nil
+        bounds.pastExpansion = IsPastExpansion(itemLink, itemID) or nil
         bounds.vendorSell = VendorSellPrice(itemLink, itemID)
         bounds.disenchant = DisenchantValue(itemLink)
         local unadjusted, marketResult
         bounds.marketValue, bounds.marketSource, unadjusted, marketResult = UnitValue({ itemID = itemID, itemLink = itemLink, configKey = configKey })
         if marketResult then
             marketResult.configKey = marketResult.configKey or configKey
-            bounds.confidence = Confidence(marketResult)
+            bounds.confidence, bounds.confidenceReason = Confidence(marketResult)
         end
         -- Valuation's sanity caps (quality-sibling-cap, tool-tier-cap: a lower
         -- quality is never worth more than a higher one) lowered this item's
@@ -369,15 +506,38 @@ function SmartPricing:GetBounds(candidate)
         end
         -- The cap a rule worked out even when it didn't lower the value
         -- (ValuationRuleSet NoteCap): never post above a better version.
+        -- ruleCapFrom (2026-11-07): the better item that set that cap, for the
+        -- post window's single "Capped by" line. Equal caps count, so a value
+        -- lowered by the cap (ruleCap above) still names the item.
         local ladderCap = marketResult and tonumber(marketResult.ladderCap)
-        if ladderCap and ladderCap > 0 and (not bounds.ruleCap or ladderCap < bounds.ruleCap) then
+        if ladderCap and ladderCap > 0 and (not bounds.ruleCap or ladderCap <= bounds.ruleCap) then
             bounds.ruleCap = ladderCap
+            bounds.ruleCapFrom = marketResult.ladderCapFrom
         end
         bounds.lastSale, bounds.lastSaleSource = LastSalePrice(configKey, itemID)
+        bounds.groupPrice, bounds.groupStats = SameGroupListing(itemLink, itemID)
         bounds.stackSize = StackSize(itemLink, itemID)
 
+        -- Craftable (anyone can make it: shipped recipe seed or this
+        -- account's professions) but no Cost to Make, saved or estimated: no
+        -- floor at all, never fall back to vendor / disenchant (Brian,
+        -- 2026-11-06: 50g pickaxe floored at 3.55g vendor +10%; a bought
+        -- crafted item still has a replacement cost). needsRecipe = "ours"
+        -- (open the recipe) | "seed" (mats not priced yet). The evaluator
+        -- skips the row.
+        if not bounds.costToMake then
+            local seed = PocketCFO and PocketCFO.RecipeSeed
+            local okCraftable, craftable = pcall(function()
+                return seed and seed:IsCraftable(itemID, candidate.itemName)
+            end)
+            if okCraftable and craftable then
+                local okOurs, ours = pcall(seed.IsOurs, seed, itemID, candidate.itemName)
+                bounds.needsRecipe = (okOurs and ours) and "ours" or "seed"
+            end
+        end
+
         local base, source = nil, nil
-        for _, pair in ipairs({
+        for _, pair in ipairs(bounds.needsRecipe and {} or {
             { bounds.costToMake, "cost" },
             { bounds.disenchant, "disenchant" },
             { bounds.vendorSell, "vendor" },
@@ -392,25 +552,55 @@ function SmartPricing:GetBounds(candidate)
             bounds.floor = SilverUp(base * FLOOR_MARKUP)
         end
 
-        -- Max price, first that exists (Brian, 2026-11-04):
-        --   2x our last sale  ->  Cost to Make x curve  ->  market value x curve.
-        -- No max = not posted ("No price data yet").
+        -- Max price (stage 2, Brian 2026-11-06). Fix the value, don't
+        -- multiply it: a value we trust IS the max.
+        --   1. Confident market value -> the value.            ("value")
+        --   2. Not confident:
+        --      a. current-expansion crafted -> Cost to Make x curve: anyone
+        --         can level a crafter, so cost holds the price down. ("cost")
+        --      b. everything else (past-expansion crafted, drops, mats,
+        --         transmog) -> market value, few listings or not; few people
+        --         go back to craft old items (50g pickaxe sells at ~4,000g).
+        --         ("pastmarket" for past-expansion crafted, else "market")
+        --   3. (later) scan history, through Valuation's market value.
+        --   4. 2x our last sale, only when there's no value at all. ("sale")
+        --   5. No max = not posted (Your call).
+        -- Replaced 2026-11-04's order (2x last sale first, market value x
+        -- curve for drops): a single 400g sale capped a tool valued 1,285g.
         local ceiling, ceilingKind = nil, nil
-        if bounds.lastSale then
-            bounds.multiplier = SALE_MULTIPLIER
-            ceiling, ceilingKind = bounds.lastSale * SALE_MULTIPLIER, "sale"
-        elseif bounds.costToMake then
+        local currentCraft = bounds.costToMake and not bounds.pastExpansion
+        if bounds.marketValue and bounds.confidence == "confident" then
+            bounds.multiplier = 1
+            ceiling, ceilingKind = bounds.marketValue, "value"
+        elseif currentCraft then
             bounds.multiplier = self:CurveMultiplier(bounds.costToMake)
             ceiling, ceilingKind = bounds.costToMake * (bounds.multiplier or MIN_MULT), "cost"
+            -- Never below a value we only threw out for being too LOW
+            -- (Brian, 2026-11-06: Chef's Bright Linen Cooking Chapeau, value
+            -- 357g rejected as far below a clown-polluted history, then
+            -- cost x curve gave 112g, lower than the price we called too
+            -- low). Values far ABOVE usual may be clowns and don't count.
+            if bounds.confidenceReason == "farBelowUsual" and bounds.marketValue
+                and bounds.marketValue > ceiling then
+                bounds.multiplier = 1
+                ceiling, ceilingKind = bounds.marketValue, "lowvalue"
+            end
         elseif bounds.marketValue then
-            bounds.multiplier = self:CurveMultiplier(bounds.marketValue)
-            ceiling, ceilingKind = bounds.marketValue * (bounds.multiplier or MIN_MULT), "market"
+            bounds.multiplier = 1
+            ceiling, ceilingKind = bounds.marketValue, (bounds.costToMake and bounds.pastExpansion) and "pastmarket" or "market"
+        elseif bounds.lastSale then
+            bounds.multiplier = SALE_MULTIPLIER
+            ceiling, ceilingKind = bounds.lastSale * SALE_MULTIPLIER, "sale"
         end
         if ceiling then
             bounds.ceilingBase = ceilingKind
             bounds.ceiling = SilverDown(ceiling)
             if bounds.floor and bounds.ceiling < bounds.floor then
                 bounds.ceiling = bounds.floor
+                -- The max was under the lowest we'd post and got raised to
+                -- it: label it that way, not by what it started from
+                -- (Brian, 2026-11-07).
+                bounds.ceilingAtFloor = true
             end
         end
         if bounds.ruleCap then
@@ -419,6 +609,7 @@ function SmartPricing:GetBounds(candidate)
                 bounds.ceiling = capped
                 bounds.ceilingBase = "rule"
                 ceilingKind = "rule"
+                bounds.ceilingAtFloor = (bounds.floor and SilverDown(bounds.ruleCap) < bounds.floor) or nil
             end
         end
         -- Nobody else listing: post at the value only when there's enough
@@ -429,12 +620,112 @@ function SmartPricing:GetBounds(candidate)
                 price = math.min(price, bounds.ceiling)
             end
             bounds.valuePrice = price
+        -- Value from few listings: still a price, but the player checks it
+        -- ("Check the price" group, Brian 2026-11-06). Same floor / max.
+        -- valueAtFloor = the value was below the floor, so this is the floor.
+        elseif bounds.marketValue then
+            local value = SilverDown(bounds.marketValue)
+            local price = math.max(value, bounds.floor or 0)
+            if bounds.ceiling then
+                price = math.min(price, bounds.ceiling)
+            end
+            if price > 0 then
+                bounds.checkPrice = price
+                bounds.valueAtFloor = (bounds.floor and value < bounds.floor) and true or nil
+            end
         end
     end)
     if not ok and PocketCFO and PocketCFO.AppendSessionLog then
         PocketCFO:AppendSessionLog("[MCG] SmartPricing: GetBounds failed err=" .. tostring(err))
     end
     return bounds
+end
+
+-- ---------------------------------------------------------------------------
+-- Load mat data before the list is built (Brian, 2026-11-06: after /reload
+-- almost every craftable row came back "Loading prices..."). Asks the
+-- client for every not-yet-loaded mat of every craftable item in the bags.
+-- Called when the AH opens and before Post Auctions builds its list; the
+-- controller waits until IsPrewarming() is false or 5 seconds pass.
+-- ---------------------------------------------------------------------------
+
+local prewarmPending = {}
+
+local function IsCached(itemID)
+    if not (C_Item and type(C_Item.IsItemDataCachedByID) == "function") then
+        return true
+    end
+    local ok, cached = pcall(C_Item.IsItemDataCachedByID, itemID)
+    return not ok or cached == true
+end
+
+-- Returns true when something is still loading.
+function SmartPricing:PrewarmMats()
+    local seed = PocketCFO and PocketCFO.RecipeSeed
+    if not seed or not C_Container or type(C_Container.GetContainerItemID) ~= "function"
+        or not C_TradeSkillUI or type(C_TradeSkillUI.GetRecipeSchematic) ~= "function" then
+        return false
+    end
+    local basicType = Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic
+    local lastBag = tonumber(NUM_TOTAL_EQUIPPED_BAG_SLOTS) or 5
+    local seen = {}
+    pcall(function()
+        for bag = 0, lastBag do
+            local slots = tonumber(C_Container.GetContainerNumSlots(bag)) or 0
+            for slot = 1, slots do
+                local itemID = C_Container.GetContainerItemID(bag, slot)
+                if itemID and not seen[itemID] then
+                    seen[itemID] = true
+                    for _, recipeID in ipairs(seed:GetRecipeIDsForOutput(itemID) or {}) do
+                        local ok, schematic = pcall(C_TradeSkillUI.GetRecipeSchematic, recipeID, false)
+                        local slotsList = ok and type(schematic) == "table" and schematic.reagentSlotSchematics or {}
+                        for _, reagentSlot in ipairs(slotsList) do
+                            if reagentSlot.reagentType == basicType and reagentSlot.required ~= false then
+                                for _, reagent in ipairs(type(reagentSlot.reagents) == "table" and reagentSlot.reagents or {}) do
+                                    local matID = tonumber(reagent.itemID)
+                                    if matID and not IsCached(matID) then
+                                        prewarmPending[matID] = true
+                                        if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+                                            pcall(C_Item.RequestLoadItemDataByID, matID)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return self:IsPrewarming()
+end
+
+function SmartPricing:IsPrewarming()
+    for matID in pairs(prewarmPending) do
+        if IsCached(matID) then
+            prewarmPending[matID] = nil
+        end
+    end
+    return next(prewarmPending) ~= nil
+end
+
+-- Start loading as soon as the AH opens (PocketCFO_AH loads on AH open, so
+-- also once now), well before the player clicks Post Auctions.
+do
+    local frame = CreateFrame("Frame")
+    frame:RegisterEvent("AUCTION_HOUSE_SHOW")
+    frame:SetScript("OnEvent", function()
+        if SmartPricing:IsSmartView() then
+            pcall(SmartPricing.PrewarmMats, SmartPricing)
+        end
+    end)
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+            if SmartPricing:IsSmartView() then
+                pcall(SmartPricing.PrewarmMats, SmartPricing)
+            end
+        end)
+    end
 end
 
 SmartPricing.DEFAULT_DURATION = DEFAULT_DURATION

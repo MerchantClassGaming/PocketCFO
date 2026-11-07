@@ -395,8 +395,22 @@ function CraftQueueController:RefreshAnalysisAvailability(opts)
     local operationType   = (profileKeyService and recipeID) and profileKeyService:GetOperationType(recipeID) or nil
     local isProcessing     = profileKeyService ~= nil and operationType == profileKeyService.OPERATION_TYPE_PROCESSING
 
+    -- Milling is one herb -> one pigment, so it gets the ordinary live Recipe
+    -- Analysis (RecipeAnalysisController fills in the slotted herb and its
+    -- pigment from history), not the processing comparison list. Prospecting
+    -- and Crushing stay on the processing list (Brian, 2026-11-06).
+    local isMilling = false
+    if isProcessing then
+        local recipeAnalysisController = GetRecipeAnalysisController()
+        isMilling = recipeAnalysisController ~= nil and recipeAnalysisController.IsMillingRecipe ~= nil
+            and recipeAnalysisController:IsMillingRecipe(recipeID) == true
+        if isMilling then
+            isProcessing = false
+        end
+    end
+
     local eligibilityPolicy = GetCraftAnalysisEligibilityPolicy()
-    local isCraftAnalysisEligible = not isProcessing and recipeID ~= nil
+    local isCraftAnalysisEligible = not isProcessing and not isMilling and recipeID ~= nil
         and eligibilityPolicy ~= nil and eligibilityPolicy.IsEnabled ~= nil
         and eligibilityPolicy:IsEnabled(recipeID) == true
 

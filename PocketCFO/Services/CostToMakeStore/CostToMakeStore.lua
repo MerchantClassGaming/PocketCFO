@@ -19,8 +19,10 @@
 -- saved cost would be wrong). Bound mats with no price count as free, the
 -- same as recipe analysis.
 --
--- Readers: PocketCFO_AH smart posting (floor and ceiling).
--- Flavor: Both.
+-- Readers: PocketCFO_AH smart posting (floor and ceiling), PocketCFO_Valuation
+-- tool-tier-cap (is a cheap better version a dump?).
+-- Flavor: Both. The recipe estimate needs RecipeSeed (retail TOC only), so
+-- on Forever EstimateCost returns nil.
 
 local PocketCFO = _G.PocketCFO
 
@@ -84,6 +86,22 @@ function CostToMakeStore:Record(observation, economics)
         AddMats(mats, economics.vellumRows)
         if #mats == 0 then
             return
+        end
+        -- Quality conversion (a mat has the output's name, e.g. 5 Bismuth Q1
+        -- -> 1 Bismuth Q2): not a craft, no Cost to Make (Brian, 2026-11-06).
+        -- Same rule as RecipeSeed:IsConversionRecipe; the recipe window is
+        -- open here, so names are loaded.
+        local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+        if type(getInfo) == "function" then
+            local okOut, outName = pcall(getInfo, itemID)
+            if okOut and type(outName) == "string" and outName ~= "" then
+                for _, mat in ipairs(mats) do
+                    local okMat, matName = pcall(getInfo, mat.id)
+                    if okMat and matName == outName then
+                        return
+                    end
+                end
+            end
         end
 
         local db = DB()
@@ -169,6 +187,117 @@ function CostToMakeStore:GetCostToday(configKey, itemID, priceFn)
         end
     end
     return lowest, matchedBy
+end
+
+-- Estimated Cost to Make from the recipe itself, for craftable items whose
+-- recipe hasn't been opened since this store shipped (Brian, 2026-11-06;
+-- moved here from PocketCFO_AH SmartPricing 2026-11-06 so Valuation can use
+-- it too, no change in behaviour).
+-- C_TradeSkillUI.GetRecipeSchematic works at the AH with the profession
+-- window closed, even for a recipe this character hasn't learned (confirmed
+-- /mcgd recipetest 2026-11-06, Proficient Sickle on Matavida). On a
+-- character without the profession: Theoretical.
+-- Per item = sum over required Basic slots of (cheapest quality x quantity),
+-- divided by average items per craft. No Resourcefulness or multicraft, so it
+-- runs a little high (Sickle: ~119g vs ~100g real; Brian: fine, it's an
+-- estimate). Any quality in a required slot without a price -> nil (can't
+-- know which is cheapest). onMissing(matID), if given, is called for each
+-- mat with no price (the AH uses it to ask the client to load item data).
+local function EstimateRecipe(recipeID, priceFn, onMissing)
+    local ok, schematic = pcall(C_TradeSkillUI.GetRecipeSchematic, recipeID, false)
+    if not ok or type(schematic) ~= "table" or type(schematic.reagentSlotSchematics) ~= "table" then
+        return nil
+    end
+    local basicType = Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic
+    if basicType == nil then
+        return nil
+    end
+    local total, counted, complete = 0, 0, true
+    for _, slot in ipairs(schematic.reagentSlotSchematics) do
+        if slot.reagentType == basicType and slot.required ~= false then
+            local quantity = tonumber(slot.quantityRequired) or 0
+            local cheapest, hasItem = nil, false
+            for _, reagent in ipairs(type(slot.reagents) == "table" and slot.reagents or {}) do
+                local matID = tonumber(reagent.itemID)
+                -- Currencies have no AH price; recipe analysis leaves them out too.
+                if matID then
+                    hasItem = true
+                    local price = tonumber(priceFn(matID, nil))
+                    if not price then
+                        if onMissing then
+                            pcall(onMissing, matID)
+                        end
+                        complete = false
+                    elseif not cheapest or price < cheapest then
+                        cheapest = price
+                    end
+                end
+            end
+            if hasItem and quantity > 0 then
+                if not cheapest then
+                    complete = false
+                else
+                    total = total + cheapest * quantity
+                    counted = counted + 1
+                end
+            end
+        end
+    end
+    if not complete or counted == 0 or total <= 0 then
+        return nil
+    end
+    local qMin = tonumber(schematic.quantityMin) or 1
+    local qMax = tonumber(schematic.quantityMax) or qMin
+    local perCraft = (qMin + qMax) / 2
+    if perCraft <= 0 then
+        perCraft = 1
+    end
+    return math.floor(total / perCraft + 0.5)
+end
+
+-- Cheapest estimate across every recipe that makes the item. Recipes come
+-- from core RecipeSeed: the shipped seed (every profession) plus this
+-- account's live RecipeRegistry. Returns copper or nil. Never throws.
+function CostToMakeStore:EstimateCost(itemID, itemName, priceFn, onMissing)
+    itemID = tonumber(itemID)
+    local seed = PocketCFO and PocketCFO.RecipeSeed
+    if not itemID or type(priceFn) ~= "function"
+        or not seed or type(seed.GetRecipeIDsForOutput) ~= "function"
+        or not C_TradeSkillUI or type(C_TradeSkillUI.GetRecipeSchematic) ~= "function" then
+        return nil
+    end
+    local ok, recipeIDs = pcall(seed.GetRecipeIDsForOutput, seed, itemID, itemName)
+    if not ok or type(recipeIDs) ~= "table" then
+        return nil
+    end
+    local lowest
+    for _, recipeID in ipairs(recipeIDs) do
+        local okCost, cost = pcall(EstimateRecipe, recipeID, priceFn, onMissing)
+        cost = okCost and tonumber(cost) or nil
+        if cost and (not lowest or cost < lowest) then
+            lowest = cost
+        end
+    end
+    return lowest
+end
+
+-- Cost to Make per item: the saved recipe at today's prices, else the
+-- recipe estimate. Returns copper, source ("saved" | "estimate") or nil.
+-- Never throws.
+function CostToMakeStore:GetCost(configKey, itemID, itemName, priceFn, onMissing)
+    if type(priceFn) ~= "function" then
+        return nil
+    end
+    local ok, cost = pcall(self.GetCostToday, self, configKey, itemID, priceFn)
+    cost = ok and tonumber(cost) or nil
+    if cost and cost > 0 then
+        return cost, "saved"
+    end
+    local estimate = self:EstimateCost(itemID, itemName, priceFn, onMissing)
+    if estimate and estimate > 0 then
+        return estimate, "estimate"
+    end
+    return nil
 end
 
 if PocketCFO then

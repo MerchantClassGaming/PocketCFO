@@ -99,6 +99,20 @@ local function GetLibAHTab()
     return nil
 end
 
+-- LibAHTab sizes its tab once, inside CreateTab. Our tab is created on the
+-- first AH open (this addon loads on demand then), and that first measure can
+-- come out wrong (oversized tab, "Pocket...." text). Re-run the same resize
+-- LibAHTab uses (padding 20, min width 70) on our own tab only.
+-- Theoretical cause; confirm in-game on a character's first AH open.
+local LIBAHTAB_PADDING = 20
+local LIBAHTAB_MIN_WIDTH = 70
+
+local function ResizeLibTab(button)
+    if button and PanelTemplates_TabResize then
+        pcall(PanelTemplates_TabResize, button, LIBAHTAB_PADDING, nil, LIBAHTAB_MIN_WIDTH)
+    end
+end
+
 local function SafeLoad(name)
     local loaded = (C_AddOns and C_AddOns.IsAddOnLoaded and C_AddOns.IsAddOnLoaded(name))
         or (IsAddOnLoaded and IsAddOnLoaded(name))
@@ -979,6 +993,9 @@ function AHPostingUI:EnsureAuctionHouseTab()
     end
 
     if self.tabButton and self.content then
+        if self.tabIsLib then
+            ResizeLibTab(self.tabButton)
+        end
         self:SetPocketCFOTabSelected(self.active)
         self:HookAuctionHouseButtons(frame)
         self:HookAuctionatorFrames()
@@ -999,13 +1016,21 @@ function AHPostingUI:EnsureAuctionHouseTab()
     if lib and not lib:DoesIDExist(POCKETCFO_TAB_ID) then
         lib:CreateTab(POCKETCFO_TAB_ID, content, "Pocket CFO", "Pocket CFO")
         self.tabButton = lib:GetButton(POCKETCFO_TAB_ID)
+        self.tabIsLib = true
         if self.tabButton then
             self.tabButton:HookScript("OnClick", function()
                 self:ShowPocketCFOContent()
             end)
+            local button = self.tabButton
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0, function()
+                    ResizeLibTab(button)
+                end)
+            end
         end
     elseif lib and lib:DoesIDExist(POCKETCFO_TAB_ID) then
         self.tabButton = lib:GetButton(POCKETCFO_TAB_ID)
+        self.tabIsLib = true
         if self.tabButton and self.tabButton.HookScript and not self.libTabHooked then
             self.libTabHooked = true
             self.tabButton:HookScript("OnClick", function()

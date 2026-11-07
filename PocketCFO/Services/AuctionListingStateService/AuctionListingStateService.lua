@@ -14,6 +14,12 @@ local AuctionListingStateService = PocketCFO:NewModule("AuctionListingStateServi
 
 local INACTIVE_RETENTION_DAYS = 30
 local MAX_INACTIVE_ROWS = 5000
+-- Expired / canceled / closed listings whose mail is already accounted for
+-- (mailboxResolution set and not "unresolved") and that didn't sell: kept
+-- 7 days instead of 30 (Brian, 2026-11-07, memory: 2,320 expired listings
+-- at ~50 fields each). Sold listings keep 30 days (SaleIndex reads them);
+-- unresolved ones keep 30 days so their mail can still be matched.
+local RESOLVED_UNSOLD_RETENTION_DAYS = 7
 
 local VALID_CLOSE_STATUSES = {
     canceled  = true,
@@ -785,7 +791,13 @@ function AuctionListingStateService:PruneInactiveListings(options)
             -- "unresolved": WoW mail expires after 30 days, so any evidence that would have
             -- resolved them is also gone by the time these rows age out.
             local ageAt = InactiveAgeTimestamp(row)
-            if ageAt > 0 and ageAt < cutoff then
+            local rowCutoff = cutoff
+            local resolution = type(row) == "table" and row.mailboxResolution or nil
+            if type(row) == "table" and row.status ~= "sold" and resolution ~= nil
+                and resolution ~= "unresolved" and resolution ~= "sold" then
+                rowCutoff = now - (RESOLVED_UNSOLD_RETENTION_DAYS * 86400)
+            end
+            if ageAt > 0 and ageAt < rowCutoff then
                 db.ahListings[key] = nil
                 prunedByAge = prunedByAge + 1
             else

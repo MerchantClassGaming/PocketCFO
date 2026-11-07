@@ -350,7 +350,9 @@ end
 -- Needed because bag snapshot rows carry no bag/slot and mark a whole
 -- configKey bound when any copy is. Includes the reagent bag.
 local function LivePostableQuantities(eligibility)
-    local live = { byConfigKey = {}, byItemID = {}, keyedItemIDs = {}, inspected = false }
+    -- refused[itemID] = reason a slot of it was refused ("bound" |
+    -- "ahRefused"), for the session log only (2026-11-06).
+    local live = { byConfigKey = {}, byItemID = {}, keyedItemIDs = {}, refused = {}, inspected = false }
     local identityService = GetItemIdentityService()
     if not eligibility or not eligibility.IsBagSlotAHPostable
         or not C_Container or not C_Container.GetContainerNumSlots or not C_Container.GetContainerItemInfo then
@@ -365,7 +367,10 @@ local function LivePostableQuantities(eligibility)
                 local okInfo, info = pcall(C_Container.GetContainerItemInfo, containerID, slot)
                 local itemID = okInfo and info and tonumber(info.itemID) or nil
                 if itemID then
-                    local okPost, postable = pcall(eligibility.IsBagSlotAHPostable, eligibility, containerID, slot, itemID)
+                    local okPost, postable, refusedWhy = pcall(eligibility.IsBagSlotAHPostable, eligibility, containerID, slot, itemID)
+                    if okPost and postable ~= true then
+                        live.refused[itemID] = live.refused[itemID] or refusedWhy or "unknown"
+                    end
                     if okPost and postable == true then
                         local count = tonumber(info.stackCount) or 1
                         live.byItemID[itemID] = (live.byItemID[itemID] or 0) + count
@@ -396,6 +401,20 @@ function PostingQueuePipeline:BuildSmartCandidates(bagRows, ownerKey, diagnostic
     local candidates = {}
     local skipped = { unsellable = 0, gray = 0, kept = 0 }
     local live = LivePostableQuantities(eligibility)
+    -- Why each unsellable row was dropped, for the session log (Brian,
+    -- 2026-11-06: the list sometimes drops every finished good with no
+    -- error). Diagnostics only; nothing below reads it.
+    --   bound      a slot's tooltip says bound
+    --   ahRefused  C_AuctionHouse.IsSellItemValid said no
+    --   keyMismatch  postable live, but under a different configKey than
+    --              the bag snapshot row (count falls to 0)
+    --   notLive    snapshot row with no postable slot and no refusal seen
+    --              (e.g. the snapshot lists an item no longer in the bags)
+    local why = { bound = {}, ahRefused = {}, keyMismatch = {}, notLive = {} }
+    local function NoteWhy(reason, row)
+        local list = why[reason] or why.notLive
+        list[#list + 1] = tostring(row.itemName or row.itemID)
+    end
 
     for _, row in ipairs(bagRows or {}) do
         -- Postable copies only. The snapshot's isBound (any copy bound =
@@ -416,6 +435,14 @@ function PostingQueuePipeline:BuildSmartCandidates(bagRows, ownerKey, diagnostic
 
         if not postable then
             skipped.unsellable = skipped.unsellable + 1
+            local itemID = tonumber(row.itemID)
+            if not live.inspected then
+                NoteWhy(row.isBound == true and "bound" or "notLive", row)
+            elseif itemID and live.keyedItemIDs[itemID] and (live.byItemID[itemID] or 0) > 0 then
+                NoteWhy("keyMismatch", row)
+            else
+                NoteWhy(itemID and live.refused[itemID] or "notLive", row)
+            end
         elseif IsGrayItem(row) then
             skipped.gray = skipped.gray + 1
         else
@@ -468,6 +495,20 @@ function PostingQueuePipeline:BuildSmartCandidates(bagRows, ownerKey, diagnostic
     self.lastCandidates = candidates
     SessionLog("PostingQueuePipeline: smart candidates owner=%s rows=%d candidates=%d unsellable=%d gray=%d kept=%d",
         tostring(ownerKey), #(bagRows or {}), #candidates, skipped.unsellable, skipped.gray, skipped.kept)
+    local function FirstNames(list)
+        local shown = {}
+        for index = 1, math.min(#list, 5) do
+            shown[#shown + 1] = list[index]
+        end
+        return table.concat(shown, ", ") .. (#list > 5 and ", ..." or "")
+    end
+    SessionLog("PostingQueuePipeline: unsellable why bound=%d ahRefused=%d keyMismatch=%d notLive=%d",
+        #why.bound, #why.ahRefused, #why.keyMismatch, #why.notLive)
+    for _, reason in ipairs({ "bound", "ahRefused", "keyMismatch", "notLive" }) do
+        if #why[reason] > 0 then
+            SessionLog("PostingQueuePipeline:   %s: %s", reason, FirstNames(why[reason]))
+        end
+    end
     if diagnostics and diagnostics.CompleteRun then
         diagnostics:CompleteRun({ ownerKey = ownerKey, bagRows = #(bagRows or {}), candidates = #candidates, smart = true })
     end

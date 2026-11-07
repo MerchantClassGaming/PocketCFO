@@ -117,7 +117,9 @@ local function ComputeContainerValue(context)
     local unvaluedDependencies = {}
     local possibleDrops = {}
     local vendorSellOutputs = {}
-    local itemDataPending = false
+    -- ContainerOutcomeService couldn't sort local one-offs yet (item data
+    -- loading; 2026-11-07 confidence filter): never cache this result.
+    local itemDataPending = expected.itemDataPending == true
     local openCount = tonumber(expected.effectiveOpenCount) or 0
 
     -- One-offs count when every output is a one-off (no stackable output and

@@ -20,6 +20,12 @@ local PocketCFO = _G.PocketCFO
 -- an opening. Items matching the bag's expansion were kept (Brian).
 local SEED_VERSION = 2
 
+-- Per-container fields (2026-11-07, claude/Container_Confidence_Design.md):
+--   seedOnly = true: players' own openings are ignored for this container
+--     (value and "can contain"); the seed and live seed are the answer. For
+--     containers with hundreds of seed openings.
+--   excludedOutputs = { [itemID] = true }: never counted for this container,
+--     from any source. A container never contains itself (no entry needed).
 local SEED_CONTAINERS = {
     [260534] = {
         bagName = "Alchemist Surplus",
@@ -37,6 +43,7 @@ local SEED_CONTAINERS = {
     [246585] = {
         bagName = "Consortium Payout (Midnight)",
         openCount = 777,
+        seedOnly = true,   -- 777 openings (Brian, 2026-11-07)
         outputs = {
             { itemID = 236777, quality = 2, quantity = 54 }, -- Argentleaf
             { itemID = 236776, quality = 1, quantity = 85 }, -- Argentleaf

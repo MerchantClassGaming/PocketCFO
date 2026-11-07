@@ -7,6 +7,29 @@
 -- the low-quality value with only high-quality lenses loaded). For those
 -- slots the single line is skipped and one "PocketCFO Value" line per
 -- quality is added instead, the same way Auctionator does it.
+--
+-- Hover performance (Brian, 2026-11-07; a player had to turn the addon off,
+-- frame rate fell to ~30 sweeping across bags). A hover only ever needs
+-- three numbers, so it does the least work that gets them:
+--   - One GetItemInfo call feeds the vendor row, the disenchant gate and
+--     the item facts.
+--   - Vendor: the sell price from that call.
+--   - Disenchant: gear only (weapon / armor / profession gear, green to
+--     purple); DisenchantValue prices the mats through the price sheet.
+--   - PCFO Value, in order:
+--       1. a custom value rule (containers, Moxie bags, gray items) -> value
+--       2. bound (soulbound / warbound bind line) -> no PCFO Value (it
+--          can't go on the AH; Brian: the PCFO Value is what it's worth on
+--          the AH)
+--       3. no vendor purchase price and nothing in the price cache for this
+--          item ID -> no PCFO Value
+--       4. otherwise ValuationService (price sheet: worked out once, reused
+--          until a price or rule changes)
+--   - The finished rows are remembered per item for ROW_SECONDS and until
+--     the value version moves (Core.lua), so the game refreshing a bag
+--     tooltip while you hover redraws stored rows instead of re-pricing.
+-- Never calls tooltip:Show() (Midnight finding: never inside a tooltip hook).
+-- Flavor: Both.
 
 -- Patch compat: Blizzard moved the coin-icon formatter to C_CurrencyInfo.
 local GetCoinTextureString = (C_CurrencyInfo and C_CurrencyInfo.GetCoinTextureString)
@@ -18,70 +41,12 @@ local PocketCFO_Valuation = _G.PocketCFO_Valuation
 
 local Tooltip = PocketCFO_Valuation:NewModule("Tooltip")
 
+local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+
 local TOOLTIP_DATA_HOOKED = false
 local FALLBACK_ITEM_HOOKED = false
 local QUALITY_REAGENT_HOOKED = false
 local MAX_OWNER_DEPTH = 4
-local REGISTERED_TOOLTIPS = setmetatable({}, { __mode = "k" })
-local TOOLTIP_STATE = setmetatable({}, { __mode = "k" })
-
-local function ClearTooltipState(tooltip)
-    if not tooltip then
-        return
-    end
-
-    local state = TOOLTIP_STATE[tooltip]
-    if state then
-        state.marketKey = nil
-        state.itemLink = nil
-        state.lineText = nil
-        state.hasPocketCFOValue = nil
-    end
-
-    tooltip.PocketCFOValuationMarketKey = nil
-    tooltip.PocketCFOValuationItemLink = nil
-    tooltip.PocketCFOValuationLineText = nil
-    tooltip.PocketCFOValuationHasPocketCFOValue = nil
-end
-
-local function SetTooltipState(tooltip, itemLink, marketKey, lineText)
-    local state = TOOLTIP_STATE[tooltip]
-    if not state then
-        state = {}
-        TOOLTIP_STATE[tooltip] = state
-    end
-
-    state.marketKey = marketKey
-    state.itemLink = itemLink
-    state.lineText = lineText
-    state.hasPocketCFOValue = true
-
-    tooltip.PocketCFOValuationMarketKey = marketKey
-    tooltip.PocketCFOValuationItemLink = itemLink
-    tooltip.PocketCFOValuationLineText = lineText
-    tooltip.PocketCFOValuationHasPocketCFOValue = true
-end
-
-local function TooltipHasLine(tooltip, lineText)
-    if not tooltip or not lineText or not tooltip.GetName then
-        return false
-    end
-
-    local name = tooltip:GetName()
-    if not name then
-        return false
-    end
-
-    local lineCount = tooltip.NumLines and tooltip:NumLines() or 0
-    for i = 1, lineCount do
-        local line = _G[name .. "TextLeft" .. i]
-        if line and line.GetText and line:GetText() == lineText then
-            return true
-        end
-    end
-
-    return false
-end
 
 -- Value rows (Brian, 2026-11-03): PCFO Value / Disenchant / Vendor are
 -- two-column rows, label on the left and gold on the right, so the gold
@@ -113,24 +78,6 @@ end
 
 local function TooltipHasRow(tooltip, label, valueText)
     return FindLineIndex(tooltip, label, valueText) ~= nil
-end
-
-local function RowKey(label, valueText)
-    return tostring(label) .. "\t" .. tostring(valueText)
-end
-
-local function TooltipAlreadyHasLine(tooltip, itemLink, marketKey, label, valueText)
-    local rowKey = RowKey(label, valueText)
-    local state = TOOLTIP_STATE[tooltip]
-    if state and state.hasPocketCFOValue and state.itemLink == itemLink and state.marketKey == marketKey and state.lineText == rowKey and TooltipHasRow(tooltip, label, valueText) then
-        return true
-    end
-
-    if tooltip.PocketCFOValuationHasPocketCFOValue and tooltip.PocketCFOValuationItemLink == itemLink and tooltip.PocketCFOValuationMarketKey == marketKey and tooltip.PocketCFOValuationLineText == rowKey and TooltipHasRow(tooltip, label, valueText) then
-        return true
-    end
-
-    return false
 end
 
 -- Always gold, silver and copper, silver and copper two digits (Brian,
@@ -299,15 +246,14 @@ local function IsQualityReagentSlotTooltip(tooltip)
     return false
 end
 
-local function SetLastLookup(itemLink, identity, marketKey, exact, value, freshness, candidates, note)
+-- Last hover, for diagnostics.
+local function SetLastLookup(itemLink, marketKey, value, freshness, note)
     Tooltip.lastLookup = {
         itemLink = itemLink,
-        identity = identity,
         marketKey = marketKey,
-        cacheHit = exact ~= nil,
+        cacheHit = marketKey ~= nil,
         value = value,
         freshness = freshness,
-        sameItemCandidateCount = candidates and #candidates or 0,
         note = note,
     }
 end
@@ -315,29 +261,25 @@ end
 -- Containers: rare non-stackable drops (recipes/designs, tools...) left out
 -- of the bag value (CustomValuationRegistrations) are listed under it, so
 -- the jackpot is visible without driving the value (Brian, 2026-10-20).
+-- Built once with the rest of the rows; returns a list of line texts.
 local MAX_POSSIBLE_DROP_LINES = 3
 
-local function AddPossibleDropLines(tooltip, result)
+local function BuildPossibleDropLines(result)
     local drops = type(result) == "table" and result.possibleDrops or nil
     if type(drops) ~= "table" or #drops == 0 then
-        return
+        return nil
     end
-    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    local lines = {}
     for index, drop in ipairs(drops) do
         if index > MAX_POSSIBLE_DROP_LINES then
-            local moreText = string.format("  ...and %d more rare drops", #drops - MAX_POSSIBLE_DROP_LINES)
-            if not TooltipHasLine(tooltip, moreText) then
-                tooltip:AddLine(moreText, 0.6, 0.6, 0.6)
-            end
+            lines[#lines + 1] = string.format("  ...and %d more rare drops", #drops - MAX_POSSIBLE_DROP_LINES)
             break
         end
-        local ok, name = pcall(getInfo, drop.itemID)
-        local text = string.format("Can also contain: %s (seen %d in %d opens)",
+        local ok, name = pcall(GetItemInfo, drop.itemID)
+        lines[#lines + 1] = string.format("Can also contain: %s (seen %d in %d opens)",
             (ok and name) or "a rare item", tonumber(drop.timesSeen) or 0, tonumber(drop.openCount) or 0)
-        if not TooltipHasLine(tooltip, text) then
-            tooltip:AddLine(text, 0.6, 0.6, 0.6)
-        end
     end
+    return lines
 end
 
 -- AH summary rows and the item header above a listing: Blizzard fills these
@@ -384,74 +326,79 @@ local function CheapestValueAtItemLevel(valuationService, cacheModule, itemID, i
     return best
 end
 
--- Lines under the value rows: "Scanned <age> ago" for AH values (was
--- "Last Scan:" on the PocketCFO Value line), then any possible drops.
-local function AddValueFooterLines(tooltip, result)
-    if not tooltip or type(result) ~= "table" then
-        return
+-- ---------------------------------------------------------------------------
+-- Bound items (Brian, 2026-11-07): a soulbound or warbound copy can't go on
+-- the AH, so it gets no PCFO Value (custom-rule values like containers still
+-- show). Read from the bind line on the tooltip being built, with core's
+-- shared check (SoulboundClassifier:TooltipTextIsBound: Soulbound, Binds
+-- when picked up, Warbound / Warband), the same check the posting list uses.
+-- Binds when equipped is not bound. data.lines (leftText) first, the same
+-- shape core reads from C_TooltipInfo; else the tooltip's own left lines.
+-- ---------------------------------------------------------------------------
+
+local function IsBoundTooltip(tooltip, data)
+    local core = _G.PocketCFO
+    local classifier = (core and core.SoulboundClassifier) or _G.PocketCFO_SoulboundClassifier
+    if not classifier or type(classifier.TooltipTextIsBound) ~= "function" then
+        return false
     end
-    local lastScanAge = result.source == "auctionHouse" and FormatLastScanAge(result.lastUpdated) or nil
-    if lastScanAge then
-        local scanText = "Scanned " .. lastScanAge .. " ago"
-        -- Thin evidence (ValuationService:GetConfidence, 2026-11-04): say so on
-        -- the existing line, no new tooltip line.
-        local valuationService = PocketCFO_Valuation:GetModule("ValuationService", true)
-        if valuationService and valuationService.GetConfidence then
-            local ok, level = pcall(valuationService.GetConfidence, valuationService, result)
-            if ok and level == "uncertain" then
-                scanText = "Few listings \194\183 scanned " .. lastScanAge .. " ago"
+    local lines = type(data) == "table" and data.lines or nil
+    if type(lines) == "table" then
+        for _, line in ipairs(lines) do
+            local text = type(line) == "table" and line.leftText or nil
+            if text and text ~= "" and classifier:TooltipTextIsBound(text) then
+                return true
             end
         end
-        if not TooltipHasLine(tooltip, scanText) then
-            tooltip:AddLine(scanText, NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])
+        return false
+    end
+    local name = tooltip and tooltip.GetName and tooltip:GetName()
+    if not name then
+        return false
+    end
+    for i = 1, (tooltip.NumLines and tooltip:NumLines() or 0) do
+        local left = _G[name .. "TextLeft" .. i]
+        local text = left and left.GetText and left:GetText()
+        if text and text ~= "" and classifier:TooltipTextIsBound(text) then
+            return true
         end
     end
-    AddPossibleDropLines(tooltip, result)
+    return false
 end
 
--- deferFooter: the caller adds the footer lines itself, after the
--- Disenchant / Vendor rows. The fallback OnTooltipSetItem hook passes
--- nothing, so it gets the footer straight away as before.
-local function AddValuationLine(tooltip, data, deferFooter)
-    if not tooltip then
-        return
-    end
+-- ---------------------------------------------------------------------------
+-- Building the rows (once per item per change; see the header).
+-- ---------------------------------------------------------------------------
 
-    local itemLink = ExtractItemLink(tooltip, data)
-    if not itemLink then
-        SetLastLookup(nil, nil, nil, nil, nil, nil, nil, "No item link on tooltip")
-        return
-    end
+local DISENCHANT_RARITY = { [2] = true, [3] = true, [4] = true }
+local DISENCHANT_CLASS = { [2] = true, [4] = true, [19] = true }
 
-    -- The link on a quality slot tooltip is always the lowest quality;
-    -- AddQualityReagentLines prices every quality instead.
-    if IsQualityReagentSlotTooltip(tooltip) then
-        SetLastLookup(itemLink, nil, nil, nil, nil, nil, nil, "Quality reagent slot - per-quality lines")
-        return
-    end
-
-    -- Same answer as every other part of the addon: ValuationService applies
-    -- custom/vendor/AH precedence, the stat-variant average and every
-    -- valuation rule (2026-10-12). Previously this read PricingCache directly.
-    local identityModule = PocketCFO_Valuation:GetModule("PricingIdentity", true)
-    local cacheModule = PocketCFO_Valuation:GetModule("PricingCache", true)
+-- PCFO Value: the filters from the header, then ValuationService.
+-- Returns result, marketKey, note.
+local function LookUpPocketValue(tooltip, itemLink, itemID, bound)
     local valuationService = PocketCFO_Valuation:GetModule("ValuationService", true)
-    if not identityModule or not cacheModule or not valuationService then
-        SetLastLookup(itemLink, nil, nil, nil, nil, nil, nil, "Pricing modules unavailable")
-        return
+    local cacheModule = PocketCFO_Valuation:GetModule("PricingCache", true)
+    local vendorService = PocketCFO_Valuation:GetModule("VendorPriceService", true)
+    if not valuationService or not cacheModule then
+        return nil, nil, "Pricing modules unavailable"
     end
 
-    local identity = identityModule:BuildFromItemLink(itemLink)
-    local marketKey = identity and identity.marketKey
-    local itemID = (identity and identity.itemID) or tonumber(tostring(itemLink):match("item:(%d+)"))
-    if not itemID then
-        SetLastLookup(itemLink, identity, marketKey, nil, nil, nil, nil, "No itemID")
-        return
+    local hasRule = valuationService.HasValueRule and valuationService:HasValueRule(itemID, itemLink)
+    if not hasRule then
+        if bound then
+            return nil, nil, "Bound - no PCFO Value"
+        end
+        local keyItemID = GetItemKeyArgs(tooltip)
+        local hasVendor = vendorService and vendorService.HasPrice and vendorService:HasPrice(itemID)
+        local hasCache = cacheModule.HasItemID and cacheModule:HasItemID(keyItemID or itemID)
+        if not hasVendor and not hasCache then
+            return nil, nil, "No price data for this item"
+        end
     end
 
     local ok, result = pcall(valuationService.GetItemValue, valuationService, { itemID = itemID, itemLink = itemLink })
-    local value = ok and type(result) == "table" and not result.unresolved and result.value or nil
-    local exact = marketKey and cacheModule:GetEntry(marketKey) or nil
+    local value = ok and type(result) == "table" and not result.unresolved and tonumber(result.value) or nil
+    local marketKey = value and result.provenance and result.provenance.marketKey or nil
 
     -- AH summary row / item header: price by the real item level instead.
     if not value then
@@ -459,121 +406,176 @@ local function AddValuationLine(tooltip, data, deferFooter)
         if keyItemID == itemID then
             local cheapest = CheapestValueAtItemLevel(valuationService, cacheModule, keyItemID, keyItemLevel)
             if cheapest then
-                ok, result, value = true, cheapest, cheapest.value
-                marketKey = tostring(itemID) .. "|itemKeyIlvl" .. tostring(keyItemLevel)
+                return cheapest, tostring(itemID) .. "|itemKeyIlvl" .. tostring(keyItemLevel), "Value: cheapest at item level"
+            end
+        end
+        return nil, nil, "No value: " .. tostring(ok and type(result) == "table" and result.unresolvedReason or "lookupError")
+    end
+    return result, marketKey, "Value: " .. tostring(result.source)
+end
+
+-- Everything the tooltip shows for one item, ready to draw:
+--   values = { { label, text, value }, ... } (PCFO Value, Disenchant, Vendor)
+--   highest = the largest value when two or more rows show
+--   scanAt = AH scan time for the "Scanned ... ago" line, uncertain = few
+--   listings, dropLines = container rare drops
+local function BuildRows(tooltip, itemLink, bound)
+    local itemID = LinkItemID(itemLink)
+    local rows = { values = {} }
+    if not itemID then
+        rows.note = "No itemID"
+        return rows
+    end
+
+    -- The one GetItemInfo call: sell price, rarity and item class.
+    local okInfo, itemName, _, rarity, _, _, _, _, _, _, _, sellPrice, classID = pcall(GetItemInfo, itemLink)
+    if not okInfo or not itemName then
+        rows.pending = true -- item data not loaded yet; build again next time
+    end
+    rarity = okInfo and tonumber(rarity) or nil
+    classID = okInfo and tonumber(classID) or nil
+    sellPrice = okInfo and tonumber(sellPrice) or nil
+
+    -- PCFO Value
+    local result, marketKey, note = LookUpPocketValue(tooltip, itemLink, itemID, bound)
+    local pocketValue = result and tonumber(result.value) or nil
+    local pocketText = FormatCopper(pocketValue)
+    if pocketText then
+        local label = "PCFO Value"
+        if result.valuationBasis == "modeled" then
+            label = label .. " (Est.)"
+        end
+        rows.values[#rows.values + 1] = { label = label, text = pocketText, value = pocketValue }
+        if result.source == "auctionHouse" then
+            rows.scanAt = tonumber(result.lastUpdated)
+            -- Thin evidence (ValuationService:GetConfidence, 2026-11-04):
+            -- said on the scan line, no new tooltip line.
+            local valuationService = PocketCFO_Valuation:GetModule("ValuationService", true)
+            if valuationService and valuationService.GetConfidence then
+                local okLevel, level = pcall(valuationService.GetConfidence, valuationService, result)
+                rows.uncertain = okLevel and level == "uncertain" or nil
+            end
+        end
+        rows.dropLines = BuildPossibleDropLines(result)
+    end
+    rows.note = note
+    rows.marketKey = marketKey
+    rows.value = pocketValue
+    rows.freshness = result and (result.isFresh and "fresh" or "stale") or nil
+
+    -- Disenchant (Est.): gear only. DisenchantValue checks the same gate
+    -- again with its own data; this one just avoids calling it at all for
+    -- mats, consumables, quest items and the like.
+    if DISENCHANT_RARITY[rarity] and DISENCHANT_CLASS[classID] then
+        local disenchantValue = PocketCFO_Valuation:GetModule("DisenchantValue", true)
+        if disenchantValue then
+            local ok, estimate = pcall(disenchantValue.GetEstimate, disenchantValue, itemLink)
+            local text = ok and FormatCopper(estimate) or nil
+            if text then
+                rows.values[#rows.values + 1] = { label = "Disenchant (Est.)", text = text, value = tonumber(estimate) }
             end
         end
     end
-    local formatted = FormatCopper(value)
-    if not formatted then
-        local candidates = cacheModule.GetCandidatesForItemID and cacheModule:GetCandidatesForItemID(itemID) or {}
-        SetLastLookup(itemLink, identity, marketKey, exact, nil, nil, candidates,
-            "No value: " .. tostring(ok and type(result) == "table" and result.unresolvedReason or "lookupError"))
-        return
+
+    -- Vendor: what a merchant pays per item; no row when it pays nothing.
+    -- Theoretical: GetItemInfo sellPrice is 0 for items a merchant won't
+    -- buy; the row is skipped for 0 or nil either way.
+    if sellPrice and sellPrice > 0 then
+        rows.values[#rows.values + 1] = { label = "Vendor", text = FormatCopper(sellPrice), value = sellPrice }
     end
 
-    local freshness = result.isFresh and "fresh" or "stale"
-    local label = "PCFO Value"
-    if result.valuationBasis == "modeled" then
-        label = label .. " (Est.)"
-    end
-    marketKey = marketKey or ("itemID:" .. tostring(itemID))
-    if TooltipAlreadyHasLine(tooltip, itemLink, marketKey, label, formatted) then
-        if not deferFooter then
-            AddValueFooterLines(tooltip, result)
+    -- When two or more of PCFO Value / Disenchant / Vendor show, the highest
+    -- gold amount is green and the others white; labels stay teal. With one
+    -- value, colors are unchanged. Values only, no advice.
+    if #rows.values >= 2 then
+        local highest = rows.values[1].value
+        for _, row in ipairs(rows.values) do
+            if row.value > highest then
+                highest = row.value
+            end
         end
-        return value, label, formatted, result
+        rows.highest = highest
     end
-
-    AddValueRow(tooltip, label, formatted)
-    -- The item tooltip hook adds Disenchant / Vendor rows first so the
-    -- three gold rows stay together; the scan age and drop lines go under.
-    if not deferFooter then
-        AddValueFooterLines(tooltip, result)
-    end
-    SetTooltipState(tooltip, itemLink, marketKey, RowKey(label, formatted))
-    if tooltip.Show then
-        pcall(tooltip.Show, tooltip)
-    end
-    SetLastLookup(itemLink, identity, marketKey, exact, value, freshness, nil, "Value: " .. tostring(result.source))
-    -- Returned for AddDisenchantAndVendorLines (highest-value highlight)
-    -- and the footer lines.
-    return value, label, formatted, result
+    return rows
 end
 
--- Disenchant and vendor rows (Brian, 2026-10-25). Values only, no advice:
---   Disenchant (Est.): average gold per disenchant (DisenchantValue)
---   Vendor: what a merchant pays per item; no row when it pays nothing
--- When two or more of PCFO Value / Disenchant / Vendor are shown, the
--- highest gold amount is green and the others white; labels stay teal.
--- With one value, colors are unchanged.
--- Flavor: Both. DisenchantValue is looked up silently, so a flavor without
--- it (or with no disenchant data yet) shows only the vendor row.
--- Theoretical: GetItemInfo sellPrice is 0 for items a merchant won't buy;
--- the row is skipped for 0 or nil either way.
--- No tooltip:Show() here (Midnight finding: never call it in a tooltip
--- hook). AddValuationLine still calls it as before; unchanged.
-local function AddDisenchantAndVendorLines(tooltip, data, pocketValue, pocketLabel, pocketValueText)
-    if not tooltip then
+-- Remembered rows: item link (+ bound, + AH summary row item level) ->
+-- { rows, at, version }.
+local ROW_SECONDS = 60
+local ROW_MAX_ENTRIES = 500
+local rowMemo, rowMemoCount = {}, 0
+
+local function GetRows(tooltip, itemLink, bound)
+    local _, keyItemLevel = GetItemKeyArgs(tooltip)
+    local key = itemLink .. (bound and "#bound" or "") .. (keyItemLevel and ("#ilvl" .. keyItemLevel) or "")
+    local version = PocketCFO_Valuation.valueVersion or 0
+    local now = GetTime and GetTime() or 0
+    local entry = rowMemo[key]
+    if entry and entry.version == version and now - entry.at < ROW_SECONDS then
+        return entry.rows
+    end
+    local rows = BuildRows(tooltip, itemLink, bound)
+    if not rows.pending then
+        if rowMemoCount >= ROW_MAX_ENTRIES then
+            rowMemo, rowMemoCount = {}, 0
+        end
+        if not rowMemo[key] then
+            rowMemoCount = rowMemoCount + 1
+        end
+        rowMemo[key] = { rows = rows, at = now, version = version }
+    end
+    return rows
+end
+
+local function DrawRows(tooltip, rows)
+    local first = rows.values[1]
+    if not first then
         return
     end
-    if IsQualityReagentSlotTooltip(tooltip) then
+    -- The hook ran already for this tooltip build: don't add the rows twice.
+    if TooltipHasRow(tooltip, first.label, first.text) then
+        return
+    end
+    for _, row in ipairs(rows.values) do
+        local color = VALUE_COLOR
+        if rows.highest then
+            color = (row.value == rows.highest) and HIGHEST_COLOR or OTHER_COLOR
+        end
+        tooltip:AddDoubleLine(row.label, row.text,
+            VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3],
+            color[1], color[2], color[3])
+    end
+    -- "Scanned <age> ago" for AH values, worked out now so it's never stale.
+    local lastScanAge = rows.scanAt and FormatLastScanAge(rows.scanAt) or nil
+    if lastScanAge then
+        local scanText = rows.uncertain
+            and ("Few listings \194\183 scanned " .. lastScanAge .. " ago")
+            or ("Scanned " .. lastScanAge .. " ago")
+        tooltip:AddLine(scanText, NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])
+    end
+    for _, text in ipairs(rows.dropLines or {}) do
+        tooltip:AddLine(text, NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])
+    end
+end
+
+local function OnItemTooltip(tooltip, data)
+    if not tooltip then
         return
     end
     local itemLink = ExtractItemLink(tooltip, data)
     if not itemLink then
+        SetLastLookup(nil, nil, nil, nil, "No item link on tooltip")
         return
     end
-
-    local shown = {}
-    if tonumber(pocketValue) and pocketLabel and pocketValueText then
-        shown[#shown + 1] = { value = tonumber(pocketValue), label = pocketLabel, valueText = pocketValueText }
-    end
-
-    local disenchantValue = PocketCFO_Valuation:GetModule("DisenchantValue", true)
-    if disenchantValue then
-        local ok, estimate = pcall(disenchantValue.GetEstimate, disenchantValue, itemLink)
-        local formatted = ok and FormatCopper(estimate) or nil
-        if formatted then
-            local label = "Disenchant (Est.)"
-            AddValueRow(tooltip, label, formatted)
-            shown[#shown + 1] = { value = tonumber(estimate), label = label, valueText = formatted }
-        end
-    end
-
-    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
-    if getInfo then
-        local ok, sellPrice = pcall(function() return select(11, getInfo(itemLink)) end)
-        sellPrice = ok and tonumber(sellPrice) or nil
-        if sellPrice and sellPrice > 0 then
-            local label = "Vendor"
-            local formatted = FormatCopper(sellPrice)
-            AddValueRow(tooltip, label, formatted)
-            shown[#shown + 1] = { value = sellPrice, label = label, valueText = formatted }
-        end
-    end
-
-    if #shown < 2 then
+    -- The link on a quality slot tooltip is always the lowest quality;
+    -- AddQualityReagentLines prices every quality instead.
+    if IsQualityReagentSlotTooltip(tooltip) then
+        SetLastLookup(itemLink, nil, nil, nil, "Quality reagent slot - per-quality lines")
         return
     end
-    local highest = shown[1].value
-    for _, entry in ipairs(shown) do
-        if entry.value > highest then
-            highest = entry.value
-        end
-    end
-    local name = tooltip.GetName and tooltip:GetName()
-    if not name then
-        return
-    end
-    for _, entry in ipairs(shown) do
-        local index = FindLineIndex(tooltip, entry.label, entry.valueText)
-        local line = index and _G[name .. "TextRight" .. index]
-        if line and line.SetTextColor then
-            local color = (entry.value == highest) and HIGHEST_COLOR or OTHER_COLOR
-            line:SetTextColor(color[1], color[2], color[3])
-        end
-    end
+    local rows = GetRows(tooltip, itemLink, IsBoundTooltip(tooltip, data))
+    DrawRows(tooltip, rows)
+    SetLastLookup(itemLink, rows.marketKey, rows.value, rows.freshness, rows.note)
 end
 
 local function QualityIconMarkup(itemID, fallbackTier)
@@ -617,8 +619,7 @@ local function AddQualityReagentLines(slot)
 
     for tierIndex, tier in ipairs(tiers) do
         local okLink, itemLink = pcall(function()
-            local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
-            return select(2, getInfo(tier.itemID))
+            return select(2, GetItemInfo(tier.itemID))
         end)
         itemLink = okLink and itemLink or nil
         local ok, result = pcall(valuationService.GetItemValue, valuationService, { itemID = tier.itemID, itemLink = itemLink })
@@ -656,18 +657,6 @@ local function HookQualityReagentTooltips()
         pcall(AddQualityReagentLines, slot)
     end)
     QUALITY_REAGENT_HOOKED = true
-end
-
-local function RegisterTooltip(tooltip)
-    if not tooltip or REGISTERED_TOOLTIPS[tooltip] then
-        return
-    end
-
-    REGISTERED_TOOLTIPS[tooltip] = true
-    if tooltip.HookScript then
-        tooltip:HookScript("OnTooltipCleared", ClearTooltipState)
-        tooltip:HookScript("OnHide", ClearTooltipState)
-    end
 end
 
 function Tooltip:InspectItem(itemLinkOrID)
@@ -709,27 +698,23 @@ function Tooltip:GetLastLookup()
 end
 
 function Tooltip:OnEnable()
-    RegisterTooltip(GameTooltip)
-    RegisterTooltip(ItemRefTooltip)
-
     local hasTooltipDataProcessor = TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum and Enum.TooltipDataType and Enum.TooltipDataType.Item
     if hasTooltipDataProcessor then
         if not TOOLTIP_DATA_HOOKED then
             TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, function(tooltip, data)
-                local pocketValue, pocketLabel, pocketValueText, pocketResult = AddValuationLine(tooltip, data, true)
-                pcall(AddDisenchantAndVendorLines, tooltip, data, pocketValue, pocketLabel, pocketValueText)
-                if pocketResult then
-                    pcall(AddValueFooterLines, tooltip, pocketResult)
-                end
+                pcall(OnItemTooltip, tooltip, data)
             end)
             TOOLTIP_DATA_HOOKED = true
         end
     elseif not FALLBACK_ITEM_HOOKED then
+        local function OnTooltipSetItem(tooltip)
+            pcall(OnItemTooltip, tooltip, nil)
+        end
         if GameTooltip and GameTooltip.HookScript then
-            GameTooltip:HookScript("OnTooltipSetItem", AddValuationLine)
+            GameTooltip:HookScript("OnTooltipSetItem", OnTooltipSetItem)
         end
         if ItemRefTooltip and ItemRefTooltip.HookScript then
-            ItemRefTooltip:HookScript("OnTooltipSetItem", AddValuationLine)
+            ItemRefTooltip:HookScript("OnTooltipSetItem", OnTooltipSetItem)
         end
         FALLBACK_ITEM_HOOKED = true
     end

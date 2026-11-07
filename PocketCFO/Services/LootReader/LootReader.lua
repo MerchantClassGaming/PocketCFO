@@ -121,6 +121,16 @@
 --   - Two different containers clicked within CONTAINER_LINE_SECONDS of each
 --     other, or a line that could belong to either: both records are marked
 --     ambiguous (consumers skip them; nothing is guessed).
+--   - Outside evidence (2026-11-07, Brian; claude/Container_Confidence_Design.md):
+--     mail items taken within a second of a bag click were counted as the
+--     bag's contents. Now a record is marked ambiguous (record.outside = why)
+--     when something else is known to be arriving in its window: a mail take
+--     (TakeInboxItem / AutoLootMailItem), a quest turn-in, or a "received"
+--     line in trade context while it is open; or at the click, a mail take in
+--     the last MAIL_TAKE_SECONDS, a quest turn-in in the last
+--     QUEST_CONTEXT_SECONDS, or the trade window open. The mailbox merely
+--     being open is not evidence. Such records are never split by expansion.
+--     Theoretical: a quest reward line that arrives after the record finished.
 --   - Split by expansion (2026-10-31, Brian): records marked ambiguous by each
 --     other form a burst, finished together when the last one finishes. The
 --     burst is split when every container has a different expansion (item
@@ -358,6 +368,19 @@ local function Keep(list, entry)
     list[#list + 1] = entry
     while #list > LOG_LIMIT do
         table.remove(list, 1)
+    end
+end
+
+-- Outside evidence (see header): marks a container record ambiguous, keeping
+-- the first reason. TaintOpen marks every record not finished yet.
+local function Taint(record, reason)
+    record.outside = record.outside or reason
+    record.ambiguous = true
+end
+
+local function TaintOpen(reason)
+    for _, record in ipairs(openings) do
+        Taint(record, reason)
     end
 end
 
@@ -609,6 +632,7 @@ local function WriteWindowItems(window, cat, src, countActivity)
 end
 
 local function OnMailTake(mailIndex)
+    TaintOpen("a mail item was taken")
     if not GetInboxHeaderInfo then
         return
     end
@@ -821,6 +845,9 @@ local function OnLootLine(text)
         line.ctx = cat
         local pending = { kind = "item", iid = itemID, link = link, qty = tonumber(quantity) or 1,
             dir = "in", cat = cat, src = src }
+        if cat == "trade" or src == "trade" then
+            TaintOpen("a trade item arrived")
+        end
         if cat == "craft" then
             -- Going Out step 1 (2026-11-05): craft facts (output, returns,
             -- mats used) are written by the craft capture (ItemLedger:WriteCraft),
@@ -1007,6 +1034,14 @@ function LootReader:NoteContainerClick(bag, slot, itemID, link, stackCount)
             slots = {}, lines = {}, windows = {}, currencies = {}, moneyBefore = GetMoney and GetMoney() or nil }
         openings[#openings + 1] = record
     end
+    -- Outside evidence at the click (see header).
+    if lastMailTake and (now - lastMailTake.at) <= MAIL_TAKE_SECONDS then
+        Taint(record, "a mail item was taken")
+    elseif lastQuestAt and (now - lastQuestAt) <= QUEST_CONTEXT_SECONDS then
+        Taint(record, "a quest was turned in")
+    elseif windowOpen.trade then
+        Taint(record, "the trade window was open")
+    end
     -- Another container clicked close in time: contents can't be told apart.
     for _, other in ipairs(openings) do
         if other ~= record and (now - other.lastAt) <= CONTAINER_LINE_SECONDS then
@@ -1190,6 +1225,10 @@ function LootReader:SplitBurst(burst)
     local byExpansion = {}
     local moneyBefore = nil
     for _, record in ipairs(burst.records) do
+        if record.outside then
+            burst.reason = "not split: " .. record.outside
+            return false
+        end
         if #record.windows > 0 or #(record.currencies or {}) > 0 then
             burst.reason = "not split: a loot window or currency was mixed in"
             return false
@@ -1245,6 +1284,8 @@ function LootReader:CompleteOpening(record)
     record.lastAt, record.firstAt, record.token, record.moneyBefore, record.burstDone = nil, nil, nil, nil, nil
     if opens == 0 then
         record.reason = "not opened: the container never left its slot"
+    elseif record.outside then
+        record.reason = "ambiguous: " .. record.outside .. " at the same time"
     elseif record.ambiguous then
         record.reason = "ambiguous: another container was opened at the same time"
             .. (record.burstReason and (" (" .. record.burstReason .. ")") or "")
@@ -1364,6 +1405,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         OnItemCountChanged((...))
     elseif event == "QUEST_TURNED_IN" then
         lastQuestAt = GetTime()
+        TaintOpen("a quest was turned in")
     elseif event == "TRADE_SKILL_ITEM_CRAFTED_RESULT" then
         lastCraftAt = GetTime()
     elseif event == "UNIT_SPELLCAST_SENT" then

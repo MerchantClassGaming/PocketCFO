@@ -385,6 +385,67 @@ function ValuationService:GetCheapestVersionValue(itemID)
     return ResolveCheapestVersion(cacheModule, { itemID = itemID }, itemID, nil)
 end
 
+-- Scan history fallback (stage 2 step 3, Brian 2026-11-06). ScanHistory
+-- (FullScan + item searches) keeps each market key's recent average over
+-- the last ~14 days seen and a lifetime average. Used when:
+--   - there's no cached price at all: recent average, else lifetime;
+--   - the cached price is stale (older than PricingCache's 3-day fresh
+--     window) and history has >= HISTORY_MIN_DAYS days: the recent average
+--     (it includes that same observation plus the other days seen, so one
+--     odd day doesn't carry the value).
+-- Same AH source, so every rule (ladder cap etc.) still applies.
+local HISTORY_MIN_DAYS = 2
+
+local function GetScanHistory()
+    return PocketCFO_Valuation:GetModule("ScanHistory", true)
+end
+
+local function HistoryResult(normalized, resolvedItemID, marketKey, needDays, staleRow)
+    local history = GetScanHistory()
+    if not history or type(history.Get) ~= "function" or not marketKey then
+        return nil
+    end
+    local ok, rec = pcall(history.Get, history, marketKey)
+    if not ok or type(rec) ~= "table" or (tonumber(rec.daysSeen) or 0) < needDays then
+        return nil
+    end
+    local value, which = tonumber(rec.recent), "recent"
+    if not value or value <= 0 then
+        value, which = tonumber(rec.lifetime), "lifetime"
+    end
+    if not value or value <= 0 then
+        return nil
+    end
+    value = math.floor(value + 0.5)
+    local lastSeen = history.SECONDS_PER_DAY and tonumber(rec.lastDay)
+        and tonumber(rec.lastDay) * history.SECONDS_PER_DAY or nil
+    return {
+        resolved = true,
+        value = value,
+        valuePerUnit = value,
+        currency = CURRENCY_COPPER,
+        basis = "scanHistory:" .. which .. ":" .. tostring(rec.daysSeen),
+        source = SOURCE_AH,
+        strategyKey = SOURCE_AH,
+        valuationBasis = BASIS_MODELED,
+        itemID = normalized.itemID or resolvedItemID,
+        configKey = normalized.configKey,
+        isFresh = false,
+        lastUpdated = lastSeen,
+        unresolved = nil,
+        unresolvedReason = nil,
+        provenance = {
+            marketKey = marketKey,
+            scanHistory = which,
+            historyDays = tonumber(rec.daysSeen),
+            staleCacheValue = staleRow and staleRow.value or nil,
+            staleCacheTimestamp = staleRow and staleRow.timestamp or nil,
+            timestamp = lastSeen,
+            isFresh = false,
+        },
+    }
+end
+
 -- Resolves an AH-derived value for a normalized itemRef using only existing
 -- PricingIdentity/PricingCache lookups - no new pricing math, all existing
 -- protections (bait/clown-auction depth-averaging lives upstream in
@@ -416,11 +477,23 @@ local function ResolveAHValue(normalized, facts)
 
     local value, freshness, row = cacheModule:GetValueByMarketKey(marketKey)
     if value == nil then
+        -- This exact version's own history first, then the average of the
+        -- other stat versions (recipe previews), then nothing.
+        local fromHistory = HistoryResult(normalized, resolvedItemID, marketKey, 1, nil)
+        if fromHistory then
+            return fromHistory
+        end
         local average = ResolveStatVariantAverage(cacheModule, marketKey, normalized, resolvedItemID)
         if average then
             return average
         end
         return nil, "noPriceData"
+    end
+    if freshness == "stale" then
+        local fromHistory = HistoryResult(normalized, resolvedItemID, marketKey, HISTORY_MIN_DAYS, row)
+        if fromHistory then
+            return fromHistory
+        end
     end
 
     return {
@@ -525,6 +598,7 @@ local function ResolveCustomItemValuation(normalized, options, facts)
     local visitKey = normalized.configKey or ("itemID:" .. tostring(normalized.itemID))
     local stack = ValuationService._customValuationStack
     if stack[visitKey] then
+        PocketCFO_Valuation:MarkUnstable()
         return NewUnresolved(normalized.itemID, normalized.configKey, "valuationCycle")
     end
 
@@ -714,23 +788,182 @@ local function ResolveItemValueTrace(normalized, options)
     }
 end
 
+-- Same precedence and same answer as ResolveItemValueTrace, but stops at
+-- the first source that wins (Brian, 2026-11-07, hover performance). The
+-- trace version resolves every source so ExplainValue can show them all;
+-- GetItemValue doesn't need that: when a custom rule resolves, the vendor
+-- and AH lookups are skipped, and the custom rule is matched once, not twice.
+local function ResolveItemValueFast(normalized, options)
+    local facts = NewFacts(normalized)
+    local customResult = ResolveCustomItemValuation(normalized, options, facts)
+
+    local selected
+    if customResult and customResult.resolved == true then
+        selected = customResult
+    else
+        local vendorResult, vendorUnresolvedReason = ResolveVendorValue(normalized)
+        local ahResult, ahUnresolvedReason = ResolveAHValue(normalized, facts)
+        if vendorResult then
+            local ahBelowVendor = false
+            if ahResult and tonumber(ahResult.value) and tonumber(vendorResult.value)
+                and tonumber(ahResult.value) < tonumber(vendorResult.value) then
+                local ok, level = pcall(ValuationService.GetConfidence, ValuationService, ahResult)
+                ahBelowVendor = ok and level == "confident"
+            end
+            selected = ahBelowVendor and ahResult or vendorResult
+        elseif ahResult then
+            selected = ahResult
+        else
+            local reason = (customResult and customResult.reason)
+                or ahUnresolvedReason
+                or vendorUnresolvedReason
+                or "valueUnresolved"
+            selected = NewUnresolved(normalized.itemID, normalized.configKey, reason)
+        end
+    end
+
+    selected = ApplyRuleAdjustments(selected, facts)
+    return selected, facts
+end
+
+-- ---------------------------------------------------------------------------
+-- Price sheet (Brian, 2026-11-07, hover performance). An item's value only
+-- changes when what it's worked out from changes, so each answer is
+-- remembered and reused until then:
+--   - PocketCFO_Valuation.valueVersion moves (price cache write, container
+--     opened, rule or vendor price change; see Core.lua), or
+--   - SHEET_SECONDS pass, for inputs outside this addon that don't bump the
+--     version (your own sales for confidence, Cost to Make for the tool
+--     ladder) and for the 3-day fresh -> stale switch.
+-- Kept in memory only, never saved. Shared by every caller (tooltip,
+-- recipe analysis, posting, ledger pricing, the cap rules and disenchant
+-- mats), so each item is valued once per change, not once per look.
+-- Not remembered: answers worked out while item data was still loading or
+-- a recursion guard tripped (PocketCFO_Valuation.unstableCount moved), or
+-- with rules still pending; those are tried again next time, as before.
+-- Callers get their own copy of the top-level result table, so a caller
+-- writing a field on it (SmartPricing sets configKey) never changes the
+-- remembered answer.
+-- ---------------------------------------------------------------------------
+
+local SHEET_SECONDS = 10 * 60
+local SHEET_MAX_ENTRIES = 4000
+
+local sheet, sheetCount, sheetVersion = {}, 0, nil
+
+local function SheetClock()
+    return GetTime and GetTime() or 0
+end
+
+-- Empties the sheet when the value version has moved.
+local function CheckSheetVersion()
+    local version = PocketCFO_Valuation.valueVersion or 0
+    if sheetVersion ~= version then
+        sheet, sheetCount, sheetVersion = {}, 0, version
+        ValuationService._confidenceMemo = {}
+    end
+end
+
+local function SheetKey(normalized)
+    return table.concat({
+        tostring(normalized.itemID),
+        tostring(normalized.itemLink),
+        tostring(normalized.configKey),
+        tostring(normalized.qualityTier),
+        tostring(normalized.itemLevel),
+        tostring(normalized.statFingerprint),
+    }, "#")
+end
+
+local function CopyResult(result)
+    local copy = {}
+    for key, value in pairs(result) do
+        copy[key] = value
+    end
+    return copy
+end
+
+-- Reasons that mean "not known yet", not "no value": never remembered.
+local TRANSIENT_REASONS = {
+    marketKeyUnresolved = true,
+    itemDataPending = true,
+    valuationCycle = true,
+    customStrategyError = true,
+    valuationModulesUnavailable = true,
+    valuationRulesUnavailable = true,
+    vendorPriceServiceUnavailable = true,
+}
+
+local function IsRememberable(result, facts)
+    if type(result) ~= "table" or result.rulesPending then
+        return false
+    end
+    if result.unresolved and TRANSIENT_REASONS[tostring(result.unresolvedReason or result.reason)] then
+        return false
+    end
+    -- Item data asked for during the lookup but not loaded yet.
+    if facts and facts.infoDone and facts.info == nil then
+        return false
+    end
+    return true
+end
+
 --- Returns "what is this item worth right now?" for one itemRef.
 -- Never returns zero for a missing price - returns unresolved instead.
 -- Canonical resolution order: registered custom rule -> vendor purchase
 -- price -> Auction House market price -> unresolved. See
--- ResolveItemValueTrace, the single shared precedence implementation this
--- and ExplainValue both call.
+-- ResolveItemValueTrace (the full trace ExplainValue uses) and
+-- ResolveItemValueFast (same answer, used here). Answers come from the
+-- price sheet above when nothing has changed since the last lookup.
 -- @param itemRef number itemID | string itemLink | string configKey |
 --        table { itemID, configKey, itemLink, qualityTier, itemLevel, statFingerprint }
 -- @param options table|nil reserved for future use; no options affect
---        behavior yet (no historical/trend lookups exist).
+--        behavior yet (no historical/trend lookups exist). A lookup with
+--        options is never taken from or saved to the sheet.
 function ValuationService:GetItemValue(itemRef, options)
     local normalized, normalizeReason = NormalizeItemRef(itemRef)
     if normalizeReason then
         return NewUnresolved(normalized.itemID, normalized.configKey, normalizeReason)
     end
 
-    return ResolveItemValueTrace(normalized, options).selected
+    if options ~= nil then
+        return (ResolveItemValueFast(normalized, options))
+    end
+
+    CheckSheetVersion()
+    local key = SheetKey(normalized)
+    local now = SheetClock()
+    local entry = sheet[key]
+    if entry and now - entry.at < SHEET_SECONDS then
+        return CopyResult(entry.result)
+    end
+
+    local unstableBefore = PocketCFO_Valuation.unstableCount or 0
+    local result, facts = ResolveItemValueFast(normalized, nil)
+    if (PocketCFO_Valuation.unstableCount or 0) == unstableBefore and IsRememberable(result, facts) then
+        -- A nested lookup during this one may have moved the version (it
+        -- can't today, but a stale entry must never be stored as current).
+        CheckSheetVersion()
+        if sheetCount >= SHEET_MAX_ENTRIES then
+            sheet, sheetCount = {}, 0
+        end
+        if not sheet[key] then
+            sheetCount = sheetCount + 1
+        end
+        sheet[key] = { result = result, at = now }
+    elseif not IsRememberable(result, facts) then
+        -- Lookups wrapping this one must not remember an answer built on it.
+        PocketCFO_Valuation:MarkUnstable()
+    end
+    return CopyResult(result)
+end
+
+--- True when a custom value rule (containers, Moxie bags, gray items...)
+-- covers this item. Lets the tooltip value a bound item that has one and
+-- skip bound items that don't. ref: itemID and/or itemLink.
+function ValuationService:HasValueRule(itemID, itemLink)
+    local facts = NewFacts({ itemID = tonumber(itemID), itemLink = itemLink })
+    return FindCustomItemStrategy({ itemID = tonumber(itemID), itemLink = itemLink }, facts) ~= nil
 end
 
 -- Smallest canonical currency identity helper - the one place a currency
@@ -800,6 +1033,7 @@ function ValuationService:GetCurrencyValue(currencyRef, options)
     local visitKey = "currency:" .. tostring(currencyID)
     local stack = self._customValuationStack
     if stack[visitKey] then
+        PocketCFO_Valuation:MarkUnstable()
         return NewUnresolvedCurrency(currencyID, "valuationCycle")
     end
 
@@ -917,8 +1151,11 @@ function ValuationService:ExplainValue(itemRef, options)
             -- accepted/rejected bucket+quantity counts, per-rejected-bucket
             -- reason) from PricingValuation.CalculateStackableValue - see
             -- that module's header for the algorithm. nil for non-stackable
-            -- items or cache rows priced before this diagnostic existed.
-            valuationDiagnostics = cacheRow and cacheRow.valuationDiagnostics,
+            -- items. Since 2026-11-07 not saved on cache rows: only kept for
+            -- markets priced by an item search this session.
+            valuationDiagnostics = (cacheRow and cacheRow.valuationDiagnostics)
+                or (cacheModule and cacheModule.GetSessionDiagnostics and cacheModule:GetSessionDiagnostics(marketKey))
+                or nil,
             unresolvedReason = (not trace.ah) and trace.ahUnresolvedReason or nil,
         },
         selected = {
@@ -968,7 +1205,8 @@ end
 -- result: a GetItemValue result. Returns "confident" | "uncertain", reason.
 -- Confident:
 --   - not an AH price (custom rule, vendor purchase price)
---   - our own sale of it in the last SALE_DAYS days (SaleIndex)
+--   - our own sale of it in the last SALE_DAYS days (SaleIndex), only when
+--     the value is within 50%-2x of that sale price (2026-11-06)
 --   - stackable priced from >= MIN_UNITS units across >= 2 listings
 --   - anything else with >= MIN_LISTINGS listings of that exact version
 --   - seen on >= MIN_DAYS days (ScanHistory)
@@ -983,6 +1221,13 @@ local CONFIDENCE_SALE_DAYS = 30
 local CONFIDENCE_LOW_PCT = 0.5
 local CONFIDENCE_HIGH_X = 2
 
+-- Answers are remembered with the price sheet (same version and time
+-- limit; Brian, 2026-11-07): the tooltip, the vendor-ceiling check and smart
+-- posting ask about the same result several times.
+ValuationService._confidenceMemo = ValuationService._confidenceMemo or {}
+
+local ComputeConfidence
+
 function ValuationService:GetConfidence(result)
     if type(result) ~= "table" or result.unresolved or not tonumber(result.value) then
         return "uncertain", "noValue"
@@ -990,6 +1235,25 @@ function ValuationService:GetConfidence(result)
     if result.source ~= "auctionHouse" then
         return "confident", "notAuctionHouse"
     end
+    CheckSheetVersion()
+    local key = table.concat({
+        tostring(result.provenance and result.provenance.marketKey),
+        tostring(result.value),
+        tostring(result.provenance and result.provenance.scanHistory),
+        tostring(result.configKey),
+        tostring(result.itemID),
+    }, "#")
+    local now = SheetClock()
+    local memo = self._confidenceMemo[key]
+    if memo and now - memo.at < SHEET_SECONDS then
+        return memo.level, memo.reason
+    end
+    local level, reason = ComputeConfidence(result)
+    self._confidenceMemo[key] = { level = level, reason = reason, at = now }
+    return level, reason
+end
+
+ComputeConfidence = function(result)
     local value = tonumber(result.value)
     local marketKey = result.provenance and result.provenance.marketKey
     local cache = PocketCFO_Valuation:GetModule("PricingCache", true)
@@ -1002,16 +1266,31 @@ function ValuationService:GetConfidence(result)
     local recent = rec and tonumber(rec.recent)
 
     if daysSeen >= CONFIDENCE_MIN_DAYS and recent and recent > 0 then
-        local before = tonumber(row and row.value) or value
-        if before < recent * CONFIDENCE_LOW_PCT or before > recent * CONFIDENCE_HIGH_X then
-            return "uncertain", "farFromUsual"
+        -- A value from scan history is history: compare it, not the stale
+        -- cached row it replaced (2026-11-06).
+        local fromHistory = result.provenance and result.provenance.scanHistory
+        local before = (not fromHistory and tonumber(row and row.value)) or value
+        -- Which side matters to smart posting (Brian, 2026-11-06): a value
+        -- thrown out for being far BELOW usual is still a lower bound on the
+        -- max; one far ABOVE usual may be a clown and never is.
+        if before < recent * CONFIDENCE_LOW_PCT then
+            return "uncertain", "farBelowUsual"
+        end
+        if before > recent * CONFIDENCE_HIGH_X then
+            return "uncertain", "farAboveUsual"
         end
     end
 
     if sales then
         local ok, price, at = pcall(sales.GetLastSale, sales, result.configKey, result.itemID)
         local now = GetServerTime and GetServerTime() or time()
-        if ok and price and at and now - at <= CONFIDENCE_SALE_DAYS * 86400 then
+        -- A recent sale only backs the value up when it's close to it (same
+        -- 50%-2x band as the history check; Brian 2026-11-06: a 400g sale
+        -- made a 1,285g value "confident"). Far off, it says nothing either
+        -- way and the checks below decide.
+        price = tonumber(price)
+        if ok and price and price > 0 and at and now - at <= CONFIDENCE_SALE_DAYS * 86400
+            and value >= price * CONFIDENCE_LOW_PCT and value <= price * CONFIDENCE_HIGH_X then
             return "confident", "soldRecently"
         end
     end

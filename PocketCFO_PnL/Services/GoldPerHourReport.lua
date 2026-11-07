@@ -291,6 +291,66 @@ local function NewestFirst(list)
     return list
 end
 
+-- Dropped professions (2026-11-06, Brian): gathering loot from a profession
+-- the character no longer has goes to its own "<Profession> (dropped)" row.
+-- Returns { { run = run or slice, droppedKey = key or nil } }.
+--   No dropped parts: the run as is. All parts dropped (one profession, the
+--   usual case): the run as is, on that profession's dropped row.
+--   Mixed: one slice per dropped part plus one for the rest, each with its
+--   own items and parts; run time split by share of loots. Zones and lure
+--   costs stay on the rest (zones are not kept per profession).
+local function SplitDroppedGathering(run, dropped)
+    if (run.activity or "gathering") ~= "gathering" or not next(dropped) then
+        return { { run = run } }
+    end
+    local droppedKeys, keptKeys = {}, {}
+    for partKey in pairs(run.parts or {}) do
+        if dropped[partKey] then
+            droppedKeys[#droppedKeys + 1] = partKey
+        else
+            keptKeys[#keptKeys + 1] = partKey
+        end
+    end
+    if #droppedKeys == 0 then
+        return { { run = run } }
+    end
+    if #keptKeys == 0 and #droppedKeys == 1 then
+        return { { run = run, droppedKey = droppedKeys[1] } }
+    end
+    local runs = Runs()
+    local totalSeconds = runs:GetRunSeconds(run)
+    local totalLoots = 0
+    for _, part in pairs(run.parts) do
+        totalLoots = totalLoots + (tonumber(part.loots) or 0)
+    end
+    local function Share(part)
+        return totalLoots > 0 and ((tonumber(part.loots) or 0) / totalLoots) or 0
+    end
+    local function Slice(partKeys, withExtras)
+        local slice = { startedAt = run.startedAt, lastLootAt = run.lastLootAt,
+            endedAt = run.endedAt or run.lastLootAt or run.startedAt, activity = "gathering",
+            seconds = 0, items = {}, parts = {}, zones = withExtras and run.zones or {},
+            costs = withExtras and run.costs or nil, costUnpriced = withExtras and run.costUnpriced or nil }
+        local share = 0
+        for _, partKey in ipairs(partKeys) do
+            local part = run.parts[partKey]
+            slice.parts[partKey] = part
+            MergeItems(slice.items, part.items)
+            share = share + Share(part)
+        end
+        slice.seconds = totalSeconds * share
+        return slice
+    end
+    local list = {}
+    for _, partKey in ipairs(droppedKeys) do
+        list[#list + 1] = { run = Slice({ partKey }, #keptKeys == 0 and partKey == droppedKeys[1]), droppedKey = partKey }
+    end
+    if #keptKeys > 0 then
+        list[#list + 1] = { run = Slice(keptKeys, true) }
+    end
+    return list
+end
+
 -- Ranking for a period and toon (characterGUID nil = all shown toons):
 -- { ranked = { row }, unranked = { row }, hideable = { { key, label } } }
 -- row = { key, label (activity), name (character), activity, runs, seconds, copper, cost, costUnpriced, perHour,
@@ -309,11 +369,12 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
     local history = runs:GetHistory()
     local byCharacter = {}
 
-    local function Collect(guid, run)
+    local droppedByGuid = {}
+    local function CollectOne(guid, run, droppedKey)
         local activity = run.activity or "gathering"
-        local key = guid .. ":" .. activity
-        local character = byCharacter[key] or { guid = guid, activity = activity, runs = 0, seconds = 0,
-            cost = 0, items = {}, parts = {}, zones = {}, runList = {} }
+        local key = droppedKey and (guid .. ":gathering:dropped:" .. droppedKey) or (guid .. ":" .. activity)
+        local character = byCharacter[key] or { guid = guid, activity = activity, droppedKey = droppedKey,
+            runs = 0, seconds = 0, cost = 0, items = {}, parts = {}, zones = {}, runList = {} }
         byCharacter[key] = character
         character.runs = character.runs + 1
         character.runList[#character.runList + 1] = run
@@ -333,6 +394,18 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
             character.zones[zoneName] = merged
             merged.seconds = merged.seconds + (tonumber(zone.seconds) or 0)
             MergeItems(merged.items, zone.items)
+        end
+    end
+
+    -- Each run, split off any dropped profession's loot first (SplitDroppedGathering).
+    local function Collect(guid, run)
+        local dropped = droppedByGuid[guid]
+        if not dropped then
+            dropped = runs:GetDroppedGatheringProfessions(guid)
+            droppedByGuid[guid] = dropped
+        end
+        for _, piece in ipairs(SplitDroppedGathering(run, dropped)) do
+            CollectOne(guid, piece.run, piece.droppedKey)
         end
     end
 
@@ -358,8 +431,10 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
         local copper = gross - character.cost
         local row = {
             key = key,
-            hideKey = RunHideKey(runs, character.guid, character.activity),
-            label = runs:GetActivityLabel(character.guid, character.activity),
+            hideKey = character.droppedKey and ("gathering:dropped:" .. character.droppedKey)
+                or RunHideKey(runs, character.guid, character.activity),
+            label = character.droppedKey and (runs:GetGatheringLabel(character.droppedKey) .. " (dropped)")
+                or runs:GetActivityLabel(character.guid, character.activity),
             name = ColoredName(name, classFile),
             activity = character.activity,
             runs = character.runs,
@@ -386,7 +461,7 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
         end
         -- By profession: what the character has (2026-10-31). Gathering rows
         -- only, 2+ professions; one it has but gathered nothing of shows as 0.
-        if character.activity == "gathering" then
+        if character.activity == "gathering" and not character.droppedKey then
             local professions = runs:GetGatheringProfessions(character.guid)
             row.showProfessions = #professions >= 2
             local present = {}
@@ -470,8 +545,21 @@ function GoldPerHourReport:GetHideable()
         end
     end
     if runs then
+        local droppedByGuid = {}
         local function Note(guid, run)
-            Add(RunHideKey(runs, guid, run.activity), runs:GetActivityLabel(guid, run.activity))
+            local dropped = droppedByGuid[guid]
+            if not dropped then
+                dropped = runs:GetDroppedGatheringProfessions(guid)
+                droppedByGuid[guid] = dropped
+            end
+            for _, piece in ipairs(SplitDroppedGathering(run, dropped)) do
+                if piece.droppedKey then
+                    Add("gathering:dropped:" .. piece.droppedKey,
+                        runs:GetGatheringLabel(piece.droppedKey) .. " (dropped)")
+                else
+                    Add(RunHideKey(runs, guid, run.activity), runs:GetActivityLabel(guid, run.activity))
+                end
+            end
         end
         for guid, entry in pairs(runs:GetHistory()) do
             for _, run in ipairs(entry.runs or {}) do

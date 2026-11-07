@@ -7,7 +7,7 @@
 ## X-Curse-Project-ID: 1575653
 ## X-Wago-ID: 4N2k0W6L
 ## X-WoWI-ID: 27267
-## Version: v1.2.2
+## Version: v1.2.3
 ## Category-enUS: Auctions
 ## IconTexture: Interface\AddOns\PocketCFO\Media\PocketCFO_Icon.tga
 ## AddonCompartmentFunc: PocketCFO_OnAddonCompartmentClick
@@ -40,6 +40,8 @@ Infrastructure\RecipeOwnershipUpdater.lua
 Services\ProfessionRegistry\ProfessionRegistry.lua
 Services\RecipeRegistry\RecipeRegistry.lua
 Services\CostToMakeStore\CostToMakeStore.lua
+Services\RecipeSeed\RecipeSeedLive.lua
+Services\RecipeSeed\RecipeSeed.lua
 Services\ProcessingOperationRegistry\ProcessingOperationRegistry.lua
 Services\CraftAnalysisEligibilityPolicy\CraftAnalysisEligibilityPolicy.lua
 Services\OperationProfileKeyService\OperationProfileKeyService.lua

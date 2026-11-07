@@ -1,16 +1,1 @@
-Forever and Retail
-Aligned tooltip for vendor, auction value, and disenchant value so they are easier to read
-
-Fixed a bug where sometimes an item sold by vendors would overstate its valuation if a vendor sold it for more than current AH listings.
-
-Adjusted rounding of gold amounts to use the biggest 2 coin amounts. In other words, a value that has gold will cut off the copper where smaller amounts will show silver/copper.
-
-Added a Start Session button to the small, standalone gold per hour tracker window. This does the same thing as the Start Session button in the main gold window.
-
-Custom gold tracking sessions keep running through a logout or a reload.
-
-You will get a “Still gathering?” prompt after 3 minutes with no gather on an automatic gathering run.
-
-Retail Only
-Adjusted custom craft analysis for Inscription reagents. These now show live recipe analysis like most recipes do.
-
+Bug fixes and improvements.

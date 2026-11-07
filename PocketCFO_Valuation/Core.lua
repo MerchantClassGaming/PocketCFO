@@ -9,6 +9,32 @@ local PocketCFO_Valuation = LibStub("AceAddon-3.0"):NewAddon(
 )
 _G.PocketCFO_Valuation = PocketCFO_Valuation
 
+-- Value version (Brian, 2026-11-07, hover performance). Remembered values
+-- (ValuationService's price sheet, the tooltip rows) are kept until
+-- something they were worked out from changes. Anything that can change a
+-- value bumps this number, and every remembered value made under an older
+-- number is thrown away on its next read:
+--   - a price cache write (full scan, item search) and the quality sibling /
+--     profession gear pair rebuilds: PCFO_PRICING_UPDATED
+--   - a container opened (its value comes from your own openings):
+--     MCG_CONTAINER_OPENED
+--   - a valuation rule added or removed (ValuationRules)
+--   - a vendor purchase price seen at a merchant (VendorPriceService)
+-- Things outside this addon that only nudge a value (your own sales, Cost
+-- to Make, new disenchants) are covered by the sheet's time limit instead.
+-- unstableCount: bumped whenever a lookup hits a recursion guard or missing
+-- item data; a value worked out while it moved is not remembered.
+PocketCFO_Valuation.valueVersion = 0
+PocketCFO_Valuation.unstableCount = 0
+
+function PocketCFO_Valuation:BumpValueVersion()
+    self.valueVersion = (self.valueVersion or 0) + 1
+end
+
+function PocketCFO_Valuation:MarkUnstable()
+    self.unstableCount = (self.unstableCount or 0) + 1
+end
+
 local DB_DEFAULTS = {
     global = {
         -- Prices and last-scan time live per connected realm group in
@@ -27,6 +53,14 @@ end
 function PocketCFO_Valuation:OnInitialize()
     self.db = LibStub("AceDB-3.0"):New("PocketCFO_ValuationDB", DB_DEFAULTS, true)
     self.db.global.vendorPriceObservations = self.db.global.vendorPriceObservations or {}
+    -- Handlers ignore the message arguments (CraftSim's bundled
+    -- CallbackHandler can shift them; see api-findings).
+    self:RegisterMessage("PCFO_PRICING_UPDATED", function()
+        PocketCFO_Valuation:BumpValueVersion()
+    end)
+    self:RegisterMessage("MCG_CONTAINER_OPENED", function()
+        PocketCFO_Valuation:BumpValueVersion()
+    end)
     Debug("PocketCFO_Valuation initialized.")
 end
 

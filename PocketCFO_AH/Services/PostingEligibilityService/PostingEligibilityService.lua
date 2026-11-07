@@ -32,15 +32,19 @@ local function IsLikelyCommodityItem(itemLink, itemID, itemInfo)
     return isCraftingReagent == true or (tonumber(maxStack) or 1) > 1
 end
 
+-- Returns postable, and when false a reason: "noItem" | "noSlot" | "bound"
+-- | "ahRefused" (C_AuctionHouse.IsSellItemValid said no). The reason is for
+-- diagnostics only (Brian, 2026-11-06: smart list sometimes drops every
+-- finished good; the session log now says which check refused them).
 function PostingEligibilityService:IsBagSlotAHPostable(containerID, slot, itemID)
     if not itemID then
-        return false
+        return false, "noItem"
     end
     if not containerID or not slot then
-        return false
+        return false, "noSlot"
     end
     if BagSlotHasBoundTooltip(containerID, slot) then
-        return false
+        return false, "bound"
     end
 
     if ItemLocation and ItemLocation.CreateFromBagAndSlot
@@ -56,7 +60,7 @@ function PostingEligibilityService:IsBagSlotAHPostable(containerID, slot, itemID
             if IsLikelyCommodityItem(info and info.hyperlink, itemID, info) then
                 return true
             end
-            return false
+            return false, "ahRefused"
         end
     end
 

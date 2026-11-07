@@ -994,6 +994,9 @@ end
 -- = every character). Day / month rows in the range are re-keyed and added
 -- into any row that already has the new key; detail entries in the range are
 -- re-tagged too. Amounts never change. Returns quantity, rows, entries moved.
+-- 2026-11-07 (container cleanup, /mcg containerfix): filter.iid limits it to
+-- one item / currency; filter.clearSrc = true also clears src on what moves
+-- (the wrong source goes with the wrong category).
 function ItemLedger:MoveRows(filter, toCat)
     local ledger = DB()
     if not ledger or type(filter) ~= "table" or not filter.cat or not toCat or filter.cat == toCat then
@@ -1012,7 +1015,14 @@ function ItemLedger:MoveRows(filter, toCat)
         return row.cat == filter.cat and (filter.dir == nil or row.dir == filter.dir)
             and (filter.kind == nil or row.kind == filter.kind)
             and (filter.src == nil or row.src == filter.src)
+            and (filter.iid == nil or row.iid == filter.iid)
             and (chars == nil or chars[row.c] == true)
+    end
+    local newSrc = function(src)
+        if filter.clearSrc then
+            return nil
+        end
+        return src
     end
     local movedQty, movedRows, movedEntries = 0, 0, 0
     EachBucket(ledger, filter, function(bucket)
@@ -1026,7 +1036,7 @@ function ItemLedger:MoveRows(filter, toCat)
         for _, key in ipairs(keys) do
             local row = rows[key]
             rows[key] = nil
-            local source = { c = row.c, dir = row.dir, cat = toCat, src = row.src, prof = row.prof,
+            local source = { c = row.c, dir = row.dir, cat = toCat, src = newSrc(row.src), prof = row.prof,
                 kind = row.kind, iid = row.iid }
             AddToRow(rows, EntryKey(source), source, row.qty, row.n, row.value, row.vq, row.units)
             movedQty = movedQty + (tonumber(row.qty) or 0)
@@ -1036,6 +1046,7 @@ function ItemLedger:MoveRows(filter, toCat)
     for _, entry in ipairs(ledger.detail) do
         if Matches(entry) and (not filter.from or entry.day >= filter.from) and (not filter.to or entry.day <= filter.to) then
             entry.cat = toCat
+            entry.src = newSrc(entry.src)
             movedEntries = movedEntries + 1
         end
     end

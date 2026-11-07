@@ -131,6 +131,14 @@ local function StoreObservation(itemID, unitPrice, purchasePrice, purchaseQuanti
         return
     end
 
+    -- A new or changed vendor price changes values (Core.lua value
+    -- version). An unchanged one (every MERCHANT_UPDATE re-reads the whole
+    -- merchant) doesn't.
+    local previous = root[itemID]
+    if not previous or previous.unitPrice ~= unitPrice then
+        PocketCFO_Valuation:BumpValueVersion()
+    end
+
     root[itemID] = {
         itemID = itemID,
         purchasePrice = purchasePrice,
@@ -455,6 +463,22 @@ function VendorPriceService:GetPrice(itemID)
     end
 
     return { resolved = false, itemID = itemID, reason = "vendorPriceUnavailable" }
+end
+
+--- True when a vendor purchase price exists for this item (observation or
+-- bundled default). Two table lookups, no result table built. The tooltip
+-- uses it to skip items that can't have a PocketCFO value (2026-11-07).
+function VendorPriceService:HasPrice(itemID)
+    itemID = tonumber(itemID)
+    if not itemID then
+        return false
+    end
+    local root = GetDBRoot()
+    if root and root[itemID] then
+        return true
+    end
+    local defaults = GetDefaultsTable()
+    return (defaults and defaults[itemID]) ~= nil
 end
 
 --- Diagnostic/export access: returns every stored observation, sorted by

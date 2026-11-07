@@ -118,7 +118,11 @@ Rules:Add({
 -- posts at (Brian, 2026-11-04: green rod's ladder cap was ~369g from the
 -- blues, but its own 350g price hid it, and posting matched a 2,547g green).
 -- Adds a field only; no value changes.
-local function NoteCap(ctx, cap)
+-- from (2026-11-07): the better item that set this cap, kept with the
+-- lowest cap as result.ladderCapFrom = { itemID, quality, price } (price =
+-- that item's own price). The post window shows it as one "Capped by" line
+-- instead of listing every better version.
+local function NoteCap(ctx, cap, from)
     cap = tonumber(cap)
     local result = ctx and ctx.result
     if not cap or type(result) ~= "table" then
@@ -126,6 +130,7 @@ local function NoteCap(ctx, cap)
     end
     if not result.ladderCap or cap < result.ladderCap then
         result.ladderCap = cap
+        result.ladderCapFrom = from
     end
 end
 
@@ -159,7 +164,7 @@ Rules:Add({
                 cap = tonumber(value)
             end
             if cap then
-                NoteCap(ctx, cap)
+                NoteCap(ctx, cap, { itemID = siblingID, quality = tier, price = cap })
                 ctx:Cap(cap, string.format("Capped at the quality %s price", tostring(tier or "?")))
             end
         end
@@ -201,13 +206,22 @@ Rules:Add({
 -- wishful (a 225 Sin'dorei Quill listed at 19,999g while the 232 sat at
 -- 3,100g). Every quality is capped at a share of the blue quality 5:
 --   blue  Q5 100  Q4 90  Q3 80  Q2 70  Q1 60
---   green Q5 50   Q4 40  Q3 30  Q2 25  Q1 20
+--   green Q5 40   Q4 35  Q3 30  Q2 25  Q1 20
+-- (Green Q5/Q4 were 50/40 until 2026-11-06: green Q5 Farstrider Fabric
+-- Cutters valued ~1,285g against a 2,666g blue Q5 while buyers paid ~900g.
+-- A tuning lever: adjust from sales data as it builds up.)
 -- When blue Q5 has no price, every better quality that has one stands in,
 -- scaled by the ratio of their shares (no Q5, Q4 at 1,350g -> Q3 capped at
 -- 1,350 x 80/90 = 1,200g). The lowest cap wins; a lower own price stays.
 -- Each better quality is priced as: same stats if listed, otherwise the
--- average of every stat listed at that quality (a recipe preview has no stat
--- yet, so it always uses the average).
+-- cheapest listed stat in the same stat group (Resourcefulness = Multicraft,
+-- Perception = Finesse; 2026-11-06), otherwise the average of every stat
+-- listed at that quality (a recipe preview has no stat yet, so it always
+-- uses the average).
+-- Deals never cap (2026-11-06): a better quality priced below 50% of the
+-- next priced quality above it (scaled by the shares) AND at or below its
+-- own cost to make +10% is a dump listing, not a market price, and is
+-- skipped (see DEAL_PCT, FLOOR_MARKUP).
 --
 -- Out-of-date prices (Brian, 2026-10-23): a price counts as current when it
 -- was seen within 3 days of the NEWEST price for that tool (green and blue
@@ -230,7 +244,7 @@ Rules:Add({
 
 local LADDER = {
     [3] = { [5] = 100, [4] = 90, [3] = 80, [2] = 70, [1] = 60 }, -- blue
-    [2] = { [5] = 50, [4] = 40, [3] = 30, [2] = 25, [1] = 20 },  -- green
+    [2] = { [5] = 40, [4] = 35, [3] = 30, [2] = 25, [1] = 20 },  -- green (Q5/Q4 lowered 2026-11-06)
 }
 local RARITY_NAME = { [2] = "green", [3] = "blue" }
 local PLACEHOLDER_STAT_PREFIX = "ITEM_MOD_MODIFIED_CRAFTING_STAT_"
@@ -289,7 +303,45 @@ local function QualityAverage(rows, base, cutoff)
     return total / count
 end
 
+-- Profession gear stat groups (Brian, 2026-11-06): stats a buyer treats as
+-- the same. Crafting tools: Resourcefulness = Multicraft (Ingenuity and
+-- Crafting Speed only match themselves). Gathering tools: Perception =
+-- Finesse (Deftness only matches itself). Returns a key that is equal for
+-- stat strings in the same group ("A|B" fingerprints compared stat by stat).
+-- Matched by name fragment: the exact Perception / Finesse key names are
+-- Theoretical until seen in a market key.
+local STAT_GROUPS = {
+    { "MULTICRAFT", "craft-yield" },
+    { "RESOURCEFULNESS", "craft-yield" },
+    { "PERCEPTION", "gather-yield" },
+    { "FINESSE", "gather-yield" },
+}
+
+local function StatGroupKey(stats)
+    if type(stats) ~= "string" or stats == "" then
+        return nil
+    end
+    local parts = {}
+    for stat in string.gmatch(stats, "[^|]+") do
+        local upper = stat:upper()
+        local key = stat
+        for _, group in ipairs(STAT_GROUPS) do
+            if upper:find(group[1], 1, true) then
+                key = group[2]
+                break
+            end
+        end
+        parts[#parts + 1] = key
+    end
+    table.sort(parts)
+    return table.concat(parts, "|")
+end
+
+-- Shared with smart AH posting (match a similar-stat listing).
+PocketCFO_Valuation.StatGroupKey = StatGroupKey
+
 -- A better quality's price for capping: same stats if current, otherwise
+-- the cheapest current price in the same stat group (2026-11-06), otherwise
 -- the current average at that quality.
 local function BetterQualityPrice(rows, itemID, quality, stats, cutoff)
     local base = tostring(itemID) .. "|q" .. tostring(quality)
@@ -298,8 +350,96 @@ local function BetterQualityPrice(rows, itemID, quality, stats, cutoff)
         if value then
             return value
         end
+        local group = StatGroupKey(stats)
+        local prefix = base .. "|stats:"
+        local cheapest
+        for key, row in pairs(rows) do
+            if key:sub(1, #prefix) == prefix then
+                local otherStats = RealStats(key)
+                if otherStats and StatGroupKey(otherStats) == group then
+                    local other = CurrentValue(row, cutoff)
+                    if other and (not cheapest or other < cheapest) then
+                        cheapest = other
+                    end
+                end
+            end
+        end
+        if cheapest then
+            return cheapest
+        end
     end
     return QualityAverage(rows, base, cutoff)
+end
+
+-- A better version priced far below the version above it is a deal (a
+-- dump listing), not a market price: it never caps anything (Brian,
+-- 2026-11-06: a 225 blue Sin'dorei Snippers dumped at 200g capped green Q5
+-- Farstrider Fabric Cutters at 125g while the 232 blue sat at 2,666g).
+-- Same 50% as the posting gear gap check.
+local DEAL_PCT = 0.50
+
+-- ...but only when the seller is losing money or close to it (Brian,
+-- 2026-11-06): a price is a dump only if it is ALSO at or below that
+-- version's floor, cost to make +10% (same markup as the smart posting
+-- floor). Someone making a good profit is a real price, even if it's far
+-- below the version above it (green Q5 Bright Linen Enchanting Hat at 125g,
+-- costs ~6g: real, so it caps the Q4. Accepted: Turbo Junker's blue Q2 at
+-- 400g, costs ~200g, now caps the green Q5 at ~229g). Cost unknown -> the
+-- share check alone decides, as before.
+local FLOOR_MARKUP = 1.10
+local COST_CACHE_SECONDS = 60
+
+-- Cost to Make per itemID from core CostToMakeStore (saved recipe at
+-- today's prices, else the recipe estimate; Theoretical on a character
+-- without the profession). Mats priced with GetItemValue. Mats are never
+-- profession tools, so this doesn't recurse into this rule; the guard is
+-- there in case one ever is. A known cost is cached briefly (valuation runs
+-- per tooltip); an unknown one never is.
+local costCache = {}
+local costing = false
+
+local function MatValue(matID, matConfigKey)
+    local service = PocketCFO_Valuation:GetModule("ValuationService", true)
+    if not service then
+        return nil
+    end
+    local ok, result = pcall(service.GetItemValue, service, { itemID = matID, configKey = matConfigKey })
+    if not ok or type(result) ~= "table" or result.unresolved then
+        return nil
+    end
+    local value = tonumber(result.valuePerUnit or result.value)
+    if not value or value <= 0 then
+        return nil
+    end
+    return value
+end
+
+local function CostToMake(itemID)
+    local store = _G.PocketCFO_CostToMakeStore
+    if costing or not itemID or not store or type(store.GetCost) ~= "function" then
+        return nil
+    end
+    local now = GetTime and GetTime() or 0
+    local cached = costCache[itemID]
+    if cached and now - cached.t < COST_CACHE_SECONDS then
+        return cached.cost
+    end
+    costing = true
+    local ok, cost = pcall(store.GetCost, store, nil, itemID, nil, MatValue, nil)
+    costing = false
+    cost = ok and tonumber(cost) or nil
+    if cost and cost <= 0 then
+        cost = nil
+    end
+    -- Only a known cost is kept. "Unknown" (mats not loaded yet, e.g. while
+    -- the posting list builds) is tried again on the next look, so the same
+    -- item doesn't get a different value depending on timing (Brian,
+    -- 2026-11-06: Apprentice Jeweler's Apron row max 1,251g while its hover
+    -- value a minute later was 285g).
+    if cost then
+        costCache[itemID] = { cost = cost, t = now }
+    end
+    return cost
 end
 
 -- The item's own current price: its own stat only when it has a real stat,
@@ -379,18 +519,49 @@ Rules:Add({
             end
         end
 
-        local lowestCap, lowestFrom
+        -- Price every better position, lowest share first, then skip deals:
+        -- a price below DEAL_PCT of the next position up (scaled by the
+        -- shares) never caps. The top priced position has nothing above it
+        -- and always counts.
+        local priced = {}
         for _, position in ipairs(better) do
             local price = BetterQualityPrice(RowsFor(position.itemID), position.itemID, position.quality, stats, cutoff)
             if price then
-                local cap = price * ownShare / position.share
+                priced[#priced + 1] = { position = position, price = price }
+            end
+        end
+        table.sort(priced, function(a, b) return a.position.share < b.position.share end)
+
+        local lowestCap, lowestFrom, lowestFromPrice
+        for index, entry in ipairs(priced) do
+            local above
+            for later = index + 1, #priced do
+                if priced[later].position.share > entry.position.share then
+                    above = priced[later]
+                    break
+                end
+            end
+            local isDeal = above ~= nil
+                and entry.price < above.price * entry.position.share / above.position.share * DEAL_PCT
+            if isDeal then
+                local cost = CostToMake(entry.position.itemID)
+                if cost and entry.price > cost * FLOOR_MARKUP then
+                    isDeal = false -- far below, but the seller makes a profit: a real price
+                end
+            end
+            if not isDeal then
+                local cap = entry.price * ownShare / entry.position.share
                 if not lowestCap or cap < lowestCap then
-                    lowestCap, lowestFrom = cap, position
+                    lowestCap, lowestFrom, lowestFromPrice = cap, entry.position, entry.price
                 end
             end
         end
 
-        NoteCap(ctx, lowestCap)
+        NoteCap(ctx, lowestCap, lowestFrom and {
+            itemID = lowestFrom.itemID,
+            quality = lowestFrom.quality,
+            price = lowestFromPrice,
+        } or nil)
         local ownCurrent = OwnCurrentPrice(RowsFor(itemID), itemID, quality, stats, cutoff)
         local target, note
         if ownCurrent and (not lowestCap or ownCurrent <= lowestCap) then

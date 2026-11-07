@@ -466,11 +466,14 @@ function ValuationRules:Add(rule)
     rule._score = Score(rule.match)
     rule._order = self._order
     self.rules[rule.id] = rule
+    -- Remembered values were worked out under the old rule list (Core.lua).
+    PocketCFO_Valuation:BumpValueVersion()
     return true
 end
 
 function ValuationRules:Remove(id)
     self.rules[id] = nil
+    PocketCFO_Valuation:BumpValueVersion()
 end
 
 function ValuationRules:GetRule(id)
@@ -637,6 +640,7 @@ function ValuationRules:ApplyAdjustments(result, facts, valuationService)
 
     local visitKey = AdjustVisitKey(facts)
     if self._adjustStack[visitKey] then
+        PocketCFO_Valuation:MarkUnstable()
         return result, { { action = "skipped", note = "adjustCycle" } }
     end
 

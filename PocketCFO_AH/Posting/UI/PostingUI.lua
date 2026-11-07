@@ -168,17 +168,25 @@ local function UsuallyPostFor(row)
     return stackSize > 0 and math.floor(stackSize) or 1, false
 end
 
--- Smart view groups (Brian, 2026-11-04).
-local GROUP_TITLES = { "Ready to post", "Your call", "Probably not" }
+-- Smart view groups (Brian, 2026-11-04; Check the price added 2026-11-06).
+local GROUP_TITLES = { "Ready to post", "Check the price", "Your call", "Probably not" }
+
+-- Ready, but we picked the price ourselves (no one at that price). A typed
+-- price makes it the player's: back to Ready to post.
+local function RowIsCheck(row)
+    return RowStatus(row) == "Ready"
+        and row.evaluation and row.evaluation.check == true
+        and not (row.overrides and row.overrides.price)
+end
 
 local function RowGroup(row)
     local status = RowStatus(row)
     if status == "Ready" then
-        return 1
+        return RowIsCheck(row) and 2 or 1
     elseif status == "Listed" or status == "Skipped" or status == "Posted" then
-        return 3
+        return 4
     end
-    return 2
+    return 3
 end
 
 local function RowCanPost(row)
@@ -239,9 +247,9 @@ local function RowItemID(row)
 end
 
 -- ---------------------------------------------------------------------------
--- Compare block (smart view, Needs Price / Skipped rows): what the
--- neighbours are priced at, from data PocketCFO already has, so the player
--- can pick a price without leaving the window (Brian, 2026-11-04).
+-- Price lines under the item tooltip (smart view): why this price, from the
+-- bounds worked out when the list was built (SmartPricing:GetBounds), so a
+-- hover only reads stored values (Brian, 2026-11-04; trimmed 2026-11-07).
 -- ---------------------------------------------------------------------------
 
 local function GoldText(copper)
@@ -253,125 +261,25 @@ local function GoldText(copper)
     return PocketCFO:FormatMoney(copper)
 end
 
-local function AgeText(timestamp)
-    timestamp = tonumber(timestamp)
-    if not timestamp then
-        return ""
+-- "Capped by <item> Q2   999g" (Brian, 2026-11-07): the one better version
+-- that set the most we'd post, in place of listing every better version.
+-- Shown only when that cap is what set "Highest we'd post". Price = that
+-- item's own price; "Highest we'd post" above shows what it works out to.
+local function CappedByText(from)
+    local itemID = type(from) == "table" and tonumber(from.itemID) or nil
+    if not itemID then
+        return nil
     end
-    local now = GetServerTime and GetServerTime() or time()
-    local seconds = math.max(0, now - timestamp)
-    if seconds < 3600 then
-        return string.format("%dm ago", math.floor(seconds / 60))
-    elseif seconds < 86400 then
-        return string.format("%dh ago", math.floor(seconds / 3600))
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    local ok, name = pcall(getInfo, itemID)
+    local text = "Capped by " .. ((ok and name) or "a better version")
+    if tonumber(from.quality) then
+        text = text .. " Q" .. tostring(from.quality)
     end
-    return string.format("%dd ago", math.floor(seconds / 86400))
+    return text
 end
 
-local function StatLabel(statKey)
-    local labels = {}
-    for raw in string.gmatch(tostring(statKey or ""), "([^|]+)") do
-        local part = raw:gsub("^ITEM_MOD_", ""):gsub("_SHORT$", ""):gsub("_STAT$", ""):gsub("_RATING$", "")
-        part = part:gsub("_", " "):lower():gsub("(%a)([%w']*)", function(a, b) return a:upper() .. b end)
-        if part ~= "" and not part:find("^Modified Crafting") then
-            labels[#labels + 1] = part
-        end
-    end
-    return table.concat(labels, " / ")
-end
-
--- "222573|q5|stats:ITEM_MOD_MULTICRAFT_SHORT" -> "Q5 Multicraft".
-local function VersionLabel(marketKey)
-    marketKey = tostring(marketKey or "")
-    local parts = {}
-    local quality = marketKey:match("|q(%d+)")
-    if quality and quality ~= "0" then
-        parts[#parts + 1] = "Q" .. quality
-    end
-    local ilvl = marketKey:match("|ilvl(%d+)")
-    if ilvl then
-        parts[#parts + 1] = "ilvl " .. ilvl
-    end
-    local stats = marketKey:match("|stats:(.+)$")
-    if stats then
-        local label = StatLabel(stats)
-        if label ~= "" then
-            parts[#parts + 1] = label
-        end
-    end
-    return #parts > 0 and table.concat(parts, " ") or "Base"
-end
-
-local function ValuationModule(name)
-    local addon = _G.PocketCFO_Valuation
-    return addon and addon.GetModule and addon:GetModule(name, true) or nil
-end
-
--- The stats that make a version (Crit / Haste, Multicraft...), with
--- primaries, stamina and armor dropped: the same filter as the row name
--- (core IdentityAdapters). "" when none.
-local function VersionStats(stats)
-    if not stats or stats == "" then
-        return ""
-    end
-    local adapters = PocketCFO and PocketCFO.ItemIdentityAdapters
-    if adapters and adapters.NormalizeVariantStatFingerprint then
-        local ok, filtered = pcall(adapters.NormalizeVariantStatFingerprint, adapters, stats)
-        if ok then
-            return filtered or ""
-        end
-    end
-    return stats
-end
-
--- Keeps the cheapest entry per label (an Agility and an Intellect version
--- with the same Crit / Mastery are one line).
-local function CheapestPerLabel(list)
-    local byLabel, order = {}, {}
-    for _, entry in ipairs(list) do
-        local current = byLabel[entry.label]
-        if not current then
-            byLabel[entry.label] = entry
-            order[#order + 1] = entry.label
-        elseif (tonumber(entry.value) or 0) < (tonumber(current.value) or 0) then
-            byLabel[entry.label] = entry
-        end
-    end
-    local result = {}
-    for _, label in ipairs(order) do
-        result[#result + 1] = byLabel[label]
-    end
-    return result
-end
-
--- Parts of a market key: quality, item level, stats ("" when none).
-local function KeyParts(marketKey)
-    marketKey = tostring(marketKey or "")
-    return tonumber(marketKey:match("|q(%d+)")), tonumber(marketKey:match("|ilvl(%d+)")),
-        marketKey:match("|stats:(.+)$") or ""
-end
-
-local function SortByValue(list)
-    table.sort(list, function(a, b) return (tonumber(a.value) or 0) < (tonumber(b.value) or 0) end)
-end
-
--- Brian, 2026-11-04: what matters when pricing a tool by hand is
---   1. the same item at the same quality / item level, any stat: a buyer
---      who just wants a tool takes the cheapest, so that's competition;
---   2. better versions with the SAME stat: higher qualities of this item and
---      its blue partner. Other stats of the better version don't matter.
 local function AddCompareLines(tooltip, row)
-    local cache = ValuationModule("PricingCache")
-    local identity = ValuationModule("PricingIdentity")
-    local itemID = RowItemID(row)
-    if not cache or not itemID then
-        return
-    end
-    local itemLink = row.itemLink or (row.candidate and row.candidate.itemLink)
-    local ownKey = identity and itemLink and identity.BuildMarketKey and identity:BuildMarketKey(itemLink) or nil
-    local ownQuality, ownIlvl, ownStats = KeyParts(ownKey)
-    ownStats = VersionStats(ownStats)
-
     tooltip:AddLine(" ")
 
     -- Why this price: the range we'd post in and what set each end.
@@ -389,6 +297,12 @@ local function AddCompareLines(tooltip, row)
         tooltip:AddDoubleLine("Lowest we'd post",
             GoldText(bounds.floor) .. "  |cff999999" .. (FLOOR_SOURCES[bounds.floorSource] or "?") .. " +10%|r",
             1, 0.82, 0, 1, 1, 1)
+    elseif bounds.needsRecipe then
+        local why = bounds.needsRecipe == "ours" and "Open the recipe, then Refresh" or "Materials not priced yet"
+        if bounds.pricesLoading then
+            why = "Loading prices..."
+        end
+        tooltip:AddDoubleLine("Lowest we'd post", "|cff999999" .. why .. "|r", 1, 0.82, 0, 1, 1, 1)
     end
     if tonumber(bounds.ceiling) then
         local why
@@ -396,115 +310,52 @@ local function AddCompareLines(tooltip, row)
             why = Times(bounds.multiplier) .. "your last sale"
         elseif bounds.ceilingBase == "cost" then
             why = Times(bounds.multiplier) .. "cost to make"
+        elseif bounds.ceilingBase == "value" then
+            why = "market value"
         elseif bounds.ceilingBase == "market" then
-            why = Times(bounds.multiplier) .. "market value"
+            why = "market value, few listings"
+        elseif bounds.ceilingBase == "pastmarket" then
+            why = "market value (older expansion)"
+        elseif bounds.ceilingBase == "lowvalue" then
+            why = "market value (lower than usual)"
         elseif bounds.ceilingBase == "rule" then
             why = "below the better version"
         else
             why = "?"
         end
+        -- Raised to the floor (SmartPricing bounds.ceilingAtFloor, 2026-11-07).
+        if bounds.ceilingAtFloor then
+            why = "lowest match"
+        end
         tooltip:AddDoubleLine("Highest we'd post", GoldText(bounds.ceiling) .. "  |cff999999" .. why .. "|r",
             1, 0.82, 0, 1, 1, 1)
+        if bounds.ceilingBase == "rule" then
+            local cappedBy = CappedByText(bounds.ruleCapFrom)
+            if cappedBy then
+                tooltip:AddDoubleLine(cappedBy, GoldText(bounds.ruleCapFrom.price), 1, 0.82, 0, 1, 1, 1)
+            end
+        end
     end
-    if tonumber(bounds.marketValue) then
-        local few = bounds.confidence == "uncertain" and "  |cff999999few listings|r" or ""
-        tooltip:AddDoubleLine("Market value", GoldText(bounds.marketValue) .. few, 1, 0.82, 0, 1, 1, 1)
-    end
+    -- No "Market value" line (2026-11-07): it's the PCFO Value already shown
+    -- in the item tooltip above, few-listings note included.
     local cheapest = row.evaluation and tonumber(row.evaluation.lowestMatchingPrice)
     if cheapest then
         tooltip:AddDoubleLine("Cheapest listing", GoldText(cheapest), 1, 0.82, 0, 1, 1, 1)
     end
     -- No cost yet but one of our characters knows the recipe: say how to get
-    -- it (Brian, 2026-11-04). Costs are read when the list is built.
+    -- it (Brian, 2026-11-04). Costs are read when the list is built, and so
+    -- is "ours" (bounds.needsRecipe, SmartPricing:GetBounds).
     local costText = bounds.costToMake and GoldText(bounds.costToMake) or "-"
-    if not bounds.costToMake then
-        local registry = PocketCFO and PocketCFO.RecipeRegistry
-        local okKnown, known = pcall(function()
-            return registry and registry:IsRecipeOutputItem(RowItemID(row), row.itemName)
-        end)
-        if okKnown and known then
-            costText = "|cff999999Open the recipe, then Refresh|r"
-        end
+    -- From the recipe at today's prices, not recipe analysis (no
+    -- Resourcefulness / multicraft, so a little high). Brian, 2026-11-06.
+    if bounds.costToMake and bounds.costSource == "estimate" then
+        costText = costText .. "  |cff999999estimate|r"
+    end
+    if not bounds.costToMake and bounds.needsRecipe == "ours" then
+        costText = "|cff999999Open the recipe, then Refresh|r"
     end
     tooltip:AddDoubleLine("Cost to make", costText, 1, 0.82, 0, 1, 1, 1)
     tooltip:AddDoubleLine("Your last sale", bounds.lastSale and GoldText(bounds.lastSale) or "-", 1, 0.82, 0, 1, 1, 1)
-
-    -- 1. Same item, same quality / item level, other stats. Same stats as
-    -- ours (other primary) is direct competition: already in the price.
-    local sameTier, betterSameStat = {}, {}
-    for _, cached in ipairs(cache:GetCandidatesForItemID(itemID) or {}) do
-        if type(cached) == "table" and cached.marketKey ~= ownKey and tonumber(cached.value) then
-            local quality, ilvl, rawStats = KeyParts(cached.marketKey)
-            local stats = VersionStats(rawStats)
-            if quality == ownQuality and ilvl == ownIlvl then
-                if stats ~= ownStats then
-                    sameTier[#sameTier + 1] = { value = cached.value, timestamp = cached.timestamp,
-                        label = stats ~= "" and StatLabel(stats) or VersionLabel(cached.marketKey) }
-                end
-            elseif stats == ownStats and ((quality and ownQuality and quality > ownQuality)
-                or (ilvl and ownIlvl and ilvl > ownIlvl)) then
-                betterSameStat[#betterSameStat + 1] = { value = cached.value, timestamp = cached.timestamp,
-                    label = (quality and ("Q" .. quality)) or ("ilvl " .. ilvl) }
-            end
-        end
-    end
-    sameTier = CheapestPerLabel(sameTier)
-    SortByValue(sameTier)
-    if #sameTier > 0 then
-        tooltip:AddLine(" ")
-        tooltip:AddLine("Same tier, other stats", 1, 0.82, 0)
-        for _, entry in ipairs(sameTier) do
-            tooltip:AddDoubleLine("  " .. entry.label,
-                GoldText(entry.value) .. "  |cff999999" .. AgeText(entry.timestamp) .. "|r", 1, 1, 1, 1, 1, 1)
-        end
-    end
-
-    -- 2. Better versions, same stat: blue partner too.
-    local GetInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
-    local pairsModule = ValuationModule("ProfessionGearPairs")
-    local partnerID = pairsModule and pairsModule.GetPartner and pairsModule:GetPartner(itemID)
-    if partnerID and GetInfo then
-        local okOwn, _, _, ownRarity = pcall(GetInfo, itemLink or itemID)
-        local okPartner, name, _, partnerRarity = pcall(GetInfo, partnerID)
-        if okOwn and okPartner and tonumber(partnerRarity) and tonumber(ownRarity)
-            and tonumber(partnerRarity) > tonumber(ownRarity) then
-            for _, cached in ipairs(cache:GetCandidatesForItemID(partnerID) or {}) do
-                if type(cached) == "table" and tonumber(cached.value) then
-                    local quality, ilvl, rawStats = KeyParts(cached.marketKey)
-                    if VersionStats(rawStats) == ownStats then
-                        betterSameStat[#betterSameStat + 1] = { value = cached.value, timestamp = cached.timestamp,
-                            label = (name or "Blue") .. " " .. ((quality and ("Q" .. quality)) or (ilvl and ("ilvl " .. ilvl)) or "") }
-                    end
-                end
-            end
-        end
-    end
-    betterSameStat = CheapestPerLabel(betterSameStat)
-    SortByValue(betterSameStat)
-    if #betterSameStat > 0 then
-        local statText = ownStats ~= "" and (" (" .. StatLabel(ownStats) .. ")") or ""
-        tooltip:AddLine(" ")
-        tooltip:AddLine("Better versions" .. statText, 1, 0.82, 0)
-        for _, entry in ipairs(betterSameStat) do
-            tooltip:AddDoubleLine("  " .. entry.label,
-                GoldText(entry.value) .. "  |cff999999" .. AgeText(entry.timestamp) .. "|r", 1, 1, 1, 1, 1, 1)
-        end
-    end
-
-    -- Higher-quality items (quality-tier reagents etc., separate itemIDs).
-    local siblings = ValuationModule("QualitySiblings")
-    local higher = siblings and siblings.GetHigherSiblings and siblings:GetHigherSiblings(itemID)
-    if type(higher) == "table" then
-        for _, siblingID in ipairs(higher) do
-            local key = siblings:GetMarketKey(siblingID)
-            local value = key and cache:GetValueByMarketKey(key)
-            if tonumber(value) then
-                tooltip:AddDoubleLine("Higher quality (Q" .. tostring(siblings:GetTier(siblingID) or "?") .. ")",
-                    GoldText(value), 1, 0.82, 0, 1, 1, 1)
-            end
-        end
-    end
-
 end
 
 local function ShowRowTooltip(button)
@@ -715,7 +566,24 @@ function PostingUI:FinishEdit(commit)
             value = tonumber(text)
         end
     end
-    controller:ApplyOverride(editing.row, editing.field, value)
+    -- Stay in place while working down a group (Brian, 2026-11-06): if the
+    -- edit moves the row to another group, select the row that came after it.
+    local row = editing.row
+    local groupBefore = RowGroup(row)
+    local nextRowID = nil
+    for index, other in ipairs(self.rows or {}) do
+        if other == row then
+            local nextRow = self.rows[index + 1]
+            nextRowID = nextRow and RowID(nextRow) or nil
+            break
+        end
+    end
+    controller:ApplyOverride(row, editing.field, value)
+    if nextRowID and RowGroup(row) ~= groupBefore then
+        self.selectedRowID = nextRowID
+        self.autoSelected = false
+        self:RefreshRows()
+    end
 end
 
 function PostingUI:HandleSkipSelected()
@@ -977,7 +845,7 @@ function PostingUI:RefreshRows()
                 end
                 button.PriceText:SetText(shownPrice and FormatCopperString(shownPrice) or "")
                 button.DurationText:SetText(row.duration and (tostring(row.duration) .. "h") or "")
-                button.StatusText:SetText(status)
+                button.StatusText:SetText((self.smart and RowIsCheck(row)) and "Check" or status)
                 button.NoteText:SetText(RowNote(row))
                 button:Enable()
                 button:Show()
