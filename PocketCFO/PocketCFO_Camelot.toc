@@ -8,7 +8,7 @@
 ## X-Curse-Project-ID: 1575653
 ## X-Wago-ID: 4N2k0W6L
 ## X-WoWI-ID: 27267
-## Version: v1.2.3
+## Version: v1.2.4
 ## Category-enUS: Auctions
 ## IconTexture: Interface\AddOns\PocketCFO\Media\PocketCFO_Icon.tga
 ## AddonCompartmentFunc: PocketCFO_OnAddonCompartmentClick

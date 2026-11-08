@@ -136,11 +136,12 @@ local function SafeGetItemInfo(itemRef)
     if not itemRef or not GetItemInfo then
         return nil
     end
-    local ok, itemName, _, itemRarity, itemLevel, _, _, _, maxStack, equipLoc, _, _, classID, subClassID = pcall(GetItemInfo, itemRef)
+    local ok, itemName, _, itemRarity, itemLevel, _, _, _, maxStack, equipLoc, _, sellPrice, classID, subClassID = pcall(GetItemInfo, itemRef)
     if not ok or not itemName then
         return nil
     end
     return {
+        sellPrice = tonumber(sellPrice), -- what a merchant pays (ValuationService vendor sell floor)
         rarity = tonumber(itemRarity),
         itemLevel = tonumber(itemLevel),
         maxStack = tonumber(maxStack),

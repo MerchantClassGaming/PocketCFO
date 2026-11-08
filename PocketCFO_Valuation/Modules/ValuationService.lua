@@ -718,6 +718,35 @@ local function ApplyRuleAdjustments(selected, facts)
     return rules:ApplyAdjustments(selected, facts, ValuationService)
 end
 
+-- Vendor sell floor (Brian, 2026-11-07): the last step of every lookup. A
+-- merchant always buys at a fixed price, so an item is never worth less than
+-- what a vendor pays for it, whatever the AH or a rule says. Runs after the
+-- adjust rules so no cap can push the value back under it. Unpriced items
+-- stay unpriced (smart posting treats "no value" as Needs Price). Source and
+-- basis are kept (a vendor price is fixed, not an estimate);
+-- vendorSellFloor / unflooredValue record what happened.
+-- Real state: sellPrice from GetItemInfo (same field as the tooltip's
+-- Vendor row); 0 or nil (merchant won't buy) means no floor.
+local function ApplyVendorSellFloor(selected, facts)
+    if type(selected) ~= "table" or selected.resolved ~= true or not facts then
+        return selected
+    end
+    local value = tonumber(selected.value)
+    if not value then
+        return selected
+    end
+    local info = facts:Info()
+    local sellPrice = info and tonumber(info.sellPrice) or nil
+    if not sellPrice or sellPrice <= 0 or value >= sellPrice then
+        return selected
+    end
+    selected.unflooredValue = value
+    selected.vendorSellFloor = true
+    selected.value = sellPrice
+    selected.valuePerUnit = sellPrice
+    return selected
+end
+
 -- The single canonical precedence implementation. Every public entry point
 -- (GetItemValue, ExplainValue, and by extension GetValues) routes through
 -- this so no consumer or diagnostic can end up seeing a different source
@@ -773,6 +802,7 @@ local function ResolveItemValueTrace(normalized, options)
     local unadjustedSource = selected.source
     local adjustments
     selected, adjustments = ApplyRuleAdjustments(selected, facts)
+    selected = ApplyVendorSellFloor(selected, facts)
 
     return {
         selected = selected,
@@ -823,6 +853,7 @@ local function ResolveItemValueFast(normalized, options)
     end
 
     selected = ApplyRuleAdjustments(selected, facts)
+    selected = ApplyVendorSellFloor(selected, facts)
     return selected, facts
 end
 

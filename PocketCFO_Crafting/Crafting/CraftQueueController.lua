@@ -126,10 +126,60 @@ local function TraceProcessingAnalysisUI(event, fmt, ...)
     end
 end
 
--- Mining and Herbalism have nothing to show yet, so the window stays hidden
--- for them. Skinning shows it for Lure Analysis (Brian, 2026-10-16).
+-- Herbalism has nothing to show yet, so the window stays hidden for it.
+-- Skinning shows it for Lure Analysis (Brian, 2026-10-16).
+-- Mining shows it only on a real smelting recipe (ore in, bar out): retail
+-- Classic through Pandaria, and Forever. Draenor onward has no smelting, so
+-- those tabs stay hidden. Decided per recipe, no expansion list or flavor
+-- gate (Brian, 2026-11-08).
 local SKINNING_PROFESSION_ID = 393 -- ProfessionRegistry
+local MINING_PROFESSION_ID   = 186 -- ProfessionRegistry
 
+local function IsMiningContext(context)
+    local professionID = context and context.professionID
+    local professionName = context and context.professionName
+    if professionID == MINING_PROFESSION_ID then
+        return true
+    end
+    return type(professionName) == "string" and professionName:lower() == "mining"
+end
+
+-- A real craft: not a gathering entry, makes an item, and takes at least one
+-- reagent. Theoretical until confirmed in-game on both flavors: assumes
+-- C_TradeSkillUI.GetRecipeSchematic returns outputItemID and
+-- reagentSlotSchematics[n].reagents[1].itemID for smelting recipes.
+local function IsRealCraftRecipe(recipeID)
+    if not recipeID or not C_TradeSkillUI then
+        return false
+    end
+    if type(C_TradeSkillUI.GetRecipeInfo) == "function" then
+        local okInfo, info = pcall(C_TradeSkillUI.GetRecipeInfo, recipeID)
+        if okInfo and type(info) == "table" and info.isGatheringRecipe == true then
+            return false
+        end
+    end
+    if type(C_TradeSkillUI.GetRecipeSchematic) ~= "function" then
+        return false
+    end
+    local ok, schematic = pcall(C_TradeSkillUI.GetRecipeSchematic, recipeID, false)
+    if not ok or type(schematic) ~= "table" then
+        return false
+    end
+    if not schematic.outputItemID or schematic.outputItemID == 0 then
+        return false
+    end
+    for _, slot in ipairs(schematic.reagentSlotSchematics or {}) do
+        local first = slot and slot.reagents and slot.reagents[1]
+        if first and first.itemID and first.itemID > 0 then
+            return true
+        end
+    end
+    return false
+end
+
+-- Returns hidden, reason. reason "miningNoCraft" means the window was hidden
+-- only because the selected Mining recipe isn't a smelt, so selecting one
+-- should bring it back.
 local function IsHiddenGatheringProfessionContext(context)
     local registry = GetProfessionRegistry()
     if not registry or not registry.IsGatheringProfession then
@@ -143,6 +193,14 @@ local function IsHiddenGatheringProfessionContext(context)
     if professionID == SKINNING_PROFESSION_ID
         or (type(professionName) == "string" and professionName:lower() == "skinning") then
         return false
+    end
+    if IsMiningContext(context) then
+        local contextService = GetProfessionContextService()
+        local recipeID = contextService and contextService:GetCurrentRecipeID()
+        if IsRealCraftRecipe(recipeID) then
+            return false
+        end
+        return true, "miningNoCraft"
     end
     return true
 end
@@ -1881,10 +1939,18 @@ function CraftQueueController:OnTradeSkillShow()
     local window = GetWindow()
     if not window then return end
 
-    if IsHiddenGatheringProfessionContext(context) then
+    local hidden, hiddenReason = IsHiddenGatheringProfessionContext(context)
+    if hidden then
+        -- Mining: remember we hid it for a non-smelt recipe, and make sure
+        -- the recipe-select hook is in so picking a smelt can reopen it.
+        self.miningHiddenNoCraft = hiddenReason == "miningNoCraft" or nil
+        if self.miningHiddenNoCraft and PocketCFO_Crafting.InstallSelectRecipeHook then
+            PocketCFO_Crafting:InstallSelectRecipeHook()
+        end
         window:Hide()
         return
     end
+    self.miningHiddenNoCraft = nil
 
     window:ResetExpFilter()
 
@@ -1957,6 +2023,7 @@ function CraftQueueController:OnTradeSkillClose()
     end
 
     currentProfID              = nil
+    self.miningHiddenNoCraft   = nil
     self.pendingCraftConfigID  = nil
     self.inFlightCraftMode     = nil
     self.highlightedConfigID   = nil
@@ -1995,8 +2062,19 @@ function CraftQueueController:OnTradeSkillUpdate()
         local context = contextService and contextService:GetCurrentProfessionContext() or {}
         currentProfID = context.professionID
         local window = GetWindow()
-        if IsHiddenGatheringProfessionContext(context) then
+        local hidden, hiddenReason = IsHiddenGatheringProfessionContext(context)
+        if hidden then
+            if hiddenReason == "miningNoCraft" then
+                self.miningHiddenNoCraft = true
+            end
             if window then window:Hide() end
+            return
+        end
+        -- Mining: a smelt is now selected after we hid the window for a
+        -- non-smelt entry, so run the full open path.
+        if self.miningHiddenNoCraft and window and not window:IsShown()
+            and ProfessionsFrame and ProfessionsFrame:IsShown() then
+            self:OnTradeSkillShow()
             return
         end
         InstallSchematicFormHighlightHooks()
@@ -2029,6 +2107,32 @@ end
 
 function CraftQueueController:OnViewedRecipeChanged(message, recipeID, source)
     SessionLog("OnViewedRecipeChanged: recipeID=%s source=%s", tostring(recipeID), tostring(source))
+
+    -- Mining: show the window on a smelting recipe, hide it on anything
+    -- else. Only reopens a window we hid ourselves (miningHiddenNoCraft).
+    do
+        local contextService = GetProfessionContextService()
+        local context = contextService and contextService:GetCurrentProfessionContext() or {}
+        if IsMiningContext(context) then
+            local miningWindow = GetWindow()
+            local hidden, hiddenReason = IsHiddenGatheringProfessionContext(context)
+            if hidden then
+                if hiddenReason == "miningNoCraft" then
+                    self.miningHiddenNoCraft = true
+                end
+                if miningWindow and miningWindow:IsShown() then
+                    miningWindow:Hide()
+                end
+                return
+            end
+            if self.miningHiddenNoCraft and miningWindow and not miningWindow:IsShown()
+                and ProfessionsFrame and ProfessionsFrame:IsShown() then
+                self:OnTradeSkillShow()
+                return
+            end
+        end
+    end
+
     InstallSchematicFormHighlightHooks()
     self:RefreshAnalysisAvailability()
 

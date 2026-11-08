@@ -1,1 +1,2 @@
-Bug fixes and improvements.
+Retail and Forever
+Enabled recipe analysis for smelting recipes.

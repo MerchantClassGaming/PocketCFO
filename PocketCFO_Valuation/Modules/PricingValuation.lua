@@ -17,6 +17,13 @@ local LOW_PRICE_OUTLIER_MULTIPLIER = 3.0
 local LOW_PRICE_OUTLIER_QUANTITY_THRESHOLD = 2
 local UPPER_MARKET_MULTIPLIER = 3.0
 
+-- Snap to anchor (2026-11-07): when the median is within this fraction of the
+-- anchor (cheapest listing left after bait filtering), the value is the
+-- anchor. Players read "value" as what they could post at right now; a median
+-- a copper or two above the cheapest listing reads as wrong. A median further
+-- above the anchor means the cheap layer is thin, so the median stands.
+local SNAP_TO_ANCHOR_PCT = 0.10
+
 local function NormalizeObservations(observations)
     if type(observations) ~= "table" then
         return {}
@@ -294,6 +301,15 @@ function PricingValuation.CalculateStackableValue(selfOrObservations, maybeObser
 
     local value, depthUsed = WeightedMedianPrice(acceptedBuckets)
 
+    -- Phase 7: snap to anchor (see SNAP_TO_ANCHOR_PCT).
+    local medianValue = value
+    local snapPct = tonumber(market and market.snapToAnchorPct) or SNAP_TO_ANCHOR_PCT
+    local snappedToAnchor = false
+    if value and value > anchorPrice and value <= anchorPrice * (1 + snapPct) then
+        value = anchorPrice
+        snappedToAnchor = true
+    end
+
     local rejectedBuckets = {}
     local rejectedQuantity = 0
     for _, bucket in ipairs(lowRejected) do
@@ -307,6 +323,8 @@ function PricingValuation.CalculateStackableValue(selfOrObservations, maybeObser
 
     local diagnostics = {
         anchorPrice = anchorPrice,
+        medianValue = medianValue,
+        snappedToAnchor = snappedToAnchor,
         acceptedBucketCount = #acceptedBuckets,
         acceptedQuantity = depthUsed or 0,
         rejectedBucketCount = #rejectedBuckets,
