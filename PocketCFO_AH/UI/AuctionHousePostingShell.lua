@@ -1357,7 +1357,9 @@ function AHPostingUI:RefreshSelectedPage(pageKey)
         end
     elseif pageKey == "cancel" then
         local cancelUI = GetCancelAuctionsUIModule()
-        if cancelUI and cancelUI.RefreshQueue then
+        if cancelUI and cancelUI.CanReuseList and cancelUI:CanReuseList() then
+            cancelUI:ShowSavedList()
+        elseif cancelUI and cancelUI.RefreshQueue then
             cancelUI:RefreshQueue("cancel-page-activated")
         end
     elseif pageKey == "dashboard" then
@@ -2069,8 +2071,9 @@ function AHPostingUI:RenderIgnoreList(parent)
 end
 
 -- ---------------------------------------------------------------------------
--- Keep List (smart view). Per character (SmartPricing.lua). Same layout as
--- the Ignore List, plus an editable Keep quantity (blank = keep all).
+-- Keep List (smart view). Own or shared list per character (SmartPricing.lua).
+-- Same layout as the Ignore List, plus an editable Keep quantity (blank =
+-- keep all) and the Shared list / Own list choice at the top.
 -- ---------------------------------------------------------------------------
 
 local function GetSmartPricing()
@@ -2154,7 +2157,51 @@ function AHPostingUI:RenderKeepList(parent)
     local smart = GetSmartPricing()
     local rows = self:GetKeepRows()
 
-    AddChild(parent, CreateLabel(parent, "Kept Items (this character)", 10, -12, 260, "GameFontNormal"))
+    local usingShared = smart and smart.IsUsingSharedKeep and smart:IsUsingSharedKeep() or false
+    local headerText = usingShared and "Shared Keep List"
+        or ("Keep List: " .. tostring((UnitName and UnitName("player")) or "this character") .. " only")
+    AddChild(parent, CreateLabel(parent, headerText, 10, -12, 370, "GameFontNormal"))
+
+    -- Shared list / Own list. Switching re-reads the bags next time Post
+    -- Auctions opens, since a different list can change what's offered.
+    local function SetShared(useShared)
+        if not smart or not smart.SetUseSharedKeep or useShared == usingShared then
+            self:RefreshPage("keep")
+            return
+        end
+        smart:SetUseSharedKeep(useShared)
+        local postingUI = GetPostingUIModule()
+        if postingUI then
+            postingUI.evaluatedAt = nil
+        end
+        self.selectedKeepKey = nil
+        self:RefreshPage("keep")
+    end
+    AddChild(parent, CreateLabel(parent, "This character uses:", 414, -14, 120, "GameFontHighlightSmall"))
+    local function CreateListChoice(text, x, isShared, tip)
+        local radio = AddChild(parent, CreateFrame("CheckButton", nil, parent, "UIRadioButtonTemplate"))
+        radio:SetPoint("TOPLEFT", parent, "TOPLEFT", x, -12)
+        radio:SetChecked(usingShared == isShared)
+        radio:SetScript("OnClick", function()
+            SetShared(isShared)
+        end)
+        radio:SetScript("OnEnter", function(button)
+            if GameTooltip then
+                GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+                GameTooltip:SetText(text, 1, 1, 1)
+                GameTooltip:AddLine(tip, 0.8, 0.8, 0.8, true)
+                GameTooltip:Show()
+            end
+        end)
+        radio:SetScript("OnLeave", function()
+            if GameTooltip then GameTooltip:Hide() end
+        end)
+        AddChild(parent, CreateLabel(parent, text, x + 20, -14, 80, "GameFontHighlightSmall"))
+    end
+    CreateListChoice("Shared list", 538, true,
+        "Use one Keep List with every character set to Shared. Keep amounts count each character's own bags.")
+    CreateListChoice("Own list", 638, false,
+        "Use a Keep List just for this character.")
     local listBox = AddChild(parent, CreateFrame("Frame", nil, parent, "BackdropTemplate"))
     listBox:SetPoint("TOPLEFT", parent, "TOPLEFT", 10, -36)
     listBox:SetPoint("BOTTOMRIGHT", parent, "BOTTOMLEFT", 384, 16)
@@ -2236,6 +2283,19 @@ function AHPostingUI:RenderKeepList(parent)
         keepInput:Disable()
         saveButton:Disable()
         removeButton:Disable()
+    end
+
+    -- First switch to Shared: offer this character's own list, so it
+    -- doesn't have to be marked again. Only while the shared list is empty.
+    if usingShared and #rows == 0 and smart and smart.GetOwnKeepList and next(smart:GetOwnKeepList()) ~= nil then
+        AddChild(parent, CreateButton(parent, "Copy my list to Shared", 414, -176, 180, function()
+            smart:CopyOwnKeepToShared()
+            local postingUI = GetPostingUIModule()
+            if postingUI then
+                postingUI.evaluatedAt = nil
+            end
+            self:RefreshPage("keep")
+        end))
     end
 
     if #rows == 0 then
@@ -2581,6 +2641,10 @@ function AHPostingUI:OnAuctionHouseClosed()
     local postingUI = GetPostingUIModule()
     if postingUI and postingUI.OnAuctionHouseClosed then
         postingUI:OnAuctionHouseClosed()
+    end
+    local cancelUI = GetCancelAuctionsUIModule()
+    if cancelUI and cancelUI.OnAuctionHouseClosed then
+        cancelUI:OnAuctionHouseClosed()
     end
     local exec = PocketCFO_AH:GetModule("PostingExecution", true)
     if exec and exec.ClearPending then

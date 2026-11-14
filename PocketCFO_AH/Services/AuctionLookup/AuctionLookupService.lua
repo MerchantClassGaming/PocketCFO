@@ -8,7 +8,6 @@ local PocketCFO_AH = _G.PocketCFO_AH
 local PocketCFO = _G.PocketCFO
 
 local AuctionLookupService = {}
-local callbacksByID = {}
 local callbacksByName = {}
 local pendingNameByItemKey = {}
 local pendingLookupKeyByItemID = {}
@@ -17,15 +16,10 @@ local pendingBrowseLookups = {}
 
 local frame = CreateFrame and CreateFrame("Frame") or nil
 
+-- Lookup log lines only while PocketCFO debug is on (MCG_Diagnostic enabled,
+-- or /mcg debug). Players never have it (Brian, 2026-11-10).
 local function DebugEnabled()
-    local settings = PocketCFO_AH
-        and PocketCFO_AH.db
-        and PocketCFO_AH.db.global
-        and PocketCFO_AH.db.global.postingSettings
-        or nil
-    return settings
-        and settings.debug
-        and settings.debug.captureCompetitionRows == true
+    return PocketCFO ~= nil and PocketCFO.debugEnabled == true
 end
 
 local function SessionLog(msg, ...)
@@ -630,53 +624,6 @@ local function QueueNextNameDetailSearch(lookupKey)
     return RequestItemSearch(lookupKey, itemKey, context.row, context.candidate)
 end
 
-local function FinishIDLookup(auctionID, auction)
-    local callbacks = callbacksByID[tostring(auctionID)]
-    callbacksByID[tostring(auctionID)] = nil
-    if not callbacks then
-        return
-    end
-
-    for _, callback in ipairs(callbacks) do
-        SafeCall(callback, auction)
-    end
-end
-
-local function FindAuctionInRows(auctionID, rows, isCommodity)
-    local wanted = tostring(auctionID)
-    for _, row in ipairs(rows or {}) do
-        local rowAuctionID = row and (row.auctionID or row.auctionId or row.listingID or row.listingId)
-        if rowAuctionID ~= nil and tostring(rowAuctionID) == wanted then
-            return NormalizeAuctionRow(row, isCommodity)
-        end
-    end
-    return nil
-end
-
-local function SearchCurrentResultsForAuction(auctionID)
-    if C_AuctionHouse and C_AuctionHouse.GetBrowseResults then
-        local ok, rows = pcall(C_AuctionHouse.GetBrowseResults)
-        if ok then
-            local auction = FindAuctionInRows(rows, auctionID, nil)
-            if auction then
-                return auction
-            end
-        end
-    end
-
-    if C_AuctionHouse and C_AuctionHouse.GetOwnedAuctions then
-        local ok, rows = pcall(C_AuctionHouse.GetOwnedAuctions)
-        if ok then
-            local auction = FindAuctionInRows(rows, auctionID, nil)
-            if auction then
-                return auction
-            end
-        end
-    end
-
-    return nil
-end
-
 local function RequestNameSearch(itemName)
     if not C_AuctionHouse then
         return false
@@ -1155,23 +1102,6 @@ if frame then
             OnCommoditySearchResultsUpdated(...)
         end
     end)
-end
-
-function AuctionLookupService:GetAuctionByID(auctionID, callback)
-    if auctionID == nil or callback == nil then
-        SafeCall(callback, nil)
-        return
-    end
-
-    local auction = SearchCurrentResultsForAuction(auctionID)
-    if auction then
-        SafeCall(callback, auction)
-        return
-    end
-
-    callbacksByID[tostring(auctionID)] = callbacksByID[tostring(auctionID)] or {}
-    callbacksByID[tostring(auctionID)][#callbacksByID[tostring(auctionID)] + 1] = callback
-    FinishIDLookup(auctionID, nil)
 end
 
 function AuctionLookupService:GetAuctionsByName(itemName, callback)

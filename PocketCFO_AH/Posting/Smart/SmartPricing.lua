@@ -30,15 +30,31 @@ local COPPER_PER_GOLD = 10000
 -- 56122796 never posted, 41310000 and 10002800 did).
 local COPPER_PER_SILVER = 100
 
+-- Rounding step (Brian, 2026-11-10): round to the smallest coin shown.
+-- Forever (gated): 1g and up = whole silver, under 1g = copper (Forever
+-- sells items for copper, e.g. Minor Arcane Elixir at 60c, which whole
+-- silver turned into a 1s floor and max). Retail: always whole silver
+-- (the retail sell window has no copper box; copper left over = no post).
+local function PriceStep(copper)
+    if PocketCFO and PocketCFO.flavor == "forever" and (tonumber(copper) or 0) < COPPER_PER_GOLD then
+        return 1
+    end
+    return COPPER_PER_SILVER
+end
+
 local function SilverUp(copper)
-    return math.ceil(copper / COPPER_PER_SILVER) * COPPER_PER_SILVER
+    local step = PriceStep(copper)
+    return math.ceil(copper / step) * step
 end
 
 local function SilverDown(copper)
-    return math.floor(copper / COPPER_PER_SILVER) * COPPER_PER_SILVER
+    local step = PriceStep(copper)
+    return math.floor(copper / step) * step
 end
 local FLOOR_MARKUP = 1.10
 local DEFAULT_DURATION = 12
+-- WoW Forever default duration (Forever-only, gated): 2h (Brian, 2026-11-10).
+local FOREVER_DEFAULT_DURATION = 2
 
 -- Ceiling multiplier by base price (gold), retail. Smooth: straight lines
 -- between points on a log scale, flat past the ends (never below 2x).
@@ -99,8 +115,8 @@ end
 -- are both checked. Both default off.
 -- ---------------------------------------------------------------------------
 
--- Smart posting needs the posting modules, which Forever doesn't load yet
--- (PocketCFO_AH_Camelot.toc); there it reads off until they are added.
+-- Smart posting needs the posting modules. Forever loads them since
+-- 2026-11-10 (PocketCFO_AH_Camelot.toc); this check stays as a guard.
 function SmartPricing:IsSmartView()
     if not PocketCFO_AH:GetModule("PostingController", true) then
         return false
@@ -110,8 +126,13 @@ function SmartPricing:IsSmartView()
 end
 
 -- ---------------------------------------------------------------------------
--- Keep list: per character. [itemKey] = { keep = number or nil (nil = all),
--- itemID, itemName, configKey }. Never touches the old itemRuleIgnoreList.
+-- Keep list. [itemKey] = { keep = number or nil (nil = all), itemID,
+-- itemName, configKey }. Never touches the old itemRuleIgnoreList.
+-- Each character uses either its own list (smartKeepList[charGUID], the
+-- default) or the one shared list (smartKeepShared), picked on the Keep List
+-- tab (Brian, 2026-11-10). The choice is smartKeepUseShared[charGUID] = true.
+-- Switching never merges or deletes: both lists stay saved. Keep amounts are
+-- per character either way (posting only sees the current bags).
 -- ---------------------------------------------------------------------------
 
 local function CharKey()
@@ -119,15 +140,77 @@ local function CharKey()
         or (UnitGUID and UnitGUID("player")) or "unknown"
 end
 
+local function OwnKeepRoot(db)
+    db.smartKeepList = db.smartKeepList or {}
+    local key = CharKey()
+    db.smartKeepList[key] = db.smartKeepList[key] or {}
+    return db.smartKeepList[key]
+end
+
+local function SharedKeepRoot(db)
+    db.smartKeepShared = db.smartKeepShared or {}
+    return db.smartKeepShared
+end
+
+local function UsesSharedKeep(db)
+    return type(db.smartKeepUseShared) == "table" and db.smartKeepUseShared[CharKey()] == true
+end
+
 local function KeepRoot()
     local db = PocketCFO_AH.db and PocketCFO_AH.db.global
     if not db then
         return {}
     end
-    db.smartKeepList = db.smartKeepList or {}
-    local key = CharKey()
-    db.smartKeepList[key] = db.smartKeepList[key] or {}
-    return db.smartKeepList[key]
+    if UsesSharedKeep(db) then
+        return SharedKeepRoot(db)
+    end
+    return OwnKeepRoot(db)
+end
+
+function SmartPricing:IsUsingSharedKeep()
+    local db = PocketCFO_AH.db and PocketCFO_AH.db.global
+    return db ~= nil and UsesSharedKeep(db)
+end
+
+function SmartPricing:SetUseSharedKeep(useShared)
+    local db = PocketCFO_AH.db and PocketCFO_AH.db.global
+    if not db then
+        return
+    end
+    db.smartKeepUseShared = db.smartKeepUseShared or {}
+    db.smartKeepUseShared[CharKey()] = (useShared == true) or nil
+end
+
+function SmartPricing:GetOwnKeepList()
+    local db = PocketCFO_AH.db and PocketCFO_AH.db.global
+    return db and OwnKeepRoot(db) or {}
+end
+
+function SmartPricing:GetSharedKeepList()
+    local db = PocketCFO_AH.db and PocketCFO_AH.db.global
+    return db and SharedKeepRoot(db) or {}
+end
+
+-- Copies this character's own list into the shared list. Items already on
+-- the shared list are left as they are. Returns how many were added.
+function SmartPricing:CopyOwnKeepToShared()
+    local db = PocketCFO_AH.db and PocketCFO_AH.db.global
+    if not db then
+        return 0
+    end
+    local shared = SharedKeepRoot(db)
+    local added = 0
+    for itemKey, entry in pairs(OwnKeepRoot(db)) do
+        if shared[itemKey] == nil and type(entry) == "table" then
+            local copy = {}
+            for key, value in pairs(entry) do
+                copy[key] = value
+            end
+            shared[itemKey] = copy
+            added = added + 1
+        end
+    end
+    return added
 end
 
 function SmartPricing:GetKeepList()
@@ -728,6 +811,7 @@ do
     end
 end
 
-SmartPricing.DEFAULT_DURATION = DEFAULT_DURATION
+SmartPricing.DEFAULT_DURATION = IsForever() and FOREVER_DEFAULT_DURATION or DEFAULT_DURATION
 SmartPricing.SilverUp = SilverUp
+SmartPricing.PriceStep = PriceStep
 SmartPricing.FLOOR_MARKUP = FLOOR_MARKUP

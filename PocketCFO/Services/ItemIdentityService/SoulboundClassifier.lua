@@ -119,17 +119,96 @@ function SoulboundClassifier:TooltipTextIsBound(text)
         or text:find("warband", 1, true) ~= nil
 end
 
-function SoulboundClassifier:BagSlotHasBoundTooltip(bag, slot)
-    if bag == nil or slot == nil then
-        return false
+-- Blizzard's own bind flags for the slot (2026-11-10): the slot's isBound and
+-- C_Item.IsBound. They don't wait for the item's tooltip, which is empty on a
+-- cold read (a bank scan right after login counted 71 bound items, the
+-- rescan 3s later 128). Theoretical: whether either is true for Warband-bound
+-- items; the tooltip check below still catches those once loaded.
+local function SlotBindFlags(bag, slot)
+    local infoBound, itemIsBound = false, nil
+    if C_Container and C_Container.GetContainerItemInfo then
+        local ok, info = pcall(C_Container.GetContainerItemInfo, bag, slot)
+        infoBound = ok and info and info.isBound == true or false
     end
+    if ItemLocation and ItemLocation.CreateFromBagAndSlot and C_Item and type(C_Item.IsBound) == "function" then
+        local okLoc, location = pcall(ItemLocation.CreateFromBagAndSlot, ItemLocation, bag, slot)
+        if okLoc and location then
+            local ok, bound = pcall(C_Item.IsBound, location)
+            if ok then
+                itemIsBound = bound == true
+            end
+        end
+    end
+    return infoBound or itemIsBound == true, infoBound, itemIsBound
+end
 
-    for _, text in ipairs(self:GetTooltipLinesForBagSlot(bag, slot)) do
-        if self:TooltipTextIsBound(text) then
+local function TooltipSaysBound(classifier, bag, slot)
+    for _, text in ipairs(classifier:GetTooltipLinesForBagSlot(bag, slot)) do
+        if classifier:TooltipTextIsBound(text) then
             return true
         end
     end
     return false
+end
+
+-- Diagnostics (2026-11-10): flags and tooltip disagreeing on a loaded item,
+-- once per item per session, to learn what the flags say for Warband items.
+local loggedDisagreement = {}
+
+local function SlotItemID(bag, slot)
+    if not C_Container or not C_Container.GetContainerItemInfo then
+        return nil
+    end
+    local ok, info = pcall(C_Container.GetContainerItemInfo, bag, slot)
+    return ok and info and tonumber(info.itemID) or nil
+end
+
+local function ItemDataLoaded(itemID)
+    if not itemID or not C_Item or type(C_Item.IsItemDataCachedByID) ~= "function" then
+        return true
+    end
+    local ok, cached = pcall(C_Item.IsItemDataCachedByID, itemID)
+    return not ok or cached == true
+end
+
+-- One copy (one bag slot): bound if Blizzard's flags say so, else if the
+-- tooltip says so. Per slot on purpose: a character can hold a soulbound copy
+-- and BoE copies of the same item; callers decide per copy.
+function SoulboundClassifier:BagSlotHasBoundTooltip(bag, slot)
+    if bag == nil or slot == nil then
+        return false
+    end
+    local flagBound, infoBound, itemIsBound = SlotBindFlags(bag, slot)
+    local tooltipBound = TooltipSaysBound(self, bag, slot)
+    if flagBound ~= tooltipBound then
+        local itemID = SlotItemID(bag, slot)
+        if itemID and not loggedDisagreement[itemID] and ItemDataLoaded(itemID) and PocketCFO and PocketCFO.AppendSessionLog then
+            loggedDisagreement[itemID] = true
+            PocketCFO:AppendSessionLog(string.format("[MCG] SoulboundClassifier: bind checks disagree itemID=%s bag=%s slot=%s infoIsBound=%s C_Item.IsBound=%s tooltipBound=%s",
+                tostring(itemID), tostring(bag), tostring(slot), tostring(infoBound), tostring(itemIsBound), tostring(tooltipBound)))
+        end
+    end
+    return flagBound or tooltipBound
+end
+
+-- True when the copy's bind state can't be trusted yet: not bound by any
+-- check AND the item's data isn't loaded (its tooltip may still be empty).
+-- Asks the game to load it. Scanners rescan; posting refuses its override.
+function SoulboundClassifier:BagSlotBindUnknown(bag, slot)
+    if bag == nil or slot == nil then
+        return false
+    end
+    local itemID = SlotItemID(bag, slot)
+    if ItemDataLoaded(itemID) then
+        return false
+    end
+    if self:BagSlotHasBoundTooltip(bag, slot) then
+        return false
+    end
+    if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+        pcall(C_Item.RequestLoadItemDataByID, itemID)
+    end
+    return true
 end
 
 function SoulboundClassifier:BagSlotHasSoulboundTooltip(bag, slot)

@@ -279,10 +279,47 @@ local function FormatValue(value, options, depth, seen)
     return table.concat(lines, "\n")
 end
 
+-- Debug starts ON when the dev-only MCG_Diagnostic addon is enabled (2026-11-10,
+-- Brian): a test run with debug off can't be copied from the session log and
+-- some tests cost real gold to repeat. MCG_Diagnostic never ships (.pkgmeta
+-- ignores it), so players always start with debug off. Disabling the addon or
+-- /mcg debug turns it off. Checked here, not in MCG_Diagnostic, because this runs
+-- before MCG_Diagnostic loads and would otherwise drop the login-time log lines.
+-- Theoretical: C_AddOns.GetAddOnEnableState(name, character) returns 2 when
+-- enabled for this character (falls back to C_AddOns.IsAddOnLoadable).
+local function DiagnosticAddonEnabled()
+    if not C_AddOns then
+        return false
+    end
+    if type(C_AddOns.GetAddOnEnableState) == "function" then
+        local ok, state = pcall(C_AddOns.GetAddOnEnableState, "MCG_Diagnostic", UnitName and UnitName("player") or nil)
+        if ok and tonumber(state) then
+            return tonumber(state) > 0
+        end
+    end
+    if type(C_AddOns.IsAddOnLoadable) == "function" then
+        local ok, loadable = pcall(C_AddOns.IsAddOnLoadable, "MCG_Diagnostic")
+        return ok and loadable and true or false
+    end
+    return false
+end
+
 function Diagnostics:OnInitialize()
     RestoreLastDump()
     PocketCFO.sessionLog = PocketCFO.sessionLog or {}
     PocketCFO.debugEnabled = PocketCFO.debugEnabled and true or false
+    if not PocketCFO.debugEnabled and DiagnosticAddonEnabled() then
+        PocketCFO.debugEnabled = true
+        PocketCFO.debugAutoEnabled = true
+        self:AppendSessionLog("[MCG] Debug mode ON at login (MCG_Diagnostic enabled)")
+        if C_Timer and C_Timer.After then
+            C_Timer.After(5, function()
+                if PocketCFO.debugEnabled and PocketCFO.Print then
+                    PocketCFO:Print("Debug mode ON (MCG_Diagnostic enabled). /mcg debug to turn off.")
+                end
+            end)
+        end
+    end
 end
 
 function Diagnostics:RegisterCommand(commandName, metadata, handler)

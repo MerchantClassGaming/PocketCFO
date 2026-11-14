@@ -247,7 +247,9 @@ local LADDER = {
     [2] = { [5] = 40, [4] = 35, [3] = 30, [2] = 25, [1] = 20 },  -- green (Q5/Q4 lowered 2026-11-06)
 }
 local RARITY_NAME = { [2] = "green", [3] = "blue" }
-local PLACEHOLDER_STAT_PREFIX = "ITEM_MOD_MODIFIED_CRAFTING_STAT_"
+-- Stats in keys: ItemIdentityService's form since 2026-11-10 ("A+B", short
+-- names); the old form ("ITEM_MOD_A_SHORT|ITEM_MOD_B_SHORT") is still read.
+local PLACEHOLDER_STAT_PREFIX = "MODIFIED_CRAFTING_STAT_"
 local CURRENT_WINDOW_SECONDS = 3 * 24 * 60 * 60 -- same as PricingCache's fresh window
 
 -- Real stats in a market key, or nil (none, or only Blizzard's "a stat
@@ -259,7 +261,8 @@ local function RealStats(marketKey)
         return nil
     end
     local fingerprint = marketKey:sub(statsAt + #"|stats:")
-    for stat in string.gmatch(fingerprint, "[^|]+") do
+    for stat in string.gmatch(fingerprint, "[^|+]+") do
+        stat = (stat:gsub("^ITEM_MOD_", ""))
         if stat:sub(1, #PLACEHOLDER_STAT_PREFIX) == PLACEHOLDER_STAT_PREFIX then
             return nil
         end
@@ -322,7 +325,7 @@ local function StatGroupKey(stats)
         return nil
     end
     local parts = {}
-    for stat in string.gmatch(stats, "[^|]+") do
+    for stat in string.gmatch(stats, "[^|+]+") do
         local upper = stat:upper()
         local key = stat
         for _, group in ipairs(STAT_GROUPS) do

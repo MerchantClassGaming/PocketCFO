@@ -72,7 +72,19 @@ local function RuleMaxToPost(rule)
     return PositiveQuantity(rule and (rule.maxToPost or rule.targetPosted))
 end
 
+-- WoW Forever (Forever-only, gated): 2 / 8 / 24 hours, default 2h (same as
+-- PostingExecution NormalizeDuration). Retail unchanged.
+local FOREVER_DURATIONS = { [2] = true, [8] = true, [24] = true }
+local FOREVER_DEFAULT_DURATION = 2
+
 local function NormalizeDuration(value, fallback)
+    if PocketCFO and PocketCFO.flavor == "forever" then
+        local foreverDuration = tonumber(value) or tonumber(fallback)
+        if not foreverDuration or not FOREVER_DURATIONS[foreverDuration] then
+            foreverDuration = FOREVER_DEFAULT_DURATION
+        end
+        return foreverDuration
+    end
     local duration = tonumber(value) or tonumber(fallback) or 12
     if duration ~= 12 and duration ~= 24 and duration ~= 48 then
         duration = 12
@@ -457,7 +469,10 @@ function PostingController:ApplyOverride(row, field, value)
     if field == "price" then
         local copper = Copper(value)
         -- Whole silver: PostItem drops prices with copper left over.
-        copper = copper and math.floor(copper / 100 + 0.5) * 100 or nil
+        -- Forever (gated, 2026-11-10): copper kept under 1g (SmartPricing PriceStep).
+        local smartPricing = PocketCFO_AH:GetModule("SmartPricing", true)
+        local step = (copper and smartPricing and smartPricing.PriceStep and smartPricing.PriceStep(copper)) or 100
+        copper = copper and math.floor(copper / step + 0.5) * step or nil
         if copper and copper > 0 then
             row.evaluation.price = copper
             row.overrides.price = true
@@ -765,7 +780,17 @@ function PostingController:StartAfterOwnedAuctionRefresh(reason, generation)
             end
         end
         self:NotifyQueueChanged("owned-auctions-refreshed")
-        self:ScheduleEvaluationAfterDelay(reason, generation)
+        -- The AH just answered the owned-auctions query, so it is ready for
+        -- searches: start now instead of the fixed wait (2026-11-10).
+        -- Theoretical: whether the first search ever fails without the wait.
+        -- The wait stays for timeouts and for opens without a refresh.
+        if ok then
+            SessionLog("PostingController: evaluation started without delay generation=%s rows=%d",
+                tostring(generation), #(self.rows or {}))
+            self:StartEvaluation()
+        else
+            self:ScheduleEvaluationAfterDelay(reason, generation)
+        end
     end, OWNED_AUCTION_REFRESH_TIMEOUT_SECONDS)
 end
 

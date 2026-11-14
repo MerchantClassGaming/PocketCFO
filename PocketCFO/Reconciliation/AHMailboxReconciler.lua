@@ -12,6 +12,9 @@ local PocketCFO = _G.PocketCFO
 
 local AHMailboxReconciler = PocketCFO:NewModule("AHMailboxReconciler")
 
+-- Mail waiting list helpers, defined further down (2026-11-09).
+local StampMailAge, ClaimInboxMail, AddUnclaimedWaiting, UpdateMailStore
+
 local function Now()
     return PocketCFO and PocketCFO.Now and PocketCFO:Now() or time()
 end
@@ -152,16 +155,55 @@ local function SalePrice(evidence)
     return money - deposit + cut
 end
 
+-- Mail identity (2026-11-09, AH_Mail_Matching_Design Change B):
+-- * Evidence with an item link is resolved again from the link on every pass
+--   (never from a stored configKey), so a key built while the item wasn't
+--   loaded yet (ilvl:0) corrects itself on the next pass.
+-- * An item-level key is trusted only when it came from the item's own link
+--   and has a real level. Sold mail has no link: for gear its name-only key
+--   can't say which variant sold, so it's dropped and price, name and
+--   elimination rules decide. Stackables keep their name-derived key.
+local function TrustedConfigKey(evidence, configKey)
+    if not configKey or configKey == "" then
+        return nil
+    end
+    local isItemLevelKey = configKey:find("|ilvl:", 1, true) ~= nil
+    if not isItemLevelKey then
+        return configKey
+    end
+    if not evidence.itemLink or configKey:find("|ilvl:0", 1, true) then
+        return nil
+    end
+    return configKey
+end
+
 local function BuildEvidenceEntry(evidence, index)
     if type(evidence) ~= "table" then
         return nil
     end
-    local identity, configKey, unresolvedReason = ResolveIdentity(evidence, "mailboxEvidence")
+    local lookup = CopyRow(evidence) or {}
+    if lookup.itemLink then
+        lookup.configKey = nil
+    end
+    local identity, configKey, unresolvedReason = ResolveIdentity(lookup, "mailboxEvidence")
+    if configKey and evidence.itemLink and configKey:find("|ilvl:0", 1, true) then
+        unresolvedReason = unresolvedReason or "itemLevelPending"
+    end
+    configKey = TrustedConfigKey(evidence, configKey)
+    -- Returned mail carries the item itself (2026-11-10): with a link but no
+    -- trusted key yet (item not loaded), it waits for the next pass instead of
+    -- matching by name (a Finesse knife cancel matched a Perception listing).
+    local identityPending = EvidenceIsReturned(evidence) and evidence.itemLink and not configKey or nil
     return {
         index = index,
         evidence = evidence,
         identity = identity,
         configKey = configKey,
+        -- The item's key under the pre-2026-11-10 identity rule: a listing
+        -- posted before the update still carries it until its next owned-
+        -- auctions scan (Item_Identity_Unification_Design.md 6.3).
+        legacyConfigKey = configKey and identity and identity.legacyConfigKey or nil,
+        identityPending = identityPending,
         nameKey = NameKey(evidence.itemName or (identity and identity.itemName)),
         quantity = Quantity(evidence),
         type = evidence.type,
@@ -185,7 +227,9 @@ local function NormalizeListing(row, index)
         configKey = configKey,
         nameKey = NameKey(row.itemName or row.name or (identity and identity.itemName)),
         quantity = quantity,
-        remaining = mailboxResolution == "unresolved" and quantity or 0,
+        -- Part of a commodity listing may already be settled by earlier mail.
+        remaining = mailboxResolution == "unresolved"
+            and math.max(0, quantity - (tonumber(row.settledQuantity) or 0)) or 0,
         auctionID = row.auctionID,
         mailboxResolution = mailboxResolution,
         unresolvedReason = unresolvedReason,
@@ -291,6 +335,7 @@ local function AddUnresolvedEvidence(state, entry, reason, quantity)
     row.ownerKey = row.ownerKey or state.ownerKey
     row.quantity = tonumber(quantity) or entry.quantity or Quantity(evidence)
     row.configKey = entry.configKey
+    row.legacyConfigKey = entry.legacyConfigKey
     row.identityUnresolvedReason = entry.unresolvedReason
     row.reason = reason
     row.timestamp = row.timestamp or Now()
@@ -411,6 +456,59 @@ local function PriceMatches(entry, listings)
     return matches
 end
 
+-- Owned-scan elimination (2026-11-09): a listing seen active in a reliable
+-- owned-auctions scan after this mail arrived can't be the auction the mail is
+-- about (a sale happens about an hour before its mail arrives, per Brian; an
+-- expiry or cancel at the moment its mail arrives). Only used when the mail's
+-- arrival time is precise (fractional daysLeft: confirmed in-game 2026-11-09,
+-- good to about a minute, hence the 2-minute margin).
+local ELIMINATION_MARGIN_SECONDS = 120
+-- A mail can't be about an auction posted after the mail arrived (margin kept
+-- wider, it only ever widens the set of candidates).
+local POSTED_AFTER_MARGIN_SECONDS = 600
+
+-- Also (2026-11-09): a mail can't be about an auction posted after the mail
+-- arrived, so an old waiting sale never claims a newer listing of the same item.
+-- Latest possible arrival: the precise arrival time, else arrival + 1 day
+-- (daysLeft precision Theoretical), else when the mail was first seen.
+local function LatestPossibleArrival(evidence)
+    local arrivalAt = tonumber(evidence and evidence.arrivalAt)
+    if arrivalAt then
+        return arrivalAt + (evidence.arrivalPrecise and POSTED_AFTER_MARGIN_SECONDS or 86400)
+    end
+    return tonumber(evidence and (evidence.firstSeenAt or evidence.storedAt))
+end
+
+local function EligibleListings(entry, listings)
+    local evidence = entry and entry.evidence
+    if not listings or not evidence then
+        return listings
+    end
+    local preciseArrival = evidence.arrivalPrecise and tonumber(evidence.arrivalAt)
+    local latestArrival = LatestPossibleArrival(evidence)
+    if not preciseArrival and not latestArrival then
+        return listings
+    end
+    local eligible, excluded = {}, 0
+    for _, listing in ipairs(listings) do
+        local row = listing.row or {}
+        local seenActiveAt = tonumber(row.lastConfirmedAt)
+        local postedAt = tonumber(row.postedAt)
+        if latestArrival and postedAt and postedAt > latestArrival then
+            excluded = excluded + 1
+        elseif preciseArrival and row.status == "active" and seenActiveAt
+        and seenActiveAt > preciseArrival + ELIMINATION_MARGIN_SECONDS then
+            excluded = excluded + 1
+        else
+            eligible[#eligible + 1] = listing
+        end
+    end
+    if excluded > 0 then
+        entry.eliminatedListings = (entry.eliminatedListings or 0) + excluded
+    end
+    return eligible
+end
+
 local function ResolveEntry(state, entry, byConfigKey, byName)
     if not entry or entry.quantity <= 0 then
         return
@@ -420,17 +518,27 @@ local function ResolveEntry(state, entry, byConfigKey, byName)
         return
     end
 
-    local matches = entry.configKey and byConfigKey[entry.configKey] or nil
+    local keyedListings = entry.configKey and (byConfigKey[entry.configKey]
+        or (entry.legacyConfigKey and byConfigKey[entry.legacyConfigKey])) or nil
+    local matches = keyedListings and EligibleListings(entry, keyedListings) or nil
     local resolved, remaining = ResolveAgainstListings(state, entry, matches, "configKey-match", false)
 
     if remaining <= 0 then
         return
     end
 
+    if entry.identityPending then
+        SessionLog("AHMailboxReconciler: returned mail waits, item not loaded yet item=%s reason=%s evidenceKey=%s",
+            tostring(entry.evidence and entry.evidence.itemName), tostring(entry.unresolvedReason),
+            tostring(entry.evidence and entry.evidence.evidenceKey))
+        AddUnresolvedEvidence(state, entry, "returned-identity-pending", remaining)
+        return
+    end
+
     -- Price match before the name rules (2026-11-05). Only when nothing has
     -- been applied yet, so ResolveAgainstListings starts from the full sale.
     if resolved == 0 and not entry.configKey and entry.nameKey and EvidenceIsSold(entry.evidence) then
-        local ok, priceMatches = pcall(PriceMatches, entry, byName[entry.nameKey])
+        local ok, priceMatches = pcall(PriceMatches, entry, EligibleListings(entry, byName[entry.nameKey]))
         if ok and priceMatches then
             resolved, remaining = ResolveAgainstListings(state, entry, priceMatches, "price-match", false)
             if remaining <= 0 then
@@ -440,7 +548,7 @@ local function ResolveEntry(state, entry, byConfigKey, byName)
     end
 
     if not entry.configKey and entry.nameKey then
-        local fallbackMatches = byName[entry.nameKey]
+        local fallbackMatches = EligibleListings(entry, byName[entry.nameKey])
         local safeFallback, fallbackReason = NameFallbackIsSafe(entry, fallbackMatches, state.nameGroupEvidenceTotal)
         if safeFallback then
             local fallbackResolved
@@ -471,6 +579,7 @@ local function ResolveEntry(state, entry, byConfigKey, byName)
             itemName = entry.evidence and entry.evidence.itemName,
             itemID = entry.evidence and entry.evidence.itemID,
             configKey = entry.configKey,
+            legacyConfigKey = entry.legacyConfigKey,
             quantity = remaining,
             outcome = entry.outcome,
             mailIndex = entry.evidence and entry.evidence.mailIndex,
@@ -592,7 +701,21 @@ local function NotifyListingService(results)
 
     local notified = 0
     for _, result in ipairs(results or {}) do
-        if result.auctionID then
+        if result.auctionID and service.RecordMailboxOutcome then
+            -- Settle by quantity (2026-11-09): a partial commodity sale no longer
+            -- closes the whole listing.
+            local evidence = CopyRow(result) or {}
+            evidence.source = "ah_mailbox_reconciliation"
+            evidence.reason = result.outcome
+            local _, settleErr, fullySettled = service:RecordMailboxOutcome(result.auctionID, result.outcome, result.quantity, evidence)
+            if settleErr and settleErr ~= "alreadyResolved" then
+                SessionLog("AHMailboxReconciler: RecordMailboxOutcome issue auctionID=%s outcome=%s err=%s",
+                    tostring(result.auctionID), tostring(result.outcome), tostring(settleErr))
+            end
+            if fullySettled then
+                notified = notified + 1
+            end
+        elseif result.auctionID then
             local mailboxResolution = MAILBOX_RESOLUTION_FROM_OUTCOME[tostring(result.outcome or "")]
             if mailboxResolution and service.MarkMailboxResolved then
                 local mailboxEvidence = {
@@ -625,7 +748,9 @@ local function NotifyListingService(results)
     return notified
 end
 
-local function SubmitInventoryResults(ownerKey, results, unresolvedEvidence)
+-- Unmatched mail now waits in the reconciler's own waiting list (2026-11-09),
+-- so nothing is passed to InventoryStateService's old pending-evidence store.
+local function SubmitInventoryResults(ownerKey, results)
     local service = GetInventoryStateService()
     if not service then
         return nil, "inventoryStateServiceUnavailable"
@@ -633,21 +758,428 @@ local function SubmitInventoryResults(ownerKey, results, unresolvedEvidence)
     if service.ApplyAHMailboxReconciliationResults then
         return service:ApplyAHMailboxReconciliationResults(ownerKey, results, {
             source = "ah-mailbox-reconciler",
-            unresolvedEvidence = unresolvedEvidence,
         })
     end
     return nil, "applyAHMailboxReconciliationResultsUnavailable"
 end
 
--- AH mail detection and evidence tracking (moved from MailboxScanner).
--- These helpers interpret AH meaning from raw mailbox observations.
+-- ─── Mail waiting list and matched list (2026-11-09) ─────────────────────────
+-- Design: claude/AH_Mail_Matching_Design.md, Change B.
+-- PocketCFO_DB.global.ahMailWaiting[ownerKey][evidenceKey] = AH mail not matched
+--   yet (sold or returned), retried every mailbox pass and after owned scans.
+-- PocketCFO_DB.global.ahMailMatched[ownerKey][evidenceKey] = { contentKey,
+--   arrivalAt, matchedAt }: mail already matched, never processed again.
+-- A mail has no ID in the game API. Its contentKey is what the mail says (kind,
+-- sender, subject, gold, item, quantity), without position, time, deposit or cut
+-- (older saved sales have no deposit / cut); its arrival time (from daysLeft)
+-- tells identical mails apart.
+-- Both lists drop entries after 31 days (AH mail is kept 30).
 
-local function SameItemName(left, right)
+local AH_MAIL_DAYS = 30
+local MAIL_KEEP_DAYS = 31
+local ARRIVAL_TOLERANCE_SECONDS = 600
+
+function StampMailAge(evidence, daysLeft)
+    daysLeft = tonumber(daysLeft)
+    evidence.daysLeft = daysLeft
+    evidence.mailQuantity = tonumber(evidence.quantity) or 1
+    evidence.inInbox = true
+    if daysLeft then
+        evidence.arrivalAt = Now() - math.floor((AH_MAIL_DAYS - daysLeft) * 86400)
+        -- Theoretical: whether daysLeft has sub-day precision. A whole number
+        -- means it doesn't, so the arrival time can't be used for elimination.
+        evidence.arrivalPrecise = daysLeft ~= math.floor(daysLeft)
+    end
+end
+
+local function MailContentKey(ownerKey, evidence)
+    return table.concat({
+        tostring(evidence.type or ""),
+        tostring(ownerKey or evidence.ownerKey or ""),
+        tostring(evidence.sender or ""),
+        tostring(evidence.subject or ""),
+        tostring(evidence.money or ""),
+        tostring(evidence.itemID or ""),
+        tostring(NameKey(evidence.itemName) or ""),
+        tostring(evidence.mailQuantity or evidence.quantity or ""),
+    }, "|")
+end
+
+-- One-time move of InventoryStateService's old unmatched-evidence store into the
+-- waiting list. The old store saved one copy per mailbox visit, so per mail the
+-- number of real mails is the most copies seen in any single visit.
+local function MigrateOldPendingEvidence(global, waitingRoot)
+    global.migrations = global.migrations or {}
+    if global.migrations.ahMailWaiting1 then
+        return
+    end
+    global.migrations.ahMailWaiting1 = Now()
+    local moved, dropped = 0, 0
+    local sources = {}
+    local serviceRoot = global.inventoryStateService
+    if serviceRoot and type(serviceRoot.pendingAHMailboxEvidence) == "table" then
+        sources[#sources + 1] = serviceRoot.pendingAHMailboxEvidence
+    end
+    if type(global.pendingAHMailboxEvidence) == "table" and global.pendingAHMailboxEvidence ~= (serviceRoot and serviceRoot.pendingAHMailboxEvidence) then
+        sources[#sources + 1] = global.pendingAHMailboxEvidence
+    end
+    for _, source in ipairs(sources) do
+        for ownerKey, rows in pairs(source) do
+            if type(rows) == "table" then
+                local groups = {}
+                for _, row in pairs(rows) do
+                    if type(row) == "table" and (row.type == "sold" or row.type == "returned") then
+                        row.mailQuantity = row.mailQuantity or row.quantity
+                        local contentKey = MailContentKey(ownerKey, row)
+                        local group = groups[contentKey] or { perVisit = {}, sample = row, firstAt = nil }
+                        local visit = tostring(row.mailboxScanSessionID or "?")
+                        group.perVisit[visit] = (group.perVisit[visit] or 0) + 1
+                        local at = tonumber(row.storedAt or row.timestamp)
+                        if at and (not group.firstAt or at < group.firstAt) then
+                            group.firstAt = at
+                        end
+                        groups[contentKey] = group
+                        dropped = dropped + 1
+                    end
+                end
+                waitingRoot[ownerKey] = waitingRoot[ownerKey] or {}
+                for contentKey, group in pairs(groups) do
+                    local copies = 0
+                    for _, count in pairs(group.perVisit) do
+                        copies = math.max(copies, count)
+                    end
+                    for n = 1, copies do
+                        local row = CopyRow(group.sample)
+                        row.evidenceKey = contentKey .. "@legacy#" .. n
+                        row.contentKey = contentKey
+                        row.ownerKey = ownerKey
+                        row.arrivalAt = nil
+                        row.arrivalPrecise = nil
+                        row.inInbox = nil
+                        row.mailboxScanSessionID = nil
+                        row.mailboxScanTimestamp = nil
+                        row.firstSeenAt = group.firstAt or Now()
+                        row.legacy = true
+                        waitingRoot[ownerKey][row.evidenceKey] = row
+                        moved = moved + 1
+                    end
+                end
+            end
+        end
+    end
+    if serviceRoot then
+        serviceRoot.pendingAHMailboxEvidence = {}
+    end
+    global.pendingAHMailboxEvidence = {}
+    SessionLog("AHMailboxReconciler: old unmatched mail store moved to waiting list rows=%d (from %d saved copies)", moved, dropped)
+end
+
+local function MailStore(ownerKey)
+    local global = PocketCFO and PocketCFO.db and PocketCFO.db.global
+    if not global or not ownerKey or ownerKey == "" then
+        return nil, nil
+    end
+    global.ahMailWaiting = global.ahMailWaiting or {}
+    global.ahMailMatched = global.ahMailMatched or {}
+    MigrateOldPendingEvidence(global, global.ahMailWaiting)
+    global.ahMailWaiting[ownerKey] = global.ahMailWaiting[ownerKey] or {}
+    global.ahMailMatched[ownerKey] = global.ahMailMatched[ownerKey] or {}
+    return global.ahMailWaiting[ownerKey], global.ahMailMatched[ownerKey]
+end
+
+local function ArrivalsMatch(left, right)
+    left, right = tonumber(left), tonumber(right)
     if not left or not right then
+        return true
+    end
+    return math.abs(left - right) <= ARRIVAL_TOLERANCE_SECONDS
+end
+
+-- A legacy entry (moved over by MigrateOldPendingEvidence) stands for a mail
+-- that was already in the inbox when the migration ran, so a mail that arrived
+-- after that can't be it (2026-11-10: a Finesse knife cancel from today
+-- claimed a Nov 6 legacy cancel entry). Unknown arrival: allowed, as before.
+local function LegacyClaimAllowed(entry, arrivalAt)
+    if not entry.legacy then
+        return true
+    end
+    local global = PocketCFO and PocketCFO.db and PocketCFO.db.global
+    local migratedAt = tonumber(global and global.migrations and global.migrations.ahMailWaiting1)
+    arrivalAt = tonumber(arrivalAt)
+    if not migratedAt or not arrivalAt then
+        return true
+    end
+    return arrivalAt <= migratedAt
+end
+
+-- Finds the closest unclaimed entry with this contentKey whose arrival matches.
+local function FindClaim(entries, contentKey, arrivalAt, claimed)
+    local best, bestGap
+    for key, entry in pairs(entries) do
+        if not claimed[key] and type(entry) == "table" and entry.contentKey == contentKey
+        and ArrivalsMatch(entry.arrivalAt, arrivalAt) and LegacyClaimAllowed(entry, arrivalAt) then
+            local gap = (tonumber(entry.arrivalAt) and tonumber(arrivalAt)) and math.abs(entry.arrivalAt - arrivalAt) or math.huge
+            if not best or gap < bestGap then
+                best, bestGap = key, gap
+            end
+        end
+    end
+    return best
+end
+
+-- Already accounted for (2026-11-09): a mail that matches no open listing but
+-- lines up with a listing already settled with the same outcome was matched
+-- before (e.g. by the old code, before the waiting list existed). It moves to
+-- the matched list instead of waiting 31 days.
+-- * expired: the settled listing expired (posted + duration) within 15 minutes
+--   of the mail's arrival.
+-- * cancelled: the settled listing was cancelled (closedAt) within 15 minutes of
+--   the mail's arrival.
+-- * sold: the settled listing's posted price equals the sale price (needs the
+--   invoice deposit / cut) and it was posted before the mail arrived.
+-- Same item: the trusted configKey when known, else item ID, else name. Each
+-- settled listing accounts for one mail only (remembered on the matched entry).
+local ACCOUNTED_WINDOW_SECONDS = 900
+
+local function SettledListings(ownerKey)
+    local service = GetAHListingService()
+    if service and service.GetSettledListings then
+        return service:GetSettledListings({ ownerKey = ownerKey }) or {}
+    end
+    return {}
+end
+
+local function SameItem(row, listing)
+    if row.configKey and row.configKey ~= "" then
+        return listing.configKey == row.configKey
+            or (row.legacyConfigKey ~= nil and listing.configKey == row.legacyConfigKey)
+    end
+    if row.itemID and listing.itemID then
+        return tonumber(row.itemID) == tonumber(listing.itemID)
+    end
+    local left, right = NameKey(row.itemName), NameKey(listing.itemName or listing.name)
+    return left ~= nil and left == right
+end
+
+local function AccountsFor(row, listing)
+    local arrivalAt = tonumber(row.arrivalAt)
+    local resolution = listing.mailboxResolution
+    local postedAt = tonumber(listing.postedAt)
+    if not SameItem(row, listing) then
         return false
     end
-    return string.lower(tostring(left)) == string.lower(tostring(right))
+    if row.type == "sold" then
+        local price = SalePrice(row)
+        local buyout = tonumber(listing.buyout)
+        local unitPrice = tonumber(listing.unitPrice)
+        local quantity = tonumber(row.quantity) or 1
+        return resolution == "sold" and price ~= nil
+            and (buyout == price or (unitPrice ~= nil and unitPrice * quantity == price))
+            and (not arrivalAt or not postedAt or postedAt <= arrivalAt)
+    end
+    if not arrivalAt or not row.arrivalPrecise then
+        return false
+    end
+    local outcome = ReturnedOutcome(row)
+    if outcome == "expired" and resolution == "expired" then
+        local hours = tonumber(listing.durationHours)
+        return postedAt ~= nil and hours ~= nil
+            and math.abs(postedAt + hours * 3600 - arrivalAt) <= ACCOUNTED_WINDOW_SECONDS
+    end
+    if outcome == "cancelled" and resolution == "canceled" then
+        local closedAt = tonumber(listing.closedAt)
+        return closedAt ~= nil and math.abs(closedAt - arrivalAt) <= ACCOUNTED_WINDOW_SECONDS
+    end
+    return false
 end
+
+-- Removes already-accounted-for mail from result.unresolvedEvidence and records
+-- result.accounted[evidenceKey] = auctionID. Only mail with nothing matched at all.
+local function MarkAccountedFor(ownerKey, mailEvidence, result)
+    if not result or not result.unresolvedEvidence or #result.unresolvedEvidence == 0 then
+        return 0
+    end
+    local fullQuantity = {}
+    for _, evidence in ipairs(mailEvidence or {}) do
+        if evidence.evidenceKey then
+            fullQuantity[evidence.evidenceKey] = tonumber(evidence.quantity) or 0
+        end
+    end
+    local _, matched = MailStore(ownerKey)
+    local used = {}
+    for _, entry in pairs(matched or {}) do
+        if type(entry) == "table" and entry.accountedAuctionID then
+            used[tostring(entry.accountedAuctionID)] = true
+        end
+    end
+    local settled = SettledListings(ownerKey)
+    result.accounted = result.accounted or {}
+    local kept, count = {}, 0
+    for _, row in ipairs(result.unresolvedEvidence) do
+        local key = row.evidenceKey
+        local found
+        if key and fullQuantity[key] and (tonumber(row.quantity) or 0) >= fullQuantity[key] then
+            for _, listing in ipairs(settled) do
+                local id = tostring(listing.auctionID or "")
+                if id ~= "" and not used[id] and AccountsFor(row, listing) then
+                    found = listing.auctionID
+                    used[id] = true
+                    break
+                end
+            end
+        end
+        if found then
+            result.accounted[key] = found
+            count = count + 1
+        else
+            kept[#kept + 1] = row
+        end
+    end
+    result.unresolvedEvidence = kept
+    return count
+end
+
+-- Splits inbox evidence into: already matched (dropped), already waiting (keeps
+-- its stable key), new (gets a stable key). Returns the evidence to match.
+function ClaimInboxMail(ownerKey, mailEvidence)
+    local waiting, matched = MailStore(ownerKey)
+    local stats = { inboxEvidence = #mailEvidence, alreadyMatched = 0, stillWaiting = 0, new = 0, claimedWaiting = {}, precise = 0 }
+    for _, evidence in ipairs(mailEvidence) do
+        if evidence.arrivalPrecise then
+            stats.precise = stats.precise + 1
+        end
+        stats.sampleDaysLeft = stats.sampleDaysLeft or evidence.daysLeft
+    end
+    if not waiting then
+        return mailEvidence, stats
+    end
+    local claimedMatched = {}
+    local kept = {}
+    for _, evidence in ipairs(mailEvidence) do
+        local contentKey = MailContentKey(ownerKey, evidence)
+        evidence.contentKey = contentKey
+        local matchedKey = FindClaim(matched, contentKey, evidence.arrivalAt, claimedMatched)
+        if matchedKey then
+            claimedMatched[matchedKey] = true
+            stats.alreadyMatched = stats.alreadyMatched + 1
+        else
+            local waitingKey = FindClaim(waiting, contentKey, evidence.arrivalAt, stats.claimedWaiting)
+            if waitingKey then
+                stats.claimedWaiting[waitingKey] = true
+                local row = waiting[waitingKey]
+                evidence.evidenceKey = waitingKey
+                evidence.firstSeenAt = row.firstSeenAt
+                -- A partly matched mail waits with only its unmatched quantity.
+                evidence.quantity = tonumber(row.quantity) or evidence.quantity
+                stats.stillWaiting = stats.stillWaiting + 1
+            else
+                local base = contentKey .. "@" .. tostring(evidence.arrivalAt and math.floor(evidence.arrivalAt / 60) or "?")
+                local key, n = base, 1
+                while waiting[key] or matched[key] do
+                    n = n + 1
+                    key = base .. "#" .. n
+                end
+                evidence.evidenceKey = key
+                evidence.firstSeenAt = Now()
+                stats.new = stats.new + 1
+            end
+            kept[#kept + 1] = evidence
+        end
+    end
+    return kept, stats
+end
+
+-- Adds every waiting row not claimed by an inbox mail this pass (mail already
+-- collected, or beyond the inbox's visible 50) to the evidence list.
+function AddUnclaimedWaiting(ownerKey, mailEvidence, claimedWaiting)
+    local waiting = MailStore(ownerKey)
+    local added = 0
+    for key, row in pairs(waiting or {}) do
+        if type(row) == "table" and not claimedWaiting[key] then
+            local evidence = CopyRow(row)
+            evidence.evidenceKey = key
+            evidence.inInbox = nil
+            evidence.mailIndex = nil
+            evidence.attachmentIndex = nil
+            mailEvidence[#mailEvidence + 1] = evidence
+            added = added + 1
+        end
+    end
+    return added
+end
+
+-- After a pass: matched mail moves to the matched list; mail with quantity left
+-- unmatched waits (with that quantity). Then both lists are trimmed.
+function UpdateMailStore(ownerKey, mailEvidence, result, source)
+    local waiting, matched = MailStore(ownerKey)
+    if not waiting then
+        return
+    end
+    local accountedCount = MarkAccountedFor(ownerKey, mailEvidence, result)
+    local unmatchedQuantity = {}
+    for _, row in ipairs(result and result.unresolvedEvidence or {}) do
+        if row.evidenceKey then
+            unmatchedQuantity[row.evidenceKey] = (unmatchedQuantity[row.evidenceKey] or 0) + (tonumber(row.quantity) or 0)
+        end
+    end
+    local now = Now()
+    local nowWaiting, nowMatched = 0, 0
+    for _, evidence in ipairs(mailEvidence) do
+        local key = evidence.evidenceKey
+        if key then
+            local left = unmatchedQuantity[key] or 0
+            if left > 0 then
+                local row = waiting[key] or {}
+                for field, value in pairs(evidence) do
+                    if field ~= "inInbox" and field ~= "mailIndex" and field ~= "attachmentIndex" then
+                        row[field] = value
+                    end
+                end
+                row.quantity = left
+                row.ownerKey = ownerKey
+                row.firstSeenAt = row.firstSeenAt or evidence.firstSeenAt or now
+                row.lastTriedAt = now
+                row.tries = (tonumber(row.tries) or 0) + 1
+                waiting[key] = row
+                nowWaiting = nowWaiting + 1
+            else
+                waiting[key] = nil
+                matched[key] = {
+                    contentKey = evidence.contentKey,
+                    arrivalAt = evidence.arrivalAt,
+                    matchedAt = now,
+                    type = evidence.type,
+                    accountedAuctionID = result and result.accounted and result.accounted[key] or nil,
+                }
+                nowMatched = nowMatched + 1
+            end
+        end
+    end
+    local cutoff = now - MAIL_KEEP_DAYS * 86400
+    local trimmed = 0
+    for key, row in pairs(waiting) do
+        if type(row) ~= "table" or (tonumber(row.firstSeenAt) or 0) < cutoff then
+            waiting[key] = nil
+            trimmed = trimmed + 1
+        end
+    end
+    for key, row in pairs(matched) do
+        if type(row) ~= "table" or (tonumber(row.matchedAt) or 0) < cutoff then
+            matched[key] = nil
+            trimmed = trimmed + 1
+        end
+    end
+    local waitingCount = 0
+    for _ in pairs(waiting) do
+        waitingCount = waitingCount + 1
+    end
+    SessionLog("AHMailboxReconciler: mail lists updated owner=%s source=%s matchedNow=%d (alreadyAccountedFor=%d) waitingNow=%d waitingTotal=%d trimmed=%d eliminated=%s",
+        tostring(ownerKey), tostring(source), nowMatched, accountedCount, nowWaiting, waitingCount, trimmed,
+        tostring(result and result.report and result.report.eliminatedListings or 0))
+end
+
+-- AH mail detection and evidence tracking (moved from MailboxScanner).
+-- These helpers interpret AH meaning from raw mailbox observations.
 
 local function IsAuctionHouseSender(sender)
     return sender ~= nil
@@ -701,25 +1233,6 @@ local function IsReturnedAuctionMail(sender, subject, wasReturned, hasItem)
     return wasReturned and IsAuctionHouseSender(sender)
 end
 
-local function BuildDepreciationKey(kind, mailIndex, attachmentIndex, header, evidence, invoice)
-    return table.concat({
-        tostring(kind or ""),
-        tostring(mailIndex or 0),
-        tostring(attachmentIndex or 0),
-        tostring(header and header.sender or ""),
-        tostring(header and header.subject or ""),
-        tostring(invoice and invoice.invoiceType or ""),
-        tostring(evidence and evidence.itemID or ""),
-        tostring(evidence and evidence.itemName or ""),
-        tostring(evidence and evidence.quantity or ""),
-        tostring(invoice and invoice.bid or ""),
-        tostring(invoice and invoice.buyout or ""),
-        tostring(invoice and invoice.deposit or ""),
-        tostring(invoice and invoice.consignment or ""),
-        tostring(invoice and invoice.moneyDelay or ""),
-    }, "|")
-end
-
 local function MarkedDepreciationApplied(reconciler, key)
     reconciler.ahMailboxDepreciations = reconciler.ahMailboxDepreciations or {}
     return reconciler.ahMailboxDepreciations[key] == true
@@ -747,44 +1260,6 @@ local function IncrementSkipReason(stats, reason)
     stats.skippedMailReasons = stats.skippedMailReasons or {}
     stats.skippedMailReasons[reason] = (stats.skippedMailReasons[reason] or 0) + 1
     return true
-end
-
-local function ReconciliationResolvedEvidence(result, evidence)
-    if not result or not evidence then
-        return false
-    end
-    if evidence.type == "sold" then
-        return result.soldResolvedEvidenceKeys and result.soldResolvedEvidenceKeys[evidence.evidenceKey] == true
-    end
-    if result.resolvedEvidenceKeys and result.resolvedEvidenceKeys[evidence.evidenceKey] == true then
-        return true
-    end
-    for _, mailAdd in ipairs(result.mailAdds or {}) do
-        if tonumber(mailAdd.mailIndex) == tonumber(evidence.mailIndex)
-        and tonumber(mailAdd.itemID) == tonumber(evidence.itemID)
-        and SameItemName(mailAdd.itemName, evidence.itemName) then
-            return true
-        end
-    end
-    return false
-end
-
-local function StampMailboxResolutionEvidence(ownerKey, mailEvidence)
-    local inventoryStateService = GetInventoryStateService()
-    if not inventoryStateService or not inventoryStateService.MarkMailboxResolutionEvidenceScan then
-        return nil
-    end
-    local metadata = inventoryStateService:MarkMailboxResolutionEvidenceScan(ownerKey, Now())
-    if type(metadata) ~= "table" then
-        return nil
-    end
-    for _, evidence in ipairs(mailEvidence or {}) do
-        if type(evidence) == "table" then
-            evidence.mailboxScanSessionID = metadata.sessionID
-            evidence.mailboxScanTimestamp = metadata.scanTimestamp
-        end
-    end
-    return metadata
 end
 
 -- Returns a map of configKey → total quantity from the current AH observation snapshot.
@@ -896,18 +1371,18 @@ function AHMailboxReconciler.Resolve(selfOrEvidence, maybeEvidence)
     local scanStats = mailEvidence.scanStats or {}
     local ownerKey = GetOwnerKey(mailEvidence)
 
-    -- Pre-pass: sum evidence quantities by name key for variant group resolution.
-    -- Only counts evidence without a configKey (sold invoices, generic returns).
-    -- Used by NameFallbackIsSafe to resolve all variants when totals match.
+    -- Build entries first (identity resolved per pass), then sum quantities by
+    -- name for entries without a trusted configKey. Used by NameFallbackIsSafe to
+    -- resolve all variants when totals match (elimination across the waiting list).
+    local entries = {}
     local nameGroupEvidenceTotal = {}
-    for _, evidence in ipairs(mailEvidence) do
-        if type(evidence) == "table" then
-            local evNameKey = NameKey(evidence.itemName)
-            local hasConfigKey = evidence.configKey ~= nil and evidence.configKey ~= ""
-            if evNameKey and not hasConfigKey
+    for index, evidence in ipairs(mailEvidence or {}) do
+        local entry = BuildEvidenceEntry(evidence, index)
+        if entry then
+            entries[#entries + 1] = entry
+            if entry.nameKey and not entry.configKey and not entry.identityPending
             and (EvidenceIsSold(evidence) or EvidenceIsReturned(evidence)) then
-                local qty = tonumber(evidence.quantity) or tonumber(evidence.count) or 1
-                nameGroupEvidenceTotal[evNameKey] = (nameGroupEvidenceTotal[evNameKey] or 0) + qty
+                nameGroupEvidenceTotal[entry.nameKey] = (nameGroupEvidenceTotal[entry.nameKey] or 0) + (entry.quantity or 0)
             end
         end
     end
@@ -957,17 +1432,32 @@ function AHMailboxReconciler.Resolve(selfOrEvidence, maybeEvidence)
         },
     }
 
-    for index, evidence in ipairs(mailEvidence or {}) do
-        local entry = BuildEvidenceEntry(evidence, index)
-        if entry then
-            local firstResult = #state.results + 1
-            ResolveEntry(state, entry, byConfigKey, byName)
-            local ok, err = pcall(RememberResolvedSale, entry, state.results, firstResult)
-            if not ok then
-                SessionLog("AHMailboxReconciler: RememberResolvedSale error=%s", tostring(err))
-            end
+    -- Returned mail carries the exact item, so it settles its own listing first;
+    -- a sale checked afterwards then sees that listing gone (2026-11-09).
+    local ordered = {}
+    for _, entry in ipairs(entries) do
+        if EvidenceIsReturned(entry.evidence) then
+            ordered[#ordered + 1] = entry
         end
     end
+    for _, entry in ipairs(entries) do
+        if not EvidenceIsReturned(entry.evidence) then
+            ordered[#ordered + 1] = entry
+        end
+    end
+    entries = ordered
+
+    local eliminatedTotal = 0
+    for _, entry in ipairs(entries) do
+        local firstResult = #state.results + 1
+        ResolveEntry(state, entry, byConfigKey, byName)
+        eliminatedTotal = eliminatedTotal + (entry.eliminatedListings or 0)
+        local ok, err = pcall(RememberResolvedSale, entry, state.results, firstResult)
+        if not ok then
+            SessionLog("AHMailboxReconciler: RememberResolvedSale error=%s", tostring(err))
+        end
+    end
+    state.report.eliminatedListings = eliminatedTotal
 
     table.sort(state.ahRemovals, function(a, b)
         return (tonumber(a.rowIndex) or 0) < (tonumber(b.rowIndex) or 0)
@@ -1015,7 +1505,7 @@ function AHMailboxReconciler.Resolve(selfOrEvidence, maybeEvidence)
         end
     end
     state.listingClosures = NotifyListingService(state.results)
-    local submitted, submitErr = SubmitInventoryResults(ownerKey, soldResults, state.unresolvedEvidence)
+    local submitted, submitErr = SubmitInventoryResults(ownerKey, soldResults)
     state.inventorySubmission = submitted
     state.inventorySubmissionError = submitErr
     state.report.listingClosures = state.listingClosures
@@ -1133,7 +1623,7 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
                 subject   = obs.subject,
                 sender    = obs.sender,
             }
-            soldEvidence.evidenceKey = BuildDepreciationKey("sold", obs.mailIndex, 0, obs, soldEvidence, invoice)
+            StampMailAge(soldEvidence, obs.daysLeft)
 
             SessionLog("AHMailboxReconciler: sold AH mail detected mailIndex=%d itemName=%s quantity=%d invoiceType=%s money=%s delayed=%s",
                 obs.mailIndex, tostring(soldItemName), soldQuantity,
@@ -1145,14 +1635,8 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
                 SessionLog("AHMailboxReconciler: sold AH evidence skipped mailIndex=%d reason=missing-itemName subject=%s invoiceType=%s",
                     obs.mailIndex, tostring(obs.subject), tostring(invoice and invoice.invoiceType))
             else
-                if EvidenceAlreadyApplied(self, soldEvidence) then
-                    skipRecorded = IncrementSkipReason(stats, "sold-already-applied")
-                    SessionLog("AHMailboxReconciler: sold AH evidence skipped owner=%s itemName=%s quantity=%d reason=already-applied-this-session",
-                        tostring(ownerKey), tostring(soldEvidence.itemName), soldQuantity)
-                else
-                    mailEvidence[#mailEvidence + 1] = soldEvidence
-                    stats.soldEvidenceCount = stats.soldEvidenceCount + 1
-                end
+                mailEvidence[#mailEvidence + 1] = soldEvidence
+                stats.soldEvidenceCount = stats.soldEvidenceCount + 1
             end
         end
 
@@ -1176,16 +1660,9 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
                     subject         = obs.subject,
                     sender          = obs.sender,
                 }
-                returnedEvidence.evidenceKey = BuildDepreciationKey("returned", obs.mailIndex, att.attachmentIndex, obs, returnedEvidence, invoice)
-
-                if EvidenceAlreadyApplied(self, returnedEvidence) then
-                    skipRecorded = IncrementSkipReason(stats, "returned-already-applied")
-                    SessionLog("AHMailboxReconciler: returned AH evidence skipped owner=%s itemID=%s itemName=%s quantity=%d reason=already-applied-this-session",
-                        tostring(ownerKey), tostring(att.itemID), tostring(att.itemName), att.quantity)
-                else
-                    mailEvidence[#mailEvidence + 1] = returnedEvidence
-                    stats.returnedEvidenceCount = stats.returnedEvidenceCount + 1
-                end
+                StampMailAge(returnedEvidence, obs.daysLeft)
+                mailEvidence[#mailEvidence + 1] = returnedEvidence
+                stats.returnedEvidenceCount = stats.returnedEvidenceCount + 1
             end
         end
 
@@ -1202,20 +1679,28 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
         end
     end
 
+    -- Waiting list (2026-11-09): skip mail already matched on an earlier visit,
+    -- reuse the stable key of mail already waiting, then retry everything still
+    -- waiting together with the new mail so elimination can work across visits.
+    local inboxEvidence, claimStats = ClaimInboxMail(ownerKey, mailEvidence)
+    mailEvidence = inboxEvidence
+    local waitingAdded = AddUnclaimedWaiting(ownerKey, mailEvidence, claimStats.claimedWaiting)
     mailEvidence.scanStats = stats
 
+    SessionLog("AHMailboxReconciler: mail claims owner=%s inbox=%d alreadyMatched=%d stillWaiting=%d new=%d waitingNotInInbox=%d preciseArrival=%d sampleDaysLeft=%s",
+        tostring(ownerKey), claimStats.inboxEvidence, claimStats.alreadyMatched, claimStats.stillWaiting,
+        claimStats.new, waitingAdded, claimStats.precise or 0, tostring(claimStats.sampleDaysLeft))
+
     if #mailEvidence == 0 then
-        SessionLog("AHMailboxReconciler: no AH evidence in mailbox owner=%s; skipping reconciliation", tostring(ownerKey))
+        SessionLog("AHMailboxReconciler: no AH evidence to match owner=%s; skipping reconciliation", tostring(ownerKey))
         return nil
     end
-
-    StampMailboxResolutionEvidence(ownerKey, mailEvidence)
 
     -- Direct returned-item inventory path: applies AH offset adjustments for returned
     -- attachments with a known configKey, without requiring a listing match.
     local returnedWithKey = {}
     for _, ev in ipairs(mailEvidence) do
-        if EvidenceIsReturned(ev) and ev.configKey and ev.configKey ~= "" then
+        if EvidenceIsReturned(ev) and ev.inInbox and ev.configKey and ev.configKey ~= "" then
             returnedWithKey[#returnedWithKey + 1] = ev
         end
     end
@@ -1225,7 +1710,6 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
     end
 
     local result = self:Resolve(mailEvidence)
-    local inventoryStateService = GetInventoryStateService()
     local results = result and result.results or {}
     local submission = result and result.inventorySubmission
 
@@ -1237,30 +1721,25 @@ function AHMailboxReconciler:ProcessMailboxObservations(ownerKey, mailObservatio
         tonumber(result and result.listingClosures) or 0,
         tostring(result and result.inventorySubmissionError))
 
-    if inventoryStateService and inventoryStateService.GetPendingAHReductions
-    and inventoryStateService.StorePendingAHMailboxEvidence
-    and inventoryStateService.ResolvePendingAHMailboxEvidence then
-        local pendingRows = inventoryStateService:GetPendingAHReductions(ownerKey)
-        if type(pendingRows) == "table" and next(pendingRows) ~= nil then
-            for _, evidence in ipairs(mailEvidence) do
-                if evidence and (evidence.type == "sold" or evidence.type == "returned")
-                and ReconciliationResolvedEvidence(result, evidence)
-                and #results == 0 then
-                    inventoryStateService:StorePendingAHMailboxEvidence(ownerKey, evidence,
-                        tostring(evidence.type) .. "-mail-no-active-ah-match", "mailbox-scan")
-                end
-            end
-        end
-        inventoryStateService:ResolvePendingAHMailboxEvidence(ownerKey, "mailbox-scan")
-    end
+    UpdateMailStore(ownerKey, mailEvidence, result, "mailbox")
 
-    -- Returned evidence was already marked in ResolveReturnedInventory.
-    -- Only mark sold evidence that resolved through the listing match path.
-    for _, evidence in ipairs(mailEvidence) do
-        if not EvidenceIsReturned(evidence) and ReconciliationResolvedEvidence(result, evidence) then
-            MarkEvidenceApplied(self, evidence)
-        end
-    end
+    return result
+end
 
+-- Retries the waiting list without the mailbox open (2026-11-09). Called after
+-- a reliable owned-auctions scan: listings it just closed or saw still active
+-- can settle held mail by elimination.
+function AHMailboxReconciler:RetryWaitingMail(ownerKey, reason)
+    if not ownerKey or ownerKey == "" then
+        return nil
+    end
+    local candidates = {}
+    AddUnclaimedWaiting(ownerKey, candidates, {})
+    if #candidates == 0 then
+        return nil
+    end
+    candidates.scanStats = {}
+    local result = self:Resolve(candidates)
+    UpdateMailStore(ownerKey, candidates, result, reason or "retry")
     return result
 end

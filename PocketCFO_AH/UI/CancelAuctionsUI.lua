@@ -88,13 +88,32 @@ local function RowID(row)
     return row and (row.rowID or row.groupKey or row.auctionID)
 end
 
+-- Any live auction can be cancelled, undercut or not (Brian, 2026-11-10:
+-- fix a wrong price, move it to another character; Blizzard and Auctionator
+-- allow it). Undercut rows are still listed and selected first.
 local function RowCanCancel(row)
-    return row and row.status == "Undercut" and #(row.auctions or {}) > 0
+    return row ~= nil and (row.status == "Undercut" or row.status == "OK")
+        and #(row.auctions or {}) > 0
 end
 
+-- Group headers like Post Auctions (Brian, 2026-11-10).
+local GROUP_TITLES = { "Undercut", "Not undercut", "Canceled" }
+
+-- Cancelling (waiting for the game) and Didn't cancel sit in the Canceled
+-- group with their status shown (2026-11-10).
+local function RowGroup(row)
+    if row.status == "Undercut" then
+        return 1
+    elseif row.status == "Canceled" or row.status == "Cancelling" or row.status == "Didn't cancel" then
+        return 3
+    end
+    return 2
+end
+
+-- Auto-select only an undercut row; others are picked by hand.
 local function FirstCancelableIndex(rows)
     for index, row in ipairs(rows or {}) do
-        if RowCanCancel(row) then
+        if row and row.status == "Undercut" and RowCanCancel(row) then
             return index
         end
     end
@@ -251,22 +270,40 @@ function CancelAuctionsUI:RefreshRows()
     self.rows = self.rows or {}
     self:RestoreSelection()
 
+    -- A header over each group once evaluation is done (same pattern as
+    -- PostingUI). display = { {header = title} | {rowIndex = n} }.
+    local display = {}
+    local groupController = self:GetController()
+    local showGroups = not (groupController and groupController.IsEvaluationInProgress
+        and groupController:IsEvaluationInProgress())
+    local lastGroup = nil
+    for rowIndex, row in ipairs(self.rows) do
+        if showGroups then
+            local group = RowGroup(row)
+            if group ~= lastGroup then
+                display[#display + 1] = { header = GROUP_TITLES[group] }
+                lastGroup = group
+            end
+        end
+        display[#display + 1] = { rowIndex = rowIndex }
+    end
+
     local offset = FauxScrollFrame_GetOffset and FauxScrollFrame_GetOffset(list.scrollFrame) or 0
     local visibleRows = GetVisibleListRows(list.listBox)
     if FauxScrollFrame_Update then
-        FauxScrollFrame_Update(list.scrollFrame, #self.rows, visibleRows, ROW_HEIGHT)
+        FauxScrollFrame_Update(list.scrollFrame, #display, visibleRows, ROW_HEIGHT)
     end
 
     for index, button in ipairs(list.buttons or {}) do
         if index > visibleRows then
             button:Hide()
         else
-            local rowIndex = offset + index
-            local row = self.rows[rowIndex]
+            local entry = display[offset + index]
+            local rowIndex = entry and entry.rowIndex
+            local row = rowIndex and self.rows[rowIndex] or nil
             if row then
-                local isInactiveRow =
-                    row.status == "OK"
-                    or row.status == "Canceled"
+                -- Not-undercut rows are cancelable now, so only Canceled is gray.
+                local isInactiveRow = row.status == "Canceled"
 
                 button.queueIndex = rowIndex
                 button.queueRow = row
@@ -295,14 +332,20 @@ function CancelAuctionsUI:RefreshRows()
             else
                 button.queueIndex = nil
                 button.queueRow = nil
-                button.ItemText:SetText("")
+                button.ItemText:SetText(entry and entry.header or "")
                 button.QuantityText:SetText("")
                 button.PriceText:SetText("")
                 button.DurationText:SetText("")
                 button.StatusText:SetText("")
                 button.NoteText:SetText("")
                 button:Disable()
-                button:SetBackdropColor(0.04, 0.04, 0.04, 0.45)
+                if entry and entry.header then
+                    -- Group header: gold text, no backdrop.
+                    button.ItemText:SetTextColor(1, 0.82, 0)
+                    button:SetBackdropColor(0, 0, 0, 0)
+                else
+                    button:SetBackdropColor(0.04, 0.04, 0.04, 0.45)
+                end
                 button:Show()
             end
         end
@@ -342,6 +385,9 @@ end
 function CancelAuctionsUI:OnRowsChanged(rows, reason)
     self.rows = rows or {}
     self.lastRowsChangedReason = reason
+    if reason == "complete" then
+        self.evaluatedAt = GetTime and GetTime() or nil
+    end
     if reason == "cancel-processing-started" then
         self.cancelInProgress = true
     elseif reason == "cancel-requested" or reason == "cancel-failed" or reason == "complete" or reason == "refreshing" then
@@ -383,8 +429,16 @@ function CancelAuctionsUI:HandleCancelSelected()
         return
     end
     self.cancelInProgress = true
-    self:RefreshRows()
+    -- WoW Forever (Forever-only, gated, 2026-11-10): no redraw before the
+    -- cancel call (see CancelAuctionsController CancelSelectedRow).
+    local isForever = PocketCFO and PocketCFO.flavor == "forever"
+    if not isForever then
+        self:RefreshRows()
+    end
     local ok, err = controller:CancelSelectedRow(row)
+    if isForever then
+        self:RefreshRows()
+    end
     if not ok then
         self.cancelInProgress = false
         self:RefreshRows()
@@ -392,8 +446,118 @@ function CancelAuctionsUI:HandleCancelSelected()
     end
 end
 
+-- Coming back to Cancel Auctions shows the list that was already evaluated
+-- instead of evaluating everything again, same as Post Auctions (Brian,
+-- 2026-11-10): within SAVED_LIST_SECONDS of the evaluation finishing, and,
+-- if the AH was closed (an accidental dismount), only when it was reopened
+-- within REOPEN_RESTORE_SECONDS. Refresh always re-evaluates.
+local SAVED_LIST_SECONDS = 5 * 60
+local REOPEN_RESTORE_SECONDS = 3 * 60
+
+function CancelAuctionsUI:OnAuctionHouseClosed()
+    self.closedAt = GetTime and GetTime() or nil
+end
+
+function CancelAuctionsUI:CanReuseList()
+    local controller = self:GetController()
+    if not self.evaluatedAt or not GetTime or not controller then
+        return false
+    end
+    local now = GetTime()
+    if now - self.evaluatedAt > SAVED_LIST_SECONDS then
+        return false
+    end
+    if self.closedAt and now - self.closedAt > REOPEN_RESTORE_SECONDS then
+        return false
+    end
+    -- A cancel that was in flight may or may not have gone through:
+    -- evaluate fresh rather than guess.
+    if self.cancelInProgress == true
+    or (controller.IsCancelInProgress and controller:IsCancelInProgress() == true) then
+        return false
+    end
+    local rows = controller:GetRows() or {}
+    if #rows == 0 or (controller.IsEvaluationInProgress and controller:IsEvaluationInProgress()) then
+        return false
+    end
+    -- The saved list must still match the game's active auctions (2026-11-10:
+    -- a robe sold while the saved list still held it; Cancel then targeted
+    -- the sold auction). Any sale, expiry, new post or outside cancel means
+    -- the auction IDs differ: rebuild.
+    local current, why = self:CurrentActiveAuctionIDs()
+    if not current then
+        SessionLog("CancelAuctionsUI: saved list not reused reason=%s", tostring(why))
+        return false
+    end
+    local listed = {}
+    for _, row in ipairs(rows) do
+        if row.status == "Undercut" or row.status == "OK" then
+            for _, auction in ipairs(row.auctions or {}) do
+                local id = auction and (auction.auctionID or auction.auctionId)
+                if id == nil then
+                    SessionLog("CancelAuctionsUI: saved list not reused reason=row-auction-without-id")
+                    return false
+                end
+                listed[tostring(id)] = true
+            end
+        end
+    end
+    for id in pairs(current) do
+        if not listed[id] then
+            SessionLog("CancelAuctionsUI: saved list not reused reason=new-auction auctionID=%s", id)
+            return false
+        end
+    end
+    for id in pairs(listed) do
+        if not current[id] then
+            SessionLog("CancelAuctionsUI: saved list not reused reason=auction-gone auctionID=%s", id)
+            return false
+        end
+    end
+    return true
+end
+
+-- Active owned auction IDs from the game right now, or nil + reason.
+function CancelAuctionsUI:CurrentActiveAuctionIDs()
+    local scanner = PocketCFO_AH:GetModule("OwnedAuctionsScanner", true)
+    if not scanner or not scanner.GetOwnedAuctionInfos then
+        return nil, "scanner-unavailable"
+    end
+    if scanner.OwnedAuctionResultsReady and scanner:OwnedAuctionResultsReady() ~= true then
+        return nil, "owned-not-ready"
+    end
+    local ids = {}
+    for _, info in ipairs(scanner:GetOwnedAuctionInfos() or {}) do
+        if type(info) == "table" and (info.status == nil or tonumber(info.status) == 0) then
+            local id = info.auctionID or info.auctionId
+            if id == nil then
+                return nil, "owned-auction-without-id"
+            end
+            ids[tostring(id)] = true
+        end
+    end
+    return ids
+end
+
+function CancelAuctionsUI:ShowSavedList()
+    local controller = self:GetController()
+    self.closedAt = nil
+    self.rows = controller and controller:GetRows() or {}
+    if self.loadingLabel then
+        self.loadingLabel:Hide()
+    end
+    if self.emptyLabel then
+        self.emptyLabel:Hide()
+    end
+    SessionLog("CancelAuctionsUI: showing saved list rows=%d undercut=%d",
+        #(self.rows or {}), CountStatus(self.rows, "Undercut"))
+    self:SelectInitialRow()
+end
+
 function CancelAuctionsUI:RefreshQueue(reason)
     local controller = self:GetController()
+    self.evaluatedAt = nil
+    self.closedAt = nil
     self.cancelInProgress = false
     self.selectedIndex = nil
     self.selectedRowID = nil
@@ -456,6 +620,9 @@ function CancelAuctionsUI:Render(parent)
     for index = 1, VISIBLE_ROWS do
         local button = AddChild(parent, self:CreateQueueRow(listBox, 4, -24 - ((index - 1) * ROW_HEIGHT), 706, ROW_HEIGHT - 2))
         button:SetScript("OnClick", function(clicked)
+            if not clicked.queueIndex then
+                return -- group header
+            end
             self:SelectRow(clicked.queueIndex, false)
         end)
         button:SetScript("OnEnter", ShowRowTooltip)

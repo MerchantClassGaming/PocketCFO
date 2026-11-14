@@ -180,8 +180,8 @@ function PostingEventCapture:CapturePendingPost(itemLocation, duration, quantity
     local postedQuantity = tonumber(quantity) or 1
     if not itemID or itemID <= 0 or postedQuantity <= 0 then
         self.pendingPost = nil
-        SessionLog("AHManager: pending post capture skipped reason=missing_item_or_quantity itemGUID=%s itemID=%s quantity=%s itemLinkPresent=%s",
-            tostring(itemGUID), tostring(itemID), tostring(quantity), tostring(itemLink ~= nil))
+        SessionLog("AHManager: pending post capture skipped reason=missing_item_or_quantity itemGUID=%s itemID=%s quantity=%s itemLinkPresent=%s duration=%s",
+            tostring(itemGUID), tostring(itemID), tostring(quantity), tostring(itemLink ~= nil), tostring(duration))
         return
     end
 
@@ -208,9 +208,10 @@ function PostingEventCapture:CapturePendingPost(itemLocation, duration, quantity
         duration        = duration,
         capturedAt      = Now(),
     }
-    SessionLog("AHManager: pending post captured source=item itemGUID=%s itemID=%s quantity=%d quality=%s itemLinkPresent=%s",
+    SessionLog("AHManager: pending post captured source=item itemGUID=%s itemID=%s quantity=%d quality=%s itemLinkPresent=%s duration=%s",
         tostring(self.pendingPost.itemGUID), tostring(self.pendingPost.itemID), self.pendingPost.quantity,
-        tostring(self.pendingPost.craftingQuality), tostring(self.pendingPost.itemLink ~= nil))
+        tostring(self.pendingPost.craftingQuality), tostring(self.pendingPost.itemLink ~= nil),
+        tostring(duration))
     Debug("AHManager: pending post captured itemGUID=%s itemID=%s itemName=%s quantity=%d",
         tostring(self.pendingPost.itemGUID), tostring(self.pendingPost.itemID),
         tostring(self.pendingPost.itemName), self.pendingPost.quantity)
@@ -221,8 +222,10 @@ function PostingEventCapture:CapturePendingCommodityPost(itemID, duration, quant
     local postedQuantity = tonumber(quantity) or 0
     if not itemID or itemID <= 0 or postedQuantity <= 0 then
         self.pendingPost = nil
-        SessionLog("AHManager: pending post capture skipped source=commodity reason=missing_item_or_quantity itemID=%s quantity=%s",
-            tostring(itemID), tostring(quantity))
+        -- duration logged here too (2026-11-10): Blizzard-window commodity
+        -- posts land here (first arg is an ItemLocation, not an itemID).
+        SessionLog("AHManager: pending post capture skipped source=commodity reason=missing_item_or_quantity itemID=%s quantity=%s duration=%s",
+            tostring(itemID), tostring(quantity), tostring(duration))
         return
     end
 
@@ -249,9 +252,10 @@ function PostingEventCapture:CapturePendingCommodityPost(itemID, duration, quant
         duration        = duration,
         capturedAt      = Now(),
     }
-    SessionLog("AHManager: pending post captured source=commodity itemID=%s quantity=%d quality=%s itemLinkPresent=%s",
+    SessionLog("AHManager: pending post captured source=commodity itemID=%s quantity=%d quality=%s itemLinkPresent=%s duration=%s",
         tostring(self.pendingPost.itemID), self.pendingPost.quantity,
-        tostring(self.pendingPost.craftingQuality), tostring(self.pendingPost.itemLink ~= nil))
+        tostring(self.pendingPost.craftingQuality), tostring(self.pendingPost.itemLink ~= nil),
+        tostring(duration))
 end
 
 function PostingEventCapture:HookPostMethods()

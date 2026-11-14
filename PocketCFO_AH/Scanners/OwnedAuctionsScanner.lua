@@ -444,6 +444,19 @@ function OwnedAuctionsScanner:ScanOwnedAuctions()
         SessionLog("OwnedAuctionsScanner: AHListing reconcile skipped reason=owned-auctions-not-ready")
     end
 
+    -- Retry AH mail still waiting to be matched (2026-11-09, AH_Mail_Matching_Design
+    -- Change B): this scan may have closed listings or seen variants still listed.
+    if ready then
+        local core = _G.PocketCFO
+        local reconciler = core and core.GetModule and core:GetModule("AHMailboxReconciler", true)
+        if reconciler and reconciler.RetryWaitingMail then
+            local ok, err = pcall(reconciler.RetryWaitingMail, reconciler, ownerKey, "owned-scan")
+            if not ok then
+                SessionLog("OwnedAuctionsScanner: waiting mail retry failed err=%s", tostring(err))
+            end
+        end
+    end
+
     local allowEmptySnapshot = OnlySkippedNonActiveStatus(skippedReasons, skippedCount, #ownedInfos)
     local snapshotWritten, snapshotWriteReason, storedRows = self:WriteAHSnapshot(ownerKey, rows, ready, ownedCount, {
         allowEmptySnapshot = allowEmptySnapshot,

@@ -3,7 +3,7 @@
 ## Title: PocketCFO AH
 ## Notes: Auction House scanner and listing reconciler - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.2.4
+## Version: v1.2.5
 ## SavedVariables: PocketCFO_AH_DB
 ## LoadOnDemand: 1
 ## LoadWith: Blizzard_AuctionHouseUI
@@ -20,7 +20,49 @@
 ..\PocketCFO\Libs\AceDB-3.0\AceDB-3.0.lua
 
 ## Core
+## Forever (2026-11-10): same file list as PocketCFO_AH.toc. Forever differences are
+## gated in code with PocketCFO.flavor == "forever" (durations, settings).
 Init.lua
 
-## UI (Forever: Dashboard shell only. No scanners, posting, cancel, market services, AHManager or session controller)
+## Scanners
+Scanners\OwnedAuctionsScanner.lua
+
+## Services
+Services\AHListing\AHListingService.lua
+Services\AuctionLookup\AuctionLookupService.lua
+Services\MarketDiscoveryService\MarketDiscoveryResult.lua
+Services\MarketDiscoveryService\AuctionCandidateNormalizer.lua
+Services\MarketDiscoveryService\AuctionCandidateSearch.lua
+Services\MarketDiscoveryService\AuctionMatchFilter.lua
+Services\MarketDiscoveryService\MarketDiscoveryService.lua
+Services\MarketLadderService\LadderResult.lua
+Services\MarketLadderService\PurchaseOrderSorter.lua
+Services\MarketLadderService\OwnedPositionAnalyzer.lua
+Services\MarketLadderService\LadderBuilder.lua
+Services\MarketLadderService\MarketLadderService.lua
+Services\PostingEligibilityService\PostingEligibilityService.lua
+
+## Posting
+Posting\Smart\SmartPricing.lua
+Posting\Evaluation\PostingEvaluator.lua
+Posting\Evaluation\PostingEvaluationPipeline.lua
+Posting\Execution\PostingExecution.lua
+Posting\Components\PostingController.lua
+Posting\UI\PostingUI.lua
+Cancelling\CancelEvaluation.lua
+Cancelling\CancelAuctionsController.lua
+UI\CancelAuctionsUI.lua
+Posting\Rules\PostingRuleRepository.lua
+Posting\Components\PostingRuleEditor.lua
+Posting\UI\PostingProfileEditorUI.lua
+Posting\UI\PostingProfileManagerUI.lua
+Posting\Rules\PostingProfileRepository.lua
+Posting\Rules\PostingRuleResolver.lua
+Posting\Queue\PostingQueuePipeline.lua
 UI\AuctionHousePostingShell.lua
+
+## Manager
+Infrastructure\AHSessionController.lua
+Posting\Components\PostingEventCapture.lua
+Posting\Components\PostingLifecycleController.lua
+Infrastructure\AHManager.lua

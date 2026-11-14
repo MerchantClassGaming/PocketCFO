@@ -116,8 +116,15 @@ end
 -- Requires: prior must have a resolved configKey, matching itemID, and
 -- matching itemLink. A nil itemLink on either side is treated as a mismatch
 -- so that unresolved-link slots always re-resolve until the cache warms.
+-- An identity built before the game loaded the item has item level 0
+-- (2026-11-10, /mcgd ilvlcheck: 29 of 29 level-0 bag rows were cold reads,
+-- correct 3s later). Never reuse it: the slot resolves again next scan.
+local function IsItemLevelPending(configKey)
+    return type(configKey) == "string" and configKey:find("|ilvl:0", 1, true) ~= nil
+end
+
 local function SlotSignatureMatches(prior, itemID, itemLink)
-    if not prior or not prior.configKey then
+    if not prior or not prior.configKey or IsItemLevelPending(prior.configKey) then
         return false
     end
     if tonumber(prior.itemID) ~= tonumber(itemID) then
@@ -276,17 +283,21 @@ local function ScanContainerSet(containers, ownerKey, timestamp)
                     aggregatedRows[key].quantity = (tonumber(aggregatedRows[key].quantity) or 0) + quantity
 
                     -- Annotate bind-state while bag/slot context is available.
-                    -- Conservative: if any slot aggregated under this configKey is bound,
-                    -- the whole row is marked bound.
                     -- InventoryFilterService uses row.isBound to exclude bound items from
                     -- posting workflows. Post-scan rows (from InventoryStateService) lack
                     -- bag/slot context; this is the only place it can be detected.
-                    if not aggregatedRows[key].isBound then
-                        local classifier = GetSoulboundClassifier()
-                        if classifier and type(classifier.BagSlotHasBoundTooltip) == "function" then
-                            if classifier:BagSlotHasBoundTooltip(containerID, slot) then
-                                aggregatedRows[key].isBound = true
-                            end
+                    -- Per copy (2026-11-10): a soulbound copy must not hide BoE
+                    -- copies of the same item, so bound copies are counted and
+                    -- the row is bound only when every copy is (set after the
+                    -- loop). A copy whose bind state isn't known yet (item not
+                    -- loaded) marks the row bindPending, which triggers the
+                    -- same 3s rescan as item level 0.
+                    local classifier = GetSoulboundClassifier()
+                    if classifier and type(classifier.BagSlotHasBoundTooltip) == "function" then
+                        if classifier:BagSlotHasBoundTooltip(containerID, slot) then
+                            aggregatedRows[key].boundQuantity = (aggregatedRows[key].boundQuantity or 0) + quantity
+                        elseif type(classifier.BagSlotBindUnknown) == "function" and classifier:BagSlotBindUnknown(containerID, slot) then
+                            aggregatedRows[key].bindPending = true
                         end
                     end
 
@@ -306,6 +317,8 @@ local function ScanContainerSet(containers, ownerKey, timestamp)
 
     local scannedItems = {}
     for _, row in pairs(aggregatedRows) do
+        local bound = tonumber(row.boundQuantity) or 0
+        row.isBound = (bound > 0 and bound >= (tonumber(row.quantity) or 0)) or nil
         scannedItems[#scannedItems + 1] = row
     end
 
@@ -472,6 +485,7 @@ function BagScanner:ScanBags(options)
         diffStats.removedSlotCount   or 0,
         diffStats.identityCallsAvoided or 0,
         elapsed)
+    self:ScheduleItemLevelRescan(scannedItems, reason)
     return {
         ownerKey = characterGUID,
         location = "bags",
@@ -485,6 +499,43 @@ function BagScanner:ScanBags(options)
         skippedSoulboundFinishedGoods = observation.skippedSoulboundFinishedGoods or 0,
         diffStats = diffStats,
     }
+end
+
+-- Item level pending (2026-11-10): a scan that saved any row at item level 0
+-- (item not loaded yet; the identity service already asked the game to load
+-- it) rescans the bags once, 3s later, so the saved row gets its real level
+-- instead of waiting for the next bag change. At most 3 rescans in a row, so a
+-- row that never loads can't loop.
+local ILVL_RESCAN_DELAY = 3
+local ILVL_RESCAN_MAX = 3
+
+function BagScanner:ScheduleItemLevelRescan(rows, reason)
+    local pending = 0
+    for _, row in ipairs(rows or {}) do
+        if IsItemLevelPending(row.configKey) or row.bindPending then
+            pending = pending + 1
+        end
+    end
+    if pending == 0 then
+        self.ilvlRescanCount = 0
+        return
+    end
+    if reason ~= "ilvl-pending-rescan" then
+        self.ilvlRescanCount = 0
+    end
+    if self.ilvlRescanQueued or (self.ilvlRescanCount or 0) >= ILVL_RESCAN_MAX
+        or not C_Timer or type(C_Timer.After) ~= "function" then
+        SessionLog("BagScanner: item level pending rows=%d rescan=%s", pending,
+            self.ilvlRescanQueued and "queued" or "limit")
+        return
+    end
+    self.ilvlRescanQueued = true
+    self.ilvlRescanCount = (self.ilvlRescanCount or 0) + 1
+    SessionLog("BagScanner: item level pending rows=%d rescan in %ds (try %d)", pending, ILVL_RESCAN_DELAY, self.ilvlRescanCount)
+    C_Timer.After(ILVL_RESCAN_DELAY, function()
+        self.ilvlRescanQueued = nil
+        self:ScanBags({ reason = "ilvl-pending-rescan" })
+    end)
 end
 
 function BagScanner:OnEnable()

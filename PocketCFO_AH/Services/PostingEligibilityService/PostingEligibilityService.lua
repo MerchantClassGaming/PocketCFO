@@ -48,6 +48,37 @@ local function BagSlotHasBoundTooltip(containerID, slot)
     return false
 end
 
+-- Conjured items (mage food and water) never go to the AH (Brian,
+-- 2026-11-10, Forever: Conjured Muffin is not bound, stacks, and got in
+-- through the stackable override). Matched on the "Conjured Item" tooltip
+-- line. Theoretical: that ITEM_CONJURED is that text on every client
+-- (falls back to the English text).
+local CONJURED_TEXT = _G.ITEM_CONJURED or "Conjured Item"
+
+local function CleanTooltipText(text)
+    text = tostring(text or "")
+    text = text:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function BagSlotIsConjured(containerID, slot)
+    local classifier = GetSoulboundClassifier()
+    if not classifier or type(classifier.GetTooltipLinesForBagSlot) ~= "function" then
+        return false
+    end
+    local ok, lines = pcall(classifier.GetTooltipLinesForBagSlot, classifier, containerID, slot)
+    if not ok or type(lines) ~= "table" then
+        return false
+    end
+    for _, line in ipairs(lines) do
+        local text = type(line) == "table" and (line.leftText or line.text) or line
+        if CleanTooltipText(text) == CONJURED_TEXT then
+            return true
+        end
+    end
+    return false
+end
+
 local function IsLikelyCommodityItem(itemLink, itemID, itemInfo)
     local maxStack = itemInfo and tonumber(itemInfo.stackCount)
     local isCraftingReagent = nil
@@ -60,7 +91,7 @@ local function IsLikelyCommodityItem(itemLink, itemID, itemInfo)
 end
 
 -- Returns postable, and when false a reason: "noItem" | "noSlot" | "bound"
--- | "ahRefused" (C_AuctionHouse.IsSellItemValid said no). The reason is for
+-- | "conjured" | "ahRefused" (C_AuctionHouse.IsSellItemValid said no). The reason is for
 -- diagnostics only (Brian, 2026-11-06: smart list sometimes drops every
 -- finished good; the session log now says which check refused them).
 function PostingEligibilityService:IsBagSlotAHPostable(containerID, slot, itemID)
@@ -81,6 +112,9 @@ function PostingEligibilityService:IsBagSlotAHPostable(containerID, slot, itemID
     if BagSlotHasBoundTooltip(containerID, slot) then
         return false, "bound"
     end
+    if BagSlotIsConjured(containerID, slot) then
+        return false, "conjured"
+    end
 
     if location and C_AuctionHouse and type(C_AuctionHouse.IsSellItemValid) == "function" then
         local ok, valid = pcall(C_AuctionHouse.IsSellItemValid, location, false)
@@ -91,6 +125,17 @@ function PostingEligibilityService:IsBagSlotAHPostable(containerID, slot, itemID
 
             -- Stackable override: the AH said no, but no bind check fired.
             -- Kept for commodities IsSellItemValid has refused before.
+            -- Not while the bind state is still unknown (2026-11-10): with the
+            -- item not loaded, "no bind check fired" can just mean an empty
+            -- tooltip, which is how bound potions / Latent Arcana leaked.
+            local classifier = GetSoulboundClassifier()
+            if classifier and type(classifier.BagSlotBindUnknown) == "function"
+                and classifier:BagSlotBindUnknown(containerID, slot) then
+                SessionLog("PostingEligibility: override held, bind state not loaded yet item=%s itemID=%s bag=%s slot=%s",
+                    tostring(info and (info.itemName or info.hyperlink) or itemID), tostring(itemID),
+                    tostring(containerID), tostring(slot))
+                return false, "bindLoading"
+            end
             if IsLikelyCommodityItem(info and info.hyperlink, itemID, info) then
                 -- Diagnostics only (2026-11-07): every item that gets in only
                 -- through this override, with what each check said, so a

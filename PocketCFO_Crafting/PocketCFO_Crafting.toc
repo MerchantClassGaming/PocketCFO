@@ -2,7 +2,7 @@
 ## Title: PocketCFO Crafting
 ## Notes: Crafting queue, recipe configuration, and inventory target evaluation - Merchant Class Gaming
 ## Author: MerchantCGaming
-## Version: v1.2.4
+## Version: v1.2.5
 ## SavedVariables: PocketCFO_Crafting_DB
 ## LoadOnDemand: 1
 
@@ -57,6 +57,7 @@ UI\InventoryManager\CraftTooltipBuilder.lua
 Crafting\QueueGeneration.lua
 UI\InventoryManager\InventoryManagerWindow.lua
 Crafting\CraftQueueController.lua
+UI\RecipeAnalysis\RecipeAnalysisReopenButton.lua
 Statistics\CraftStatLog.lua
 Crafting\OperationObservationBuilder.lua
 Crafting\OperationHistoricalValuationEnricher.lua

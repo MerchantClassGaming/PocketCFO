@@ -1,2 +1,13 @@
 Retail and Forever
-Enabled recipe analysis for smelting recipes.
+Added window snapping so you can't accidentally hide the analysis window behind the main crafting window.
+
+Added a button to the recipe book/crafting window in the upper right that allows you to recover the window without having to close and reopen the recipe book. This button will also reposition the analysis window to the center in case you lost it.
+
+Cached the auction house posting and cancel view so that if you accidentally click away, as long as you click back within 3 minutes, you will see the information from your last evaluation and don't need to reevaluate. Refresh if you want an updated view in the 3 minute window.
+
+Adjusted the gold per hour tracking reminder/popup. It's now removed. If an activity is being tracked, it will now auto end if you haven't performed that activity in the last 5 minutes. e.g. you are gathering herbs and it's tracking an herb session. Once you don't pick an herb for 5 minutes, it will assume you are done and close out the session.
+
+When sessions are auto closed after 5 minutes, the time is adjusted down 3 minutes and the run is saved.
+
+You still need to perform 5 of the same auto activity to save a session, unless you have clicked the manual "start session" button.
+

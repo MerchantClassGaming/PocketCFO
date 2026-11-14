@@ -45,7 +45,6 @@ local SLOTS = {
     INVTYPE_PROFESSION_GEAR = "gear",
 }
 local GREEN, BLUE = 2, 3
-local PLACEHOLDER_STAT_PREFIX = "ITEM_MOD_MODIFIED_CRAFTING_STAT_"
 
 local ROWS_PER_CHUNK = 4000
 local ITEMS_PER_CHUNK = 200
@@ -76,20 +75,22 @@ function ProfessionGearPairs:GetPartner(itemID)
     return store and store[tonumber(itemID)] or nil
 end
 
--- Real stats from a cache key ("id|q3|stats:A|B" -> "A|B"); nil when the key
--- has none or only Blizzard's "a stat you'll choose" placeholder.
-local function RealStatsFromKey(marketKey)
-    local statsAt = marketKey:find("|stats:", 1, true)
-    if not statsAt then
+-- An accessory's own stats (2026-11-10): the same on every copy of an item
+-- ID, so they're not part of its price key any more
+-- (Item_Identity_Unification_Design.md 5.1). ItemIdentityService keeps them
+-- as ignoredStatFingerprint ("A+B"). nil when unknown (item data not loaded).
+local function AccessoryStats(itemID)
+    local core = _G.PocketCFO
+    local service = core and core.ItemIdentityService
+    if not service or type(service.FromItemID) ~= "function" then
         return nil
     end
-    local fingerprint = marketKey:sub(statsAt + #"|stats:")
-    for stat in string.gmatch(fingerprint, "[^|]+") do
-        if stat:sub(1, #PLACEHOLDER_STAT_PREFIX) == PLACEHOLDER_STAT_PREFIX then
-            return nil
-        end
+    local ok, identity = pcall(service.FromItemID, service, itemID)
+    local stats = ok and type(identity) == "table" and identity.ignoredStatFingerprint or nil
+    if stats and tostring(stats) ~= "" then
+        return tostring(stats)
     end
-    return fingerprint ~= "" and fingerprint or nil
+    return nil
 end
 
 local function InstantSlotAndIcon(itemID)
@@ -271,6 +272,12 @@ function ProfessionGearPairs:Rebuild()
                 if rarity then
                     if rarity == GREEN or rarity == BLUE then
                         local entry = candidates[itemID]
+                        if entry.slot == "gear" then
+                            local fp = AccessoryStats(itemID)
+                            if fp then
+                                entry.stats[fp] = true
+                            end
+                        end
                         resolved[itemID] = {
                             rarity = rarity, expacID = expacID, subClassID = subClassID,
                             slot = entry.slot, icon = entry.icon, stats = entry.stats,
@@ -318,13 +325,6 @@ function ProfessionGearPairs:Rebuild()
                         local slot, icon = InstantSlotAndIcon(itemID)
                         if slot then
                             candidates[itemID] = { slot = slot, icon = icon, stats = {} }
-                        end
-                    end
-                    local entry = candidates[itemID]
-                    if entry then
-                        local fp = RealStatsFromKey(tostring(key))
-                        if fp then
-                            entry.stats[fp] = true
                         end
                     end
                 end

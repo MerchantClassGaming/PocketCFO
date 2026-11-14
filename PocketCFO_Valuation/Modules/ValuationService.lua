@@ -197,7 +197,15 @@ end
 -- "238018|q5|stats:ITEM_MOD_MULTICRAFT_SHORT". A stat list made only of
 -- these placeholders counts as "no stats picked". Theoretical: _2 etc. on
 -- items with two choosable stats.
-local PLACEHOLDER_STAT_PREFIX = "ITEM_MOD_MODIFIED_CRAFTING_STAT_"
+-- Keys hold stats in ItemIdentityService's form since 2026-11-10 (short
+-- names joined with "+": "MODIFIED_CRAFTING_STAT_1+STAMINA"); the old long
+-- form ("ITEM_MOD_..._SHORT", joined with "|") is still read.
+local PLACEHOLDER_STAT_PREFIX = "MODIFIED_CRAFTING_STAT_"
+
+local function IsPlaceholderStat(stat)
+    stat = (tostring(stat or ""):gsub("^ITEM_MOD_", ""))
+    return stat:sub(1, #PLACEHOLDER_STAT_PREFIX) == PLACEHOLDER_STAT_PREFIX
+end
 
 -- Returns the key with its stats removed when it has no real stats
 -- (none, or placeholders only); nil when it has real stats of its own.
@@ -207,8 +215,8 @@ local function BaseKeyWithoutChosenStats(marketKey)
         return marketKey
     end
     local fingerprint = marketKey:sub(statsAt + #"|stats:")
-    for stat in string.gmatch(fingerprint, "[^|]+") do
-        if stat:sub(1, #PLACEHOLDER_STAT_PREFIX) ~= PLACEHOLDER_STAT_PREFIX then
+    for stat in string.gmatch(fingerprint, "[^|+]+") do
+        if not IsPlaceholderStat(stat) then
             return nil
         end
     end
@@ -375,6 +383,222 @@ end
 
 --- Cheapest priced version of an item ID (see IsInterchangeableVersionItem),
 -- in GetItemValue's result shape, or nil when no version has a price. Reads
+-- ---------------------------------------------------------------------------
+-- Version unknown (Item_Identity_Unification_Design.md 6.8, Brian 2026-11-10:
+-- the same item must never show different values in different places).
+-- Which version is meant isn't known when:
+--   - a recipe preview has no missive slotted (Blizzard's "stat you'll
+--     choose" placeholders in its stats),
+--   - an AH summary row covers every version at one item level,
+--   - a missive's stat pair has no price (nobody lists that pair).
+-- One rule for all three: the cheapest price among versions of the item at
+-- the same quality / item level that carry the known fixed stats (e.g.
+-- Strength + Stamina + DPS), counting versions seen in the last 3 days
+-- (PricingCache's fresh window) when there are any, else any age. Cheapest,
+-- not average: a craft decision never shows more than the cheapest real
+-- version supports, and it matches the AH row's own lowest price. Marked
+-- modeled ("Est."). Reads the cache only (no recursion into valuation).
+-- ---------------------------------------------------------------------------
+
+local function StatTokenSet(stats)
+    local set, count = {}, 0
+    for token in string.gmatch(tostring(stats or ""), "[^|+]+") do
+        token = (token:gsub("^ITEM_MOD_", ""))
+        token = (token:gsub("_SHORT$", ""))
+        if token ~= "" and not set[token] then
+            set[token] = true
+            count = count + 1
+        end
+    end
+    return set, count
+end
+
+local function KeyStats(marketKey)
+    local statsAt = tostring(marketKey or ""):find("|stats:", 1, true)
+    if not statsAt then
+        return nil, tostring(marketKey or "")
+    end
+    return tostring(marketKey):sub(statsAt + #"|stats:"), tostring(marketKey):sub(1, statsAt - 1)
+end
+
+-- Known stats of a stat list (placeholders left out) and whether it had any
+-- placeholder.
+local function FixedStats(stats)
+    local fixed, hasPlaceholder = {}, false
+    for token in pairs((StatTokenSet(stats))) do
+        if IsPlaceholderStat(token) then
+            hasPlaceholder = true
+        else
+            fixed[token] = true
+        end
+    end
+    return fixed, hasPlaceholder
+end
+
+-- scope: { baseKey = "id|q5" } or { itemLevel = 232 }.
+local function ResolveUnknownVersion(cacheModule, itemID, scope, fixed, normalized, requestedKey)
+    if type(cacheModule.GetCandidatesForItemID) ~= "function" or not itemID then
+        return nil
+    end
+    local cheapestFresh, cheapestAny, versionCount = nil, nil, 0
+    for _, candidate in ipairs(cacheModule:GetCandidatesForItemID(itemID) or {}) do
+        local candidateKey = type(candidate) == "table" and tostring(candidate.marketKey or "") or ""
+        local candidateStats, candidateBase = KeyStats(candidateKey)
+        local inScope
+        if scope.baseKey then
+            inScope = candidateBase == scope.baseKey
+        else
+            inScope = tonumber(candidate.itemLevel) == tonumber(scope.itemLevel)
+        end
+        if inScope and candidateKey ~= "" then
+            local tokens = StatTokenSet(candidateStats)
+            local matches = true
+            for token in pairs(tokens) do
+                if IsPlaceholderStat(token) then
+                    matches = false
+                    break
+                end
+            end
+            for token in pairs(fixed or {}) do
+                if not tokens[token] then
+                    matches = false
+                    break
+                end
+            end
+            if matches then
+                local value, freshness, row = cacheModule:GetValueByMarketKey(candidateKey)
+                value = tonumber(value)
+                if value then
+                    versionCount = versionCount + 1
+                    local entry = { key = candidateKey, value = value, freshness = freshness, row = row }
+                    if freshness == "fresh" and (not cheapestFresh or value < cheapestFresh.value) then
+                        cheapestFresh = entry
+                    end
+                    if not cheapestAny or value < cheapestAny.value then
+                        cheapestAny = entry
+                    end
+                end
+            end
+        end
+    end
+    local chosen = cheapestFresh or cheapestAny
+    if not chosen then
+        return nil
+    end
+    local row = chosen.row
+    return {
+        resolved = true,
+        value = chosen.value,
+        valuePerUnit = chosen.value,
+        currency = CURRENCY_COPPER,
+        basis = "unknownVersionCheapest:" .. tostring(versionCount),
+        source = SOURCE_AH,
+        strategyKey = SOURCE_AH,
+        valuationBasis = BASIS_MODELED,
+        itemID = itemID,
+        configKey = normalized and normalized.configKey or nil,
+        isFresh = chosen.freshness == "fresh",
+        lastUpdated = row and row.timestamp,
+        unresolved = nil,
+        unresolvedReason = nil,
+        provenance = {
+            marketKey = chosen.key,
+            requestedMarketKey = requestedKey,
+            unknownVersion = true,
+            versionCount = versionCount,
+            depthUsed = row and row.depthUsed,
+            cacheSource = row and row.source,
+            timestamp = row and row.timestamp,
+            isFresh = chosen.freshness == "fresh",
+        },
+    }
+end
+
+-- The item's fixed stats from its base link (GetItemInfo), for a missive
+-- stat pair with no price: known only when the base link shows Blizzard's
+-- placeholders. Theoretical: that a crafted item's base link carries its
+-- fixed stats plus placeholders, as the recipe preview and the AH summary
+-- row do (confirmed for those two, 2026-11-10).
+local function BaseItemFixedStats(itemID)
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    local core = _G.PocketCFO
+    local service = core and core.ItemIdentityService
+    if not getInfo or not service or type(service.GetVariantStats) ~= "function" then
+        return nil
+    end
+    local okInfo, _, baseLink = pcall(getInfo, itemID)
+    if not okInfo or not baseLink then
+        return nil
+    end
+    local okStats, stats = pcall(service.GetVariantStats, service, baseLink, nil, nil)
+    if not okStats or not stats then
+        return nil
+    end
+    local fixed, hasPlaceholder = FixedStats(stats)
+    if not hasPlaceholder then
+        return nil
+    end
+    return fixed
+end
+
+local function ResolveUnknownVersionForKey(cacheModule, marketKey, normalized, resolvedItemID)
+    local stats, baseKey = KeyStats(marketKey)
+    if not stats then
+        return nil
+    end
+    local itemID = normalized.itemID or resolvedItemID
+    local fixed, hasPlaceholder = FixedStats(stats)
+    if not hasPlaceholder then
+        -- A real stat pair with no price: price from the versions sharing
+        -- the item's fixed stats, when those can be told.
+        fixed = BaseItemFixedStats(itemID)
+        if not fixed then
+            return nil
+        end
+    end
+    return ResolveUnknownVersion(cacheModule, itemID, { baseKey = baseKey }, fixed, normalized, marketKey)
+end
+
+--- The "version unknown" value (6.8) for an AH summary row: every version of
+-- the item at this item level. itemLink: the row's own link; its known
+-- stats (e.g. the primary) narrow the versions, its placeholders don't.
+function ValuationService:GetUnknownVersionValue(itemID, itemLevel, itemLink)
+    itemID, itemLevel = tonumber(itemID), tonumber(itemLevel)
+    local cacheModule = GetPricingCache()
+    if not itemID or not itemLevel or not cacheModule then
+        return nil
+    end
+    local fixed = {}
+    local core = _G.PocketCFO
+    local service = core and core.ItemIdentityService
+    if itemLink and service and type(service.GetVariantStats) == "function" then
+        local ok, stats = pcall(service.GetVariantStats, service, itemLink, itemID, nil)
+        if ok and stats then
+            fixed = FixedStats(stats)
+        end
+    end
+    local chosen = ResolveUnknownVersion(cacheModule, itemID, { itemLevel = itemLevel }, fixed, { itemID = itemID }, nil)
+    if not chosen then
+        return nil
+    end
+    -- Through GetItemValue for the chosen version, so value rules (tool tier
+    -- cap etc.) apply as they do in the recipe book; still marked modeled.
+    local row = cacheModule:GetEntry(chosen.provenance.marketKey)
+    local ok, result = pcall(self.GetItemValue, self, {
+        itemID = itemID,
+        itemLevel = row and row.itemLevel,
+        qualityTier = row and row.qualityTier,
+        statFingerprint = row and row.statFingerprint,
+    })
+    if not ok or type(result) ~= "table" or result.unresolved or not tonumber(result.value) then
+        return chosen
+    end
+    result.valuationBasis = BASIS_MODELED
+    result.provenance = result.provenance or {}
+    result.provenance.unknownVersion = true
+    return result
+end
+
 -- the cache only, so a rule can call it without recursing into valuation.
 function ValuationService:GetCheapestVersionValue(itemID)
     itemID = tonumber(itemID)
@@ -482,6 +706,10 @@ local function ResolveAHValue(normalized, facts)
         local fromHistory = HistoryResult(normalized, resolvedItemID, marketKey, 1, nil)
         if fromHistory then
             return fromHistory
+        end
+        local unknownVersion = ResolveUnknownVersionForKey(cacheModule, marketKey, normalized, resolvedItemID)
+        if unknownVersion then
+            return unknownVersion
         end
         local average = ResolveStatVariantAverage(cacheModule, marketKey, normalized, resolvedItemID)
         if average then

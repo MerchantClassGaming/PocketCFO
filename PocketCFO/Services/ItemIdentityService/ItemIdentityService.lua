@@ -52,8 +52,14 @@ local function NewUnresolved(source, reason)
     }
 end
 
+-- Debug text only when debug is on: identity runs on every tooltip hover, so
+-- building log strings nobody reads costs frame time (Hover_Performance_Design).
+local function DebugEnabled()
+    return PocketCFO and PocketCFO.debugEnabled == true
+end
+
 local function DebugLog(msg, ...)
-    if not PocketCFO or not PocketCFO.Debug then return end
+    if not PocketCFO or not PocketCFO.Debug or not DebugEnabled() then return end
     if select("#", ...) > 0 then
         msg = string.format(msg, ...)
     end
@@ -81,6 +87,34 @@ function ItemIdentityService:RecordResolutionDiagnostic(counter, detail)
     local diagnostics = caches.diagnostics
     diagnostics[counter] = (diagnostics[counter] or 0) + 1
     DebugLog("%s%s", counter, detail and (" " .. tostring(detail)) or "")
+end
+
+-- The key this item had under the stat rule before 2026-11-10 (design 6.3):
+-- only the retail allowlist stats counted. Saved data that drives behavior
+-- (posting rules, inventory targets) may still be keyed that way; it keeps
+-- matching through this key until it's re-keyed. nil when the old key is the
+-- same as the current one.
+local function BuildLegacyConfigKey(identity, adapters, variantResolver, configKeyBuilder)
+    if not identity.configKey or not adapters or not adapters.LegacyVariantStatFingerprint then
+        return nil
+    end
+    local legacy = {
+        itemID = identity.itemID,
+        classification = identity.classification,
+        isCommodity = identity.isCommodity,
+        effectiveIlvl = identity.effectiveIlvl,
+        effectiveItemLevel = identity.effectiveItemLevel,
+        statFingerprint = identity.statFingerprint and adapters:LegacyVariantStatFingerprint(identity.statFingerprint) or nil,
+    }
+    if variantResolver and variantResolver.Resolve then
+        legacy.variantType = variantResolver:Resolve(legacy)
+        legacy.matchingPath = variantResolver:MatchingPath(legacy)
+    end
+    local legacyKey = configKeyBuilder:Build(legacy)
+    if legacyKey and legacyKey ~= identity.configKey then
+        return legacyKey
+    end
+    return nil
 end
 
 local function Finalize(identity)
@@ -168,6 +202,7 @@ local function Finalize(identity)
             identity.unresolved = true
             identity.unresolvedReason = reason or "configKeyUnavailable"
         end
+        identity.legacyConfigKey = identity.legacyConfigKey or BuildLegacyConfigKey(identity, adapters, variantResolver, configKeyBuilder)
     end
 
     if identity.unresolved == true
@@ -182,19 +217,19 @@ local function Finalize(identity)
     end
 
     if identity.unresolved then
-        ItemIdentityService:RecordResolutionDiagnostic("identity.unresolved", string.format(
+        ItemIdentityService:RecordResolutionDiagnostic("identity.unresolved", DebugEnabled() and string.format(
             "reason=%s itemID=%s source=%s",
             tostring(identity.unresolvedReason),
             tostring(identity.itemID),
             tostring(identity.source)
-        ))
+        ) or nil)
     else
-        ItemIdentityService:RecordResolutionDiagnostic("identity.resolved", string.format(
+        ItemIdentityService:RecordResolutionDiagnostic("identity.resolved", DebugEnabled() and string.format(
             "itemID=%s path=%s source=%s",
             tostring(identity.itemID),
             tostring(identity.matchingPath),
             tostring(identity.source)
-        ))
+        ) or nil)
     end
 
     identity.unresolved = identity.unresolved == true or nil
@@ -332,9 +367,109 @@ function ItemIdentityService:Matches(leftIdentity, rightIdentity)
     if not rightIdentity.configKey then
         rightIdentity = Finalize(rightIdentity)
     end
-    return NonEmpty(leftIdentity.configKey) ~= nil
-        and NonEmpty(leftIdentity.configKey) == NonEmpty(rightIdentity.configKey),
-        "configKeyEquality"
+    local leftKey, rightKey = NonEmpty(leftIdentity.configKey), NonEmpty(rightIdentity.configKey)
+    if leftKey == nil or rightKey == nil then
+        return false, "configKeyEquality"
+    end
+    if leftKey == rightKey then
+        return true, "configKeyEquality"
+    end
+    -- One side saved under the old rule (design 6.3). Old key against old key
+    -- is never a match: that would merge variants the new rule tells apart.
+    if NonEmpty(leftIdentity.legacyConfigKey) == rightKey or NonEmpty(rightIdentity.legacyConfigKey) == leftKey then
+        self:RecordLegacyMatch()
+        return true, "legacyConfigKey"
+    end
+    return false, "configKeyEquality"
+end
+
+-- ---------------------------------------------------------------------------
+-- Variant stats for a market key (Item_Identity_Unification_Design.md step 2,
+-- 2026-11-10): Valuation asks here instead of reading stats itself, so the
+-- price cache and the rest of PocketCFO agree on which items are the same.
+-- Returns the identity-form fingerprint ("A+B"), or nil when the item's stats
+-- don't tell its versions apart (not gear or a profession tool; profession
+-- accessories) or aren't known:
+--   fingerprint given (e.g. a saved price row) -> that, in identity form
+--   itemLink given                             -> the link's own stats
+--   item ID only                               -> nil: which version is
+--     meant is unknown, never guessed from the base item
+-- ---------------------------------------------------------------------------
+local VARIANT_STAT_CLASSIFICATIONS = {
+    craftedGear = true,
+    professionTool = true,
+}
+
+-- Item type from the client's own item table only (GetItemInfoInstant):
+-- no server request, so it's cheap enough for thousands of saved rows.
+-- nil when the client doesn't have the item.
+-- Theoretical: api-findings notes GetItemInfoInstant's classID was
+-- unreliable at queue-build time on a cold cache; a missing classID is
+-- treated as "can't say yet", never as "not gear".
+local function InstantClassification(itemID)
+    local api = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+    if type(api) ~= "function" then
+        return nil
+    end
+    local ok, instantID, _, _, equipLoc, _, classID, subClassID = pcall(api, itemID)
+    if not ok or not instantID or not tonumber(classID) then
+        return nil
+    end
+    local classifier = GetClassifier()
+    if not classifier or not classifier.Classify then
+        return nil
+    end
+    return classifier:Classify({ itemClassID = tonumber(classID), itemSubClassID = tonumber(subClassID), equipLoc = equipLoc })
+end
+
+-- Second return: "unknown" when the item's type couldn't be read (no item
+-- data yet), so a caller can tell "no variant stats" from "can't say yet".
+function ItemIdentityService:GetVariantStats(itemLink, itemID, fingerprint)
+    itemLink = NonEmpty(itemLink)
+    fingerprint = NonEmpty(fingerprint)
+    local classification
+    if itemLink then
+        local identity = self:FromItemLink(itemLink)
+        if type(identity) ~= "table" or identity.unresolved or not tonumber(identity.itemClassID or identity.classID) then
+            return nil, "unknown"
+        end
+        classification = identity.classification
+        if VARIANT_STAT_CLASSIFICATIONS[classification] and not fingerprint then
+            return NonEmpty(identity.statFingerprint)
+        end
+    else
+        if not fingerprint or not tonumber(itemID) then
+            return nil
+        end
+        classification = InstantClassification(tonumber(itemID))
+        if not classification then
+            return nil, "unknown"
+        end
+    end
+    if not VARIANT_STAT_CLASSIFICATIONS[classification] then
+        return nil
+    end
+    local adapters = GetAdapters()
+    return adapters and adapters.NormalizeVariantStatFingerprint and adapters:NormalizeVariantStatFingerprint(fingerprint) or nil
+end
+
+-- How often a match only worked through an old key: when this stays at zero
+-- in real data, the fallback can be retired (design 6.3). Saved, so it
+-- survives reloads; /mcgd legacykeys shows it.
+function ItemIdentityService:RecordLegacyMatch()
+    local db = PocketCFO and PocketCFO.db and PocketCFO.db.global
+    if not db then
+        return
+    end
+    local stats = db.legacyKeyMatches or { count = 0 }
+    db.legacyKeyMatches = stats
+    stats.count = (tonumber(stats.count) or 0) + 1
+    stats.lastAt = (GetServerTime and GetServerTime()) or (time and time()) or stats.lastAt
+end
+
+function ItemIdentityService:GetLegacyMatchStats()
+    local db = PocketCFO and PocketCFO.db and PocketCFO.db.global
+    return db and db.legacyKeyMatches or nil
 end
 
 -- ---------------------------------------------------------------------------

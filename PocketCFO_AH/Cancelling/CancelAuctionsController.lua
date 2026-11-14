@@ -191,8 +191,12 @@ local function RemoveRow(rows, target)
     return false
 end
 
+-- Any live auction can be cancelled, undercut or not (Brian, 2026-11-10:
+-- fix a wrong price, move it to another character; Blizzard and Auctionator
+-- allow it). Undercut rows are still listed and selected first.
 local function RowCanCancel(row)
-    return row and row.status == "Undercut" and #(row.auctions or {}) > 0
+    return row ~= nil and (row.status == "Undercut" or row.status == "OK")
+        and #(row.auctions or {}) > 0
 end
 
 local function SortRows(rows)
@@ -202,12 +206,13 @@ local function SortRows(rows)
             return 1
         elseif row.status == "Evaluating" or row.status == "Pending evaluation" or row.status == "Refreshing owned auctions..." then
             return 2
-        elseif row.status == "Canceled" then
-            return 3
+        -- Groups (2026-11-10): Undercut, Not undercut (OK), Canceled last.
         elseif row.status == "OK" then
+            return 4
+        elseif row.status == "Canceled" or row.status == "Cancelling" or row.status == "Didn't cancel" then
             return 5
         end
-        return 4
+        return 3
     end
 
     for _, row in ipairs(rows or {}) do
@@ -459,7 +464,8 @@ function CancelAuctionsController:EvaluateNext(generation)
     SessionLog("CancelAuctionsController: row evaluation request rowID=%s item=%s rowsBuiltAgeMs=%d evaluationAgeMs=%d",
         tostring(row.rowID), tostring(row.itemName), ElapsedMs(self.rowsBuiltMs), ElapsedMs(self.evaluationStartedMs))
     row.candidate = row
-    ladder:BuildForTarget(BuildOwnedAuctionTarget(row), function(ladderResult)
+
+    local function ApplyLadderResult(ladderResult)
         if generation ~= self.generation then
             return
         end
@@ -480,6 +486,28 @@ function CancelAuctionsController:EvaluateNext(generation)
         SortRows(self.rows)
         self:NotifyRowsChanged("row")
         self:EvaluateNext(generation)
+    end
+
+    -- One AH search per item per pass (2026-11-10). Rows are split by price,
+    -- so one item listed at three prices is three rows; the search result
+    -- depends only on the item (config key), and CancelEvaluation only reads
+    -- it, so the other rows reuse it.
+    local configKey = row.configKey
+    local cached = configKey and self.ladderByConfigKey and self.ladderByConfigKey[configKey]
+    if cached then
+        SessionLog("CancelAuctionsController: row evaluation reused search rowID=%s item=%s",
+            tostring(row.rowID), tostring(row.itemName))
+        ApplyLadderResult(cached)
+        return
+    end
+    ladder:BuildForTarget(BuildOwnedAuctionTarget(row), function(ladderResult)
+        if generation ~= self.generation then
+            return
+        end
+        if configKey and self.ladderByConfigKey and ladderResult then
+            self.ladderByConfigKey[configKey] = ladderResult
+        end
+        ApplyLadderResult(ladderResult)
     end)
 end
 
@@ -570,6 +598,8 @@ function CancelAuctionsController:ScheduleUnconfirmedRecheck(generation)
             end
             self.inUnconfirmedRecheck = true
             self.evaluating = true
+            -- The recheck exists to search again: no reused results.
+            self.ladderByConfigKey = {}
             SortRows(self.rows)
             self:NotifyRowsChanged("recheck-started")
             self:EvaluateNext(generation)
@@ -580,6 +610,7 @@ end
 function CancelAuctionsController:StartEvaluation()
     self.generation = (tonumber(self.generation) or 0) + 1
     self.evaluating = true
+    self.ladderByConfigKey = {}
     self.evaluationStartedMs = NowMs()
     SessionLog("CancelAuctionsController: evaluation started rows=%d rowsBuiltAgeMs=%d",
         #(self.rows or {}), ElapsedMs(self.rowsBuiltMs))
@@ -642,6 +673,10 @@ end
 function CancelAuctionsController:Refresh()
     self.generation = (tonumber(self.generation) or 0) + 1
     self.evaluating = true
+    -- The new generation stops the cancel unlock timer, so clear the lock
+    -- here (2026-11-10: Refresh within 0.8s of a cancel left Cancel Selected
+    -- locked until /reload).
+    self.cancelInProgress = false
     self.rows = {}
     self:NotifyRowsChanged("refreshing")
 
@@ -962,6 +997,80 @@ end
 -- and applies inventory movement for cancels, so a cancel issued through this
 -- controller's own CancelSelectedRow (which also calls C_AuctionHouse.CancelAuction,
 -- and is therefore observed by this same hook) is not double-processed.
+-- Cancel confirmation (Both, 2026-11-10). A Cancelling row becomes Canceled
+-- only when AUCTION_CANCELED arrives for its auctionID (confirmed on Forever:
+-- payload is the auctionID; retail payload Theoretical, same event). No
+-- confirmation within CANCEL_CONFIRM_SECONDS: "Didn't cancel".
+local CANCEL_CONFIRM_SECONDS = 10
+
+function CancelAuctionsController:EnsureCancelEventFrame()
+    if self.cancelEventFrame then
+        return
+    end
+    local frame = CreateFrame("Frame")
+    local ok = pcall(frame.RegisterEvent, frame, "AUCTION_CANCELED")
+    if not ok then
+        SessionLog("CancelAuctionsController: AUCTION_CANCELED not available; cancel rows can't be confirmed")
+    end
+    frame:SetScript("OnEvent", function(_, _, auctionID)
+        self:HandleCancelConfirmed(auctionID)
+    end)
+    self.cancelEventFrame = frame
+end
+
+function CancelAuctionsController:WatchCancelConfirm(row, auctionID)
+    self:EnsureCancelEventFrame()
+    self.pendingCancelRows = self.pendingCancelRows or {}
+    local key = tostring(auctionID)
+    self.pendingCancelRows[key] = row
+    if not (C_Timer and C_Timer.After) then
+        return
+    end
+    C_Timer.After(CANCEL_CONFIRM_SECONDS, function()
+        if self.pendingCancelRows and self.pendingCancelRows[key] == row and row.status == "Cancelling" then
+            self.pendingCancelRows[key] = nil
+            row.status = "Didn't cancel"
+            row.note = "No answer from the auction house. It may have sold. Refresh."
+            row.notes = row.note
+            row.cancel = { pending = false }
+            SessionLog("CancelAuctionsController: cancel not confirmed auctionID=%s after %ds",
+                key, CANCEL_CONFIRM_SECONDS)
+            self:NotifyRowsChanged("cancel-not-confirmed")
+        end
+    end)
+end
+
+function CancelAuctionsController:HandleCancelConfirmed(auctionID)
+    local key = tostring(auctionID)
+    local row = self.pendingCancelRows and self.pendingCancelRows[key]
+    SessionLog("CancelAuctionsController: AUCTION_CANCELED auctionID=%s matchedRow=%s",
+        key, tostring(row ~= nil))
+    if not row then
+        return
+    end
+    self.pendingCancelRows[key] = nil
+    row.status = "Canceled"
+    row.note = "Canceled."
+    row.notes = row.note
+    row.cancel = { pending = false }
+    SessionLog("CancelAuctionsController: cancel confirmed auctionID=%s elapsedMs=%d",
+        key, ElapsedMs(row.cancelRequestedMs))
+    -- The game confirmed it, so the next cancel can go now instead of
+    -- waiting out the 0.8s lock (2026-11-10).
+    if self.cancelInProgress == true and self.cancelToken == row.cancelToken then
+        self.cancelInProgress = false
+        SessionLog("CancelAuctionsController: cancel processing finished reason=cancel-confirmed")
+    end
+    -- A light click once the game confirms the cancel (Brian, 2026-11-10:
+    -- everything else in the AH makes a sound, cancelling didn't). Only for
+    -- cancels made here, and only when confirmed: no sound means it didn't
+    -- go through. Theoretical: SOUNDKIT name on the Forever client.
+    if PlaySound and SOUNDKIT and SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON then
+        pcall(PlaySound, SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+    end
+    self:NotifyRowsChanged("cancel-confirmed")
+end
+
 function CancelAuctionsController:HandleCancelAuctionObserved(auctionID)
     if auctionID == nil then
         return
@@ -1008,7 +1117,19 @@ function CancelAuctionsController:CancelSelectedRow(row)
         return false, "rowNotCancelable"
     end
     self.cancelInProgress = true
-    self:NotifyRowsChanged("cancel-processing-started")
+    -- Ties the unlock timer and the confirmation to this cancel only, so an
+    -- earlier cancel's timer can't unlock a later one.
+    self.cancelToken = (tonumber(self.cancelToken) or 0) + 1
+    local cancelToken = self.cancelToken
+    -- WoW Forever (Forever-only, gated, 2026-11-10): CancelAuction must be the
+    -- first thing the click does. Redrawing the list (which also disables the
+    -- clicked button) before the call got it blocked (taint.log), while a bare
+    -- button calling it directly cancelled. On Forever this notify runs after
+    -- the call instead.
+    local isForever = PocketCFO and PocketCFO.flavor == "forever"
+    if not isForever then
+        self:NotifyRowsChanged("cancel-processing-started")
+    end
 
     local function FinishCancel(reason)
         self.cancelInProgress = false
@@ -1059,7 +1180,22 @@ function CancelAuctionsController:CancelSelectedRow(row)
         quantity        = canceledQuantity,
     }
 
-    local ok, err = pcall(C_AuctionHouse.CancelAuction, auctionID)
+    -- Pass the auctionID as a number, the way Blizzard's owned list gives it
+    -- (2026-11-10: our row value was never forced to a number; logged type
+    -- to check whether that is why Forever blocks our cancel).
+    SessionLog("CancelAuctionsController: cancel call auctionID=%s type=%s",
+        tostring(auctionID), type(auctionID))
+    auctionID = tonumber(auctionID) or auctionID
+    local ok, err
+    if isForever then
+        -- Forever: direct call, the way Auctionator and the MCG_Diagnostic
+        -- cancel test do (both cancel on Forever), then the deferred notify.
+        C_AuctionHouse.CancelAuction(auctionID)
+        ok = true
+        self:NotifyRowsChanged("cancel-processing-started")
+    else
+        ok, err = pcall(C_AuctionHouse.CancelAuction, auctionID)
+    end
     if not ok then
         self.pendingCancelHints[tostring(auctionID)] = nil
         row.note = "Cancel request failed."
@@ -1094,12 +1230,18 @@ function CancelAuctionsController:CancelSelectedRow(row)
         auctionID = auctionID,
         quantity = canceledQuantity,
         quantityPosted = canceledQuantity,
-        status = "Canceled",
-        note = "Cancel requested.",
-        notes = "Cancel requested.",
-        cancel = { pending = false },
+        -- Shown as Cancelling until the game confirms with AUCTION_CANCELED
+        -- (Brian, 2026-11-10: a cancel of an auction that had already sold
+        -- did nothing, but the row said Canceled). See WatchCancelConfirm.
+        status = "Cancelling",
+        note = "Waiting for the auction house...",
+        notes = "Waiting for the auction house...",
+        cancel = { pending = true },
+        cancelRequestedMs = NowMs(),
+        cancelToken = cancelToken,
     }
     self.rows[#self.rows + 1] = canceledRow
+    self:WatchCancelConfirm(canceledRow, auctionID)
     local canceledRowAdded = true
 
     local sourceRemoved = false
@@ -1136,7 +1278,8 @@ function CancelAuctionsController:CancelSelectedRow(row)
         tostring(auctionID), tostring(row.itemName), #(row.auctions or {}))
 
     C_Timer.After(0.8, function()
-        if self.generation ~= generation then
+        if self.generation ~= generation or self.cancelToken ~= cancelToken
+            or self.cancelInProgress ~= true then
             return
         end
         self.cancelInProgress = false

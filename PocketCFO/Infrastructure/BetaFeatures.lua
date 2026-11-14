@@ -9,11 +9,16 @@
 -- Panel layout (Brian, 2026-11-06): three top-level sections, in order:
 --   Gold per Hour
 --   Show in Gold per Hour
---   Beta Features (retail only)
---       Inventory Manager
+--   Beta Features
+--       Inventory Manager          (retail only)
 --       Auction House Posting
---           Smart Posting
+--           Smart Posting          (retail only)
 -- Everything under Beta Features is off by default.
+--
+-- WoW Forever (Brian, 2026-11-10): only Auction House Posting is shown, and
+-- on Forever it means smart posting (no rules view: the rules view exists
+-- only so retail players keep rules they already built; Forever has none).
+-- Inventory Manager stays hidden and off there.
 --
 -- Beta features stay fully built and loaded; turning a toggle off only hides
 -- the buttons that lead to them. Each consumer reads its flag through this
@@ -48,10 +53,15 @@ local FLAG_DEFINITIONS = {
     },
 }
 
--- WoW Forever ships without the beta features: both flags read off and the
--- toggles are not shown. PocketCFO.flavor is set by Flavor_Forever.lua.
+-- WoW Forever: Auction House Posting is the only beta feature (2026-11-10);
+-- every other flag reads off and its toggle is not shown. PocketCFO.flavor
+-- is set by Flavor_Forever.lua.
 local function IsForever()
     return PocketCFO.flavor == "forever"
+end
+
+local function ForeverAllows(key)
+    return key == KEY_AUCTION_HOUSE
 end
 
 local function SettingsTable()
@@ -64,7 +74,7 @@ local function SettingsTable()
 end
 
 function BetaFeatures:IsEnabled(key)
-    if IsForever() then
+    if IsForever() and not ForeverAllows(key) then
         return false
     end
     local settings = SettingsTable()
@@ -72,7 +82,7 @@ function BetaFeatures:IsEnabled(key)
 end
 
 function BetaFeatures:SetEnabled(key, enabled)
-    if IsForever() then
+    if IsForever() and not ForeverAllows(key) then
         return
     end
     local settings = SettingsTable()
@@ -120,7 +130,8 @@ end
 -- Auction House Posting is off).
 function BetaFeatures:IsSmartPostingChecked()
     if IsForever() then
-        return false
+        -- Forever: Auction House Posting always means smart posting.
+        return true
     end
     local settings = SettingsTable()
     return settings ~= nil and settings[KEY_AH_SMART_POSTING] == true
@@ -215,9 +226,11 @@ function BetaFeatures:CreateSettingsPanel()
     -- Sections 1 and 2: Gold per Hour, Show in Gold per Hour (both flavors).
     local gph = self:BuildGoldPerHourSection(panel, title)
 
-    -- Section 3: Beta Features (retail only).
+    -- Section 3: Beta Features (Forever: Auction House Posting only).
     local beta = nil
-    if not IsForever() then
+    if IsForever() then
+        beta = self:BuildForeverBetaSection(panel, gph.bottom)
+    else
         beta = self:BuildBetaSection(panel, gph.bottom)
     end
 
@@ -286,6 +299,38 @@ function BetaFeatures:BuildBetaSection(panel, anchor)
     smartCheck:SetScript("OnClick", function(button)
         BetaFeatures:SetSmartAuctionHouse(button:GetChecked() and true or false)
         button:SetChecked(BetaFeatures:IsSmartPostingChecked())
+    end)
+
+    return { Refresh = Refresh }
+end
+
+-- Forever Beta Features section (Forever-only, 2026-11-10): one checkbox,
+-- Auction House Posting, which turns on smart posting. Returns { Refresh = fn }.
+function BetaFeatures:BuildForeverBetaSection(panel, anchor)
+    local header = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    header:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -24)
+    header:SetText("Beta Features")
+
+    local intro = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    intro:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -6)
+    intro:SetWidth(560)
+    intro:SetJustifyH("LEFT")
+    intro:SetText("These features are still being built. Turn them on to try them out. Some things may not work yet.")
+
+    local ahCheck = CreateSettingsCheck(panel, intro, "Auction House Posting",
+        "Adds Post and Cancel pages to the auction house tab. Prices everything in your bags for you. No rules to set up. Price scanning works without this.",
+        -14, BETA_INDENT)
+
+    local function Refresh()
+        ahCheck:SetChecked(BetaFeatures:IsAuctionHouseEnabled())
+    end
+
+    ahCheck:SetScript("OnClick", function(button)
+        BetaFeatures:SetEnabled(KEY_AUCTION_HOUSE, button:GetChecked() and true or false)
+        button:SetChecked(BetaFeatures:IsAuctionHouseEnabled())
+        -- The smart view follows this box on Forever; tell listeners.
+        BetaFeatures:SendMessage(BetaFeatures.SETTINGS_CHANGED_MESSAGE, KEY_AH_SMART_POSTING,
+            BetaFeatures:IsSmartAuctionHouseOn())
     end)
 
     return { Refresh = Refresh }

@@ -119,46 +119,26 @@ local function IsStackable(itemID, itemInfo)
     return nil
 end
 
-local function GetItemStatsAndFingerprint(itemLink)
-    -- Central valuation fingerprint helper. This intentionally matches the
-    -- existing PocketCFO scanner/craft format: sorted C_Item.GetItemStats keys.
-    if not itemLink or not C_Item or type(C_Item.GetItemStats) ~= "function" then
-        return nil, nil
+-- Which stats tell this item's versions apart is ItemIdentityService's
+-- answer (Item_Identity_Unification_Design.md step 2, Brian 2026-11-10: no
+-- item identification outside it). Before this, Valuation read every stat
+-- itself and only counted them when the link had bonus IDs, so a recipe
+-- preview link (bonus IDs) and an AH link (none) gave the same item two
+-- keys: the recipe book showed no PCFO Value.
+-- Stats come only from a link the caller gave, or a fingerprint it gave;
+-- an item ID alone leaves them unknown (ValuationService then prices the
+-- average of the item's stat versions).
+local function GetVariantStats(itemLink, itemID, fingerprint)
+    local core = _G.PocketCFO
+    local service = core and core.ItemIdentityService
+    if not service or type(service.GetVariantStats) ~= "function" then
+        return nil
     end
-
-    local ok, stats = pcall(C_Item.GetItemStats, itemLink)
-    if not ok or type(stats) ~= "table" then
-        return nil, nil
+    local ok, stats = pcall(service.GetVariantStats, service, itemLink, itemID, fingerprint)
+    if ok and stats and tostring(stats) ~= "" then
+        return stats
     end
-
-    local keys = {}
-    for statKey in pairs(stats) do
-        keys[#keys + 1] = statKey
-    end
-    if #keys == 0 then
-        return stats, nil
-    end
-
-    table.sort(keys)
-    return stats, table.concat(keys, "|")
-end
-
-local function LinkHasBonusContext(itemLink)
-    local itemString = itemLink and tostring(itemLink):match("item:([^|%]]+)")
-    if not itemString then
-        return false
-    end
-
-    local fields = {}
-    for field in string.gmatch(itemString .. ":", "([^:]*):") do
-        fields[#fields + 1] = field
-    end
-
-    -- Item links store the bonus-id count at field 13 in modern item strings.
-    -- Crafted variable-stat gear usually needs those link-level modifiers to be
-    -- distinguished. TODO: refine this when Blizzard exposes a direct API flag
-    -- for variable-stat crafted equipment/accessories.
-    return (tonumber(fields[13]) or 0) > 0
+    return nil
 end
 
 local function ClassifyItem(itemID, itemLink, itemInfo, statFingerprint, explicitClass)
@@ -180,7 +160,7 @@ local function ClassifyItem(itemID, itemLink, itemInfo, statFingerprint, explici
         return nil, nil
     end
 
-    if statFingerprint and tostring(statFingerprint) ~= "" and (not itemLink or LinkHasBonusContext(itemLink)) then
+    if statFingerprint and tostring(statFingerprint) ~= "" then
         return ITEM_CLASS_VARIABLE_NONSTACKABLE, false
     end
 
@@ -221,8 +201,12 @@ local function BuildIdentity(itemLink, itemID, overrides)
     local qualityTier = GetQualityTier(resolvedLink, itemID,
         overrides.qualityTier or overrides.craftingQuality)
 
-    local itemStats, statFingerprint = GetItemStatsAndFingerprint(resolvedLink)
-    statFingerprint = overrides.statFingerprint or statFingerprint
+    -- Variant stats only for non-stackables (stackables never key by stats),
+    -- which also keeps the full scan's ~27,500 commodity rows off this path.
+    local statFingerprint
+    if IsStackable(itemID, itemInfo) == false then
+        statFingerprint = GetVariantStats(itemLink, itemID, overrides.statFingerprint)
+    end
 
     local itemClass, isStackable = ClassifyItem(
         itemID,
@@ -243,7 +227,6 @@ local function BuildIdentity(itemLink, itemID, overrides)
 
         itemLink = resolvedLink,
         itemClass = itemClass,
-        itemStats = itemStats,
     }
 
     identity.marketKey = PricingIdentity:BuildMarketKey(identity)
@@ -260,8 +243,7 @@ function PricingIdentity.GetStatFingerprint(selfOrItemLink, maybeItemLink)
         itemLink = selfOrItemLink
     end
 
-    local _, statFingerprint = GetItemStatsAndFingerprint(itemLink)
-    return statFingerprint
+    return GetVariantStats(itemLink, nil, nil)
 end
 
 function PricingIdentity.Classify(selfOrIdentity, maybeIdentity)
@@ -278,10 +260,7 @@ function PricingIdentity.Classify(selfOrIdentity, maybeIdentity)
     local itemLink = identity.itemLink or identity.link
     local itemID = tonumber(identity.itemID) or GetItemIDFromLink(itemLink)
     local itemInfo = SafeGetItemInfo(itemLink) or SafeGetItemInfo(itemID)
-    local statFingerprint = identity.statFingerprint
-    if statFingerprint == nil and itemLink then
-        statFingerprint = PricingIdentity.GetStatFingerprint(itemLink)
-    end
+    local statFingerprint = GetVariantStats(itemLink, itemID, identity.statFingerprint)
 
     return ClassifyItem(itemID, itemLink, itemInfo, statFingerprint, identity.itemClass or identity.classification)
 end
@@ -355,11 +334,8 @@ function PricingIdentity.BuildMarketKey(selfOrIdentity, maybeIdentity)
     end
 
     if not isStackable and itemClass == ITEM_CLASS_VARIABLE_NONSTACKABLE then
-        local statFingerprint = identity.statFingerprint
-        if statFingerprint == nil and resolvedLink then
-            statFingerprint = PricingIdentity.GetStatFingerprint(resolvedLink)
-        end
-        if not statFingerprint or tostring(statFingerprint) == "" then
+        local statFingerprint = GetVariantStats(itemLink, itemID, identity.statFingerprint)
+        if not statFingerprint then
             return nil
         end
         keyParts[#keyParts + 1] = "stats:" .. tostring(statFingerprint)

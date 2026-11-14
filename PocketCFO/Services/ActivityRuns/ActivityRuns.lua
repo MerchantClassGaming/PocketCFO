@@ -8,12 +8,16 @@
 -- Design agreed with Brian 2026-10-23.
 --
 -- Run time (decided with Brian 2026-10-23):
---   - Measured from the first loot to the last loot: the 10 idle minutes that
---     end a run never count.
---   - Any gap between two loots longer than GAP_CAP_SECONDS counts as
---     GAP_CAP_SECONDS, so a break in the middle of a run is trimmed.
---   - While a run is going, the live timer adds the time since the last loot,
---     up to GAP_CAP_SECONDS (the same amount the next loot will add).
+--   - Measured from the first loot to the last loot: the idle minutes that
+--     end a run (RUN_END_SECONDS) never count. Trip overhead (getting out to
+--     the farm and back) is added in the ranking, not here (PocketCFO_PnL
+--     GoldPerHourReport TRIP_OVERHEAD_SECONDS, 2026-11-13).
+--   - Every gap between two loots counts in full (Brian, 2026-11-09: a bad
+--     route has to look bad; the old 3-minute cap made thin routes look
+--     better than they were). A gap can't pass RUN_END_SECONDS: by then the
+--     run has ended at its last loot. Beast runs: see BEAST_RUN_END_SECONDS.
+--   - While a run is going, the live timer adds the time since the last loot
+--     (the same amount the next loot will add). It never freezes.
 --   - Runs with fewer than MIN_RUN_LOOTS loots are not kept: picking up a
 --     couple of nodes while flying through is not a run, and a 2-node run's
 --     short clock gives a fake rate (2026-10-26). Their items still count in
@@ -104,13 +108,21 @@
 -- In memory only (not saved): every loot of the last RECENT_SECONDS as
 -- { at, copper }, for later uses like "last 15 minutes" rates.
 --
--- "Still gathering?" (agreed with Brian 2026-11-05): a gathering or fishing run
---   with MIN_RUN_LOOTS+ loots and GAP_CAP_SECONDS without loot gets a prompt
---   (ActivityControl, held until out of combat). Still gathering: this gap
---   counts in full (run.stillGathering, up to RUN_END_SECONDS) instead of
---   being capped. I'm done: the run is filed, ending at its last loot.
---   No answer: the gap is capped as before, and RUN_END_SECONDS still ends it.
---   Not for beast runs (they end at BEAST_RUN_END_SECONDS) or while paused.
+-- No "Still gathering?" popup (Brian, 2026-11-13): players couldn't tell when
+--   it would show. Runs end on their own after RUN_END_SECONDS (5 minutes,
+--   was 10) without loot, ending at the last loot. Picking something else
+--   later just starts a new run.
+--
+-- Questing (Brian, 2026-11-09): a quest accepted, an objective done or a
+--   quest turned in ends the gathering run in progress at its last loot
+--   (filed if it has MIN_RUN_LOOTS+, dropped otherwise). Herbs picked up
+--   while questing then never reach a saved run or the popup, and don't drag
+--   the gathering rate down with questing time. A real farm with one turn-in
+--   splits into two runs. Gathering runs only: fishing, beast and paused runs
+--   are left alone. Events confirmed on Forever 2026-11-09 (QUEST_ACCEPTED,
+--   QUEST_WATCH_UPDATE, QUEST_TURNED_IN, each once with the quest ID).
+--   Theoretical: retail payloads; QUEST_WATCH_UPDATE on kill objectives
+--   (seen on an interact objective; a crafting objective fired nothing).
 --
 -- Messages (split 2026-10-26: rebuilding the ranking on every loot lagged each skin):
 --   MCG_ACTIVITY_RUNS_UPDATED - loot added to the run in progress (live numbers only)
@@ -122,12 +134,12 @@ local PocketCFO = _G.PocketCFO
 local ActivityRuns = PocketCFO:NewModule("ActivityRuns", "AceEvent-3.0")
 PocketCFO.ActivityRuns = ActivityRuns
 
-local RUN_END_SECONDS = 600
-local GAP_CAP_SECONDS = 180
+-- 5 minutes without loot ends a gathering / fishing run (Brian, 2026-11-13; was 10).
+local RUN_END_SECONDS = 300
 -- Beast runs (decided with Brian 2026-10-27): a beast run ends after this long
 -- with no beast event (a lure used or a beast skinned). Inside a beast run a
 -- gap between loots counts up to this long too, so the summon and the fight
--- count in full instead of being trimmed to GAP_CAP_SECONDS.
+-- count in full.
 local BEAST_RUN_END_SECONDS = 300
 local MIN_RUN_LOOTS = 5
 local HISTORY_LIMIT = 200
@@ -379,11 +391,9 @@ local function GapCap(run)
     if run and run.activity == "beasts" then
         return BEAST_RUN_END_SECONDS
     end
-    -- "Still gathering" answered for this gap: the search time counts in full.
-    if run and run.stillGathering then
-        return RUN_END_SECONDS
-    end
-    return GAP_CAP_SECONDS
+    -- Gathering and fishing: every gap counts in full (2026-11-09). A gap
+    -- longer than this has already ended the run.
+    return RUN_END_SECONDS
 end
 
 -- The run's bucket for the zone the player is in now (created if needed).
@@ -657,7 +667,6 @@ function ActivityRuns:AddLoot(source, partKey, slots, copper, info)
         run.seconds = (run.seconds or 0) + gap
     end
     run.lastLootAt = now
-    run.stillGathering = nil  -- a new gap starts; the prompt can come again
     AddToBucket(run, slots, copper)
 
     local part = run.parts[partKey] or NewBucket()
@@ -1052,7 +1061,7 @@ end
 -- ---------------------------------------------------------------------------
 
 -- The run in progress for a character (current one by default), or nil.
--- A run whose 10 minutes have passed is filed first.
+-- A run whose end time (RUN_END_SECONDS / BEAST_RUN_END_SECONDS) has passed is filed first.
 function ActivityRuns:GetCurrentRun(characterGUID)
     local db = RunsDB()
     characterGUID = characterGUID or PlayerGUID()
@@ -1115,6 +1124,22 @@ function ActivityRuns:IsRunPaused(run)
     return run ~= nil and run.pausedAt ~= nil
 end
 
+-- Quest activity ends the gathering run in progress (see "Questing" above).
+-- Event arguments aren't used (CraftSim's bundled AceEvent can shift them).
+function ActivityRuns:OnQuestActivity(event)
+    local db = RunsDB()
+    local guid = PlayerGUID()
+    local run = db and guid and db.current[guid]
+    if not run or run.pausedAt or (run.activity or "gathering") ~= "gathering" then
+        return
+    end
+    local loots = run.loots or 0
+    if self:FinishRunIfEnded(guid, time(), true) then
+        SessionLog("run ended by quest activity (%s, loots=%d)", tostring(event), loots)
+        self:SendMessage("MCG_ACTIVITY_RUNS_FILED")
+    end
+end
+
 function ActivityRuns:StopRun(characterGUID)
     characterGUID = characterGUID or PlayerGUID()
     if self:FinishRunIfEnded(characterGUID, time(), true) then
@@ -1159,7 +1184,6 @@ function ActivityRuns:ResumeRun(characterGUID)
     end
     SessionLog("run resumed after %ds paused", now - run.pausedAt)
     run.pausedAt, run.pauseDeclined = nil, nil
-    run.stillGathering = nil
     self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
     return true
 end
@@ -1180,39 +1204,6 @@ function ActivityRuns:HoldIfPaused(characterGUID, fn)
     if control then
         control:Hold("run", fn)
     end
-    return true
-end
-
--- ---------------------------------------------------------------------------
--- "Still gathering?" prompt (2026-11-05; the popup is in ActivityControl)
--- ---------------------------------------------------------------------------
-
--- True when this run should ask "Still gathering?" now: a gathering or
--- fishing run, not paused, not already answered for this gap, with at least
--- MIN_RUN_LOOTS loots and GAP_CAP_SECONDS since the last loot.
-function ActivityRuns:NeedsStillGatheringPrompt(run, now)
-    if not run or run.endedAt or run.pausedAt or run.stillGathering then
-        return false
-    end
-    if run.activity == "beasts" or (run.loots or 0) < MIN_RUN_LOOTS then
-        return false
-    end
-    now = now or time()
-    return (now - (run.lastLootAt or now)) >= GAP_CAP_SECONDS
-end
-
--- "Still gathering": the time since the last loot counts in full (up to
--- RUN_END_SECONDS, when the run ends anyway) until the next loot.
-function ActivityRuns:KeepGathering(characterGUID)
-    local db = RunsDB()
-    characterGUID = characterGUID or PlayerGUID()
-    local run = db and characterGUID and db.current[characterGUID]
-    if not run or run.pausedAt or run.activity == "beasts" then
-        return false
-    end
-    run.stillGathering = true
-    SessionLog("still gathering (%ds since last loot)", time() - (run.lastLootAt or time()))
-    self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
     return true
 end
 
@@ -1315,6 +1306,10 @@ function ActivityRuns:OnEnable()
     self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE", "OnInteractionHide")
     -- A container's average contents changed: its value may have too.
     self:RegisterMessage("MCG_CONTAINER_OPENED", "ClearPriceCache")
+    -- Questing ends a gathering run (2026-11-09).
+    for _, event in ipairs({ "QUEST_ACCEPTED", "QUEST_WATCH_UPDATE", "QUEST_TURNED_IN" }) do
+        pcall(self.RegisterEvent, self, event, "OnQuestActivity")
+    end
     if C_Timer and C_Timer.NewTicker then
         self.ticker = C_Timer.NewTicker(CHECK_SECONDS, function()
             ActivityRuns:CheckEndedRuns()

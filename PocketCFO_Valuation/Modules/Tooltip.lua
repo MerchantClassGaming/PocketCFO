@@ -162,16 +162,32 @@ end
 -- is the CRAFTED item's link, so the value line priced the crafted item.
 -- tooltip:GetItem() returns the recipe's own link. When data.hyperlink's item
 -- doesn't match data.id, the tooltip's own link is used instead.
+-- AH sell slot (Brian, 2026-11-10: Plans: Copper Chain Vest showed a
+-- disenchant estimate): GetItem() there doesn't give the recipe's link, and
+-- falling back to data.hyperlink priced the crafted vest. On a mismatch the
+-- crafted item's link is never used: the recipe's link comes from data.id
+-- (recipes have no item level or variants, so the plain link is exact).
+-- Theoretical: what GetItem() returns on the AH sell slot; this path is
+-- correct either way.
 local function ExtractItemLink(tooltip, data)
     if data and type(data) == "table" then
         if data.hyperlink then
             local dataID = tonumber(data.id)
             local linkID = LinkItemID(data.hyperlink)
-            if dataID and linkID and linkID ~= dataID and tooltip and tooltip.GetItem then
-                local ok, _, ownLink = pcall(tooltip.GetItem, tooltip)
-                if ok and LinkItemID(ownLink) == dataID then
-                    return ownLink
+            if dataID and linkID and linkID ~= dataID then
+                if tooltip and tooltip.GetItem then
+                    local ok, _, ownLink = pcall(tooltip.GetItem, tooltip)
+                    if ok and LinkItemID(ownLink) == dataID then
+                        return ownLink
+                    end
                 end
+                local okInfo, _, recipeLink = pcall(GetItemInfo, dataID)
+                if okInfo and LinkItemID(recipeLink) == dataID then
+                    return recipeLink
+                end
+                -- Item data not loaded yet: a bare item string still prices
+                -- the recipe, never the crafted item.
+                return "item:" .. dataID
             end
             return data.hyperlink
         end
@@ -300,32 +316,6 @@ local function GetItemKeyArgs(tooltip)
     return itemID, itemLevel
 end
 
--- A summary row covers every version of the item at that item level (e.g.
--- tools with different stats). Shows the cheapest PocketCFO value among
--- them (Brian, 2026-10-24: matches the row's lowest price, as Auctionator
--- does). Each version goes through ValuationService so rules still apply.
-local function CheapestValueAtItemLevel(valuationService, cacheModule, itemID, itemLevel)
-    if not cacheModule.GetCandidatesForItemID then
-        return nil
-    end
-    local best
-    for _, row in ipairs(cacheModule:GetCandidatesForItemID(itemID) or {}) do
-        if type(row) == "table" and tonumber(row.itemLevel) == itemLevel then
-            local ok, result = pcall(valuationService.GetItemValue, valuationService, {
-                itemID = itemID,
-                itemLevel = row.itemLevel,
-                qualityTier = row.qualityTier,
-                statFingerprint = row.statFingerprint,
-            })
-            local value = ok and type(result) == "table" and not result.unresolved and tonumber(result.value) or nil
-            if value and (not best or value < best.value) then
-                best = result
-            end
-        end
-    end
-    return best
-end
-
 -- ---------------------------------------------------------------------------
 -- Bound items (Brian, 2026-11-07): a soulbound or warbound copy can't go on
 -- the AH, so it gets no PCFO Value (custom-rule values like containers still
@@ -400,13 +390,18 @@ local function LookUpPocketValue(tooltip, itemLink, itemID, bound)
     local value = ok and type(result) == "table" and not result.unresolved and tonumber(result.value) or nil
     local marketKey = value and result.provenance and result.provenance.marketKey or nil
 
-    -- AH summary row / item header: price by the real item level instead.
+    -- AH summary row / item header: it covers every version of the item at
+    -- that item level. Its link carries the base item level, so when that
+    -- misses it's priced by the real item level with the one "version
+    -- unknown" rule the recipe book uses too
+    -- (ValuationService:GetUnknownVersionValue, Item_Identity_Unification_Design.md
+    -- 6.8): the same mace can't show a value here and none in the recipe book.
     if not value then
         local keyItemID, keyItemLevel = GetItemKeyArgs(tooltip)
-        if keyItemID == itemID then
-            local cheapest = CheapestValueAtItemLevel(valuationService, cacheModule, keyItemID, keyItemLevel)
-            if cheapest then
-                return cheapest, tostring(itemID) .. "|itemKeyIlvl" .. tostring(keyItemLevel), "Value: cheapest at item level"
+        if keyItemID == itemID and valuationService.GetUnknownVersionValue then
+            local okUnknown, unknown = pcall(valuationService.GetUnknownVersionValue, valuationService, itemID, keyItemLevel, itemLink)
+            if okUnknown and type(unknown) == "table" and tonumber(unknown.value) then
+                return unknown, tostring(itemID) .. "|itemKeyIlvl" .. tostring(keyItemLevel), "Value: version unknown, cheapest at item level"
             end
         end
         return nil, nil, "No value: " .. tostring(ok and type(result) == "table" and result.unresolvedReason or "lookupError")

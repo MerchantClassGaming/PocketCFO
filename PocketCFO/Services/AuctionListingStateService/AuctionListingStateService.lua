@@ -877,6 +877,81 @@ function AuctionListingStateService:GetUnresolvedListings(options)
     return unresolved
 end
 
+-- Listings whose mail outcome is already settled (sold / expired / canceled),
+-- for one owner. Used by AHMailboxReconciler to recognise mail that was already
+-- accounted for before it reached the waiting list (2026-11-09).
+function AuctionListingStateService:GetSettledListings(options)
+    options = options or {}
+    local ownerKey = options.ownerKey
+    local settled = {}
+    for key, row in pairs(ByAuctionIDTable() or {}) do
+        if type(row) == "table" and (row.mailboxResolution or "unresolved") ~= "unresolved" then
+            if not ownerKey or tostring(row.ownerKey or "") == tostring(ownerKey) then
+                row.auctionID = row.auctionID or key
+                settled[#settled + 1] = row
+            end
+        end
+    end
+    return settled
+end
+
+-- Settles part or all of a listing from mail (2026-11-09). A commodity listing
+-- can sell in pieces and the rest expire or be cancelled, one mail per piece.
+-- Quantities settled are kept per outcome (settledQuantities.sold / expired /
+-- canceled, settledQuantity total). The listing's mailbox resolution and status
+-- are set only once the whole quantity is settled: "sold" if any of it sold
+-- (so the sale index learns the price), else the larger of expired / canceled.
+-- Returns row, err, fullySettled.
+local OUTCOME_TO_RESOLUTION = { sold = "sold", expired = "expired", canceled = "canceled", cancelled = "canceled", returned = "canceled" }
+
+function AuctionListingStateService:RecordMailboxOutcome(auctionID, outcome, quantity, evidence)
+    local resolution = OUTCOME_TO_RESOLUTION[tostring(outcome or "")]
+    if not resolution then
+        return nil, "invalidOutcome", false
+    end
+    local key = AuctionKey(auctionID)
+    if not key then return nil, "invalidAuctionID", false end
+    local byAuctionID = ByAuctionIDTable()
+    local row = byAuctionID[key]
+    if not row then
+        return nil, "notFound", false
+    end
+    if (row.mailboxResolution or "unresolved") ~= "unresolved" then
+        return row, "alreadyResolved", true
+    end
+
+    local total = tonumber(row.quantity) or tonumber(row.count) or 1
+    local amount = tonumber(quantity) or total
+    if amount <= 0 then
+        amount = total
+    end
+    row.settledQuantities = row.settledQuantities or {}
+    row.settledQuantities[resolution] = (tonumber(row.settledQuantities[resolution]) or 0) + amount
+    row.settledQuantity = (tonumber(row.settledQuantity) or 0) + amount
+    row.updatedAt = Now()
+
+    if row.settledQuantity < total then
+        SessionLog("AuctionListingStateService: listing partly settled auctionID=%s outcome=%s quantity=%d settled=%d of %d",
+            tostring(auctionID), resolution, amount, row.settledQuantity, total)
+        return row, nil, false
+    end
+
+    local settled = row.settledQuantities
+    local final = resolution
+    if (tonumber(settled.sold) or 0) > 0 then
+        final = "sold"
+    elseif (tonumber(settled.expired) or 0) >= (tonumber(settled.canceled) or 0) then
+        final = "expired"
+    else
+        final = "canceled"
+    end
+    self:MarkMailboxResolved(auctionID, final, evidence)
+    evidence = evidence or {}
+    evidence.outcome = final == "canceled" and "cancelled" or final
+    self:RecordAuctionEnded(auctionID, evidence.outcome, evidence)
+    return row, nil, true
+end
+
 function AuctionListingStateService:MarkMailboxResolved(auctionID, resolution, evidence)
     if not VALID_MAILBOX_RESOLUTIONS[resolution] then
         SessionLog("AuctionListingStateService:MarkMailboxResolved rejected invalid resolution=%s auctionID=%s",

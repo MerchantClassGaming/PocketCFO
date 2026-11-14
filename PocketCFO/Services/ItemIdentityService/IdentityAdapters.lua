@@ -143,53 +143,37 @@ local function ItemIDFromLink(itemLink)
     return NumberOrNil(tostring(itemLink):match("item:(%d+)"))
 end
 
-local VARIANT_STAT_ALLOWLIST = {
-    ITEM_MOD_CRIT_RATING_SHORT = true,
-    ITEM_MOD_HASTE_RATING_SHORT = true,
-    ITEM_MOD_MASTERY_RATING_SHORT = true,
-    ITEM_MOD_VERSATILITY = true,
-    ITEM_MOD_VERSATILITY_RATING_SHORT = true,
-    ITEM_MOD_FINESSE_SHORT = true,
-    ITEM_MOD_INGENUITY_SHORT = true,
-    ITEM_MOD_MULTICRAFT_SHORT = true,
-    ITEM_MOD_RESOURCEFULNESS_SHORT = true,
-    ITEM_MOD_CRAFTING_SPEED_SHORT = true,
-    ITEM_MOD_DEFTNESS_SHORT = true,
-    ITEM_MOD_PERCEPTION_SHORT = true,
+-- Variant stats (claude/Item_Identity_Unification_Design.md 6.1, 6.2, 6.5;
+-- Brian, 2026-11-10): every stat on the item is part of its identity, except
+-- armor (every copy of an item has the same armor). Variants are priced and
+-- matched by stats: Beaded Britches of the Owl is not of the Whale, a Strength
+-- Blood-Tempered Greaves is not the Intellect one. Names are short (Blizzard's
+-- ITEM_MOD_ prefix and _SHORT suffix dropped) and joined with "+" in sorted
+-- order: "INTELLECT+SPIRIT". "+" because "|" is a WoW escape code and mangled
+-- keys in debug output. Input may be either form, joined with "|" or "+".
+local ARMOR_STAT_TOKEN = "RESISTANCE0_NAME"
+local SHORT_STAT_ALIASES = {
+    VERSATILITY_RATING = "VERSATILITY",
 }
+-- Blizzard's "a stat you'll choose" on a recipe preview with no missive
+-- slotted (confirmed in-game 2026-11-10: _1 on Sin'dorei Quill, _1 and _2 on
+-- Blood-Tempered Greaves).
+local PLACEHOLDER_STAT_PREFIX = "MODIFIED_CRAFTING_STAT_"
 
-local VARIANT_STAT_ALIASES = {
-    ITEM_MOD_VERSATILITY_RATING_SHORT = "ITEM_MOD_VERSATILITY",
-}
-
-local function NormalizeVariantStatToken(value)
-    value = tostring(value or ""):match("^%s*(.-)%s*$")
-    if value == "" then
+local function ShortStatToken(value)
+    value = tostring(value or ""):match("^%s*(.-)%s*$") or ""
+    value = (value:gsub("[^A-Za-z0-9_]", "")):upper()
+    value = (value:gsub("^ITEM_MOD_", ""))
+    value = (value:gsub("_SHORT$", ""))
+    value = SHORT_STAT_ALIASES[value] or value
+    if value == "" or value == ARMOR_STAT_TOKEN then
         return nil
     end
-    value = value:gsub("[^A-Z0-9_]", "")
-    value = VARIANT_STAT_ALIASES[value] or value
-    if VARIANT_STAT_ALLOWLIST[value] then
-        return value
-    end
-    return nil
+    return value
 end
 
-local function BuildFilteredVariantFingerprint(rawTokens)
-    local seen = {}
-    local filtered = {}
-    for _, rawToken in ipairs(rawTokens or {}) do
-        local token = NormalizeVariantStatToken(rawToken)
-        if token and not seen[token] then
-            seen[token] = true
-            filtered[#filtered + 1] = token
-        end
-    end
-    table.sort(filtered)
-    if #filtered == 0 then
-        return nil, filtered
-    end
-    return table.concat(filtered, "|"), filtered
+local function IsPlaceholderStatToken(token)
+    return type(token) == "string" and token:sub(1, #PLACEHOLDER_STAT_PREFIX) == PLACEHOLDER_STAT_PREFIX
 end
 
 local function SplitStatFingerprint(value)
@@ -197,10 +181,93 @@ local function SplitStatFingerprint(value)
     if value == nil or tostring(value) == "" then
         return tokens
     end
-    for token in string.gmatch(tostring(value), "([^|]+)") do
+    for token in string.gmatch(tostring(value), "([^|+]+)") do
         tokens[#tokens + 1] = token
     end
     return tokens
+end
+
+-- rawTokens (any form) -> "A+B" fingerprint (nil when no stats) and the
+-- sorted short tokens.
+local function BuildVariantFingerprint(rawTokens)
+    local seen = {}
+    local tokens = {}
+    for _, rawToken in ipairs(rawTokens or {}) do
+        local token = ShortStatToken(rawToken)
+        if token and not seen[token] then
+            seen[token] = true
+            tokens[#tokens + 1] = token
+        end
+    end
+    table.sort(tokens)
+    if #tokens == 0 then
+        return nil, tokens
+    end
+    return table.concat(tokens, "+"), tokens
+end
+
+-- The rule before 2026-11-10: only these stats counted, long names joined
+-- with "|". Kept ONLY to rebuild the key an item had under that rule, so
+-- saved player data (posting rules, inventory targets) keyed the old way keeps
+-- matching until it's re-keyed (design 6.3). Never use it for a new key.
+local LEGACY_VARIANT_STATS = {
+    CRIT_RATING = "ITEM_MOD_CRIT_RATING_SHORT",
+    HASTE_RATING = "ITEM_MOD_HASTE_RATING_SHORT",
+    MASTERY_RATING = "ITEM_MOD_MASTERY_RATING_SHORT",
+    VERSATILITY = "ITEM_MOD_VERSATILITY",
+    FINESSE = "ITEM_MOD_FINESSE_SHORT",
+    INGENUITY = "ITEM_MOD_INGENUITY_SHORT",
+    MULTICRAFT = "ITEM_MOD_MULTICRAFT_SHORT",
+    RESOURCEFULNESS = "ITEM_MOD_RESOURCEFULNESS_SHORT",
+    CRAFTING_SPEED = "ITEM_MOD_CRAFTING_SPEED_SHORT",
+    DEFTNESS = "ITEM_MOD_DEFTNESS_SHORT",
+    PERCEPTION = "ITEM_MOD_PERCEPTION_SHORT",
+}
+
+local function BuildLegacyVariantFingerprint(rawTokens)
+    local seen = {}
+    local legacy = {}
+    for _, rawToken in ipairs(rawTokens or {}) do
+        local token = ShortStatToken(rawToken)
+        local longName = token and LEGACY_VARIANT_STATS[token]
+        if longName and not seen[longName] then
+            seen[longName] = true
+            legacy[#legacy + 1] = longName
+        end
+    end
+    table.sort(legacy)
+    if #legacy == 0 then
+        return nil
+    end
+    return table.concat(legacy, "|")
+end
+
+-- Recipe output with a missive chosen but not slotted (design 6.7): the
+-- preview has the item's fixed stats plus placeholders; the missive's stats
+-- take the placeholders' place. A preview with no placeholders (missive
+-- slotted) already has the real stats and is used as it is. No missive: the
+-- placeholders stay ("no stats picked").
+local function FillPlaceholderStats(previewTokens, chosenTokens)
+    local hasPlaceholder = false
+    for _, token in ipairs(previewTokens or {}) do
+        if IsPlaceholderStatToken(token) then
+            hasPlaceholder = true
+            break
+        end
+    end
+    if not hasPlaceholder or #(chosenTokens or {}) == 0 then
+        return previewTokens
+    end
+    local filled = {}
+    for _, token in ipairs(previewTokens) do
+        if not IsPlaceholderStatToken(token) then
+            filled[#filled + 1] = token
+        end
+    end
+    for _, token in ipairs(chosenTokens) do
+        filled[#filled + 1] = token
+    end
+    return filled
 end
 
 local function GetItemStatsAndFingerprint(itemLink)
@@ -219,8 +286,8 @@ local function GetItemStatsAndFingerprint(itemLink)
         keys[#keys + 1] = tostring(statKey)
     end
     table.sort(keys)
-    local fingerprint, filtered = BuildFilteredVariantFingerprint(keys)
-    return stats, fingerprint, keys, filtered
+    local fingerprint, tokens = BuildVariantFingerprint(keys)
+    return stats, fingerprint, keys, tokens
 end
 
 local function GetDetailedItemLevel(itemRef)
@@ -510,19 +577,56 @@ local function ItemLevelRelevant(identity)
         or classification == "professionItem"
 end
 
+-- Profession accessories' stats are read too (2026-11-10), but they never
+-- become variant stats: VariantResolver moves them to ignoredStatFingerprint
+-- (same on every copy; ProfessionGearPairs pairs green and blue by them).
 local function StatsRelevant(identity)
     if NonEmpty(identity.statFingerprint or identity.statTarget or identity.statKey) then
         return false
     end
     local classification = Classification(identity)
     return identity.itemLink ~= nil
-        and (classification == "craftedGear" or classification == "professionTool")
+        and (classification == "craftedGear" or classification == "professionTool"
+            or classification == "professionAccessory")
 end
 
 local function CraftingQualityRelevant(identity)
     if NumberOrNil(identity.craftingQuality or identity.itemQuality) then
         return false
     end
+    if identity.itemLink == nil then
+        return false
+    end
+    local source = identity.source or identity.evidenceType
+    if source == "recipeOutput" or source == "craftResult" then
+        return true
+    end
+    return Classification(identity) == "reagent"
+end
+
+-- What BuildVariantFacts fetches is decided by the item's type only, never by
+-- what the first caller already supplied. Its result is cached per item link
+-- for the session, so a lookup that arrived with its own item level or stats
+-- used to cache an entry without them, and every later bare-link lookup (bank
+-- scan, mail attachment) built its key with ilvl:0 / stat:none. Found
+-- 2026-11-09 (/mcgd ilvlcheck: level cached and readable, key still ilvl:0).
+-- The *Relevant functions above still decide whether a lookup needs facts at all.
+local function ItemLevelApplies(identity)
+    local classification = Classification(identity)
+    return classification == "craftedGear"
+        or classification == "professionTool"
+        or classification == "professionAccessory"
+        or classification == "professionItem"
+end
+
+local function StatsApply(identity)
+    local classification = Classification(identity)
+    return identity.itemLink ~= nil
+        and (classification == "craftedGear" or classification == "professionTool"
+            or classification == "professionAccessory")
+end
+
+local function CraftingQualityApplies(identity)
     if identity.itemLink == nil then
         return false
     end
@@ -540,7 +644,7 @@ local function BuildVariantFacts(identity)
         return facts
     end
 
-    if ItemLevelRelevant(identity) then
+    if ItemLevelApplies(identity) then
         local detailedIlvl = GetDetailedItemLevel(itemRef)
         if detailedIlvl then
             facts.effectiveIlvl = detailedIlvl
@@ -550,7 +654,7 @@ local function BuildVariantFacts(identity)
         Diag("api.GetDetailedItemLevelInfo.skipped", "itemID=" .. tostring(identity.itemID))
     end
 
-    if StatsRelevant(identity) then
+    if StatsApply(identity) then
         local itemStats, statFingerprint, rawStatTokens, filteredStatTokens = GetItemStatsAndFingerprint(itemRef)
         facts.itemStats = itemStats
         facts.rawStatTokens = rawStatTokens
@@ -560,7 +664,7 @@ local function BuildVariantFacts(identity)
         Diag("api.C_Item.GetItemStats.skipped", "itemID=" .. tostring(identity.itemID))
     end
 
-    if CraftingQualityRelevant(identity) then
+    if CraftingQualityApplies(identity) then
         local craftingQuality = GetCraftingQuality(itemRef)
         facts.craftingQuality = craftingQuality
         facts.itemQuality = craftingQuality
@@ -576,8 +680,12 @@ local function ApplyCachedVariantFacts(identity)
     if not itemLink then
         return identity
     end
-    local needsVariantFacts = ItemLevelRelevant(identity) or StatsRelevant(identity) or CraftingQualityRelevant(identity)
     local explicitFingerprint = NonEmpty(identity.statFingerprint)
+    -- A stat fingerprint handed in alongside a link (a saved row, a chosen
+    -- missive) no longer stops the link's own stats being read: the link is
+    -- the item, so its stats decide the identity (design 6.1).
+    local needsVariantFacts = ItemLevelRelevant(identity) or StatsRelevant(identity) or CraftingQualityRelevant(identity)
+        or (explicitFingerprint ~= nil and StatsApply(identity))
 
     local caches = GetResolutionCaches()
     local cache = caches.variantFactsByItemLink
@@ -587,21 +695,47 @@ local function ApplyCachedVariantFacts(identity)
     elseif needsVariantFacts then
         Diag("cache.variant.miss", "itemLink=" .. tostring(itemLink))
         facts = BuildVariantFacts(identity)
-        cache[itemLink] = facts
+        -- Don't cache an entry missing the item level when the item needs one: the
+        -- item wasn't loaded yet (seen 2026-11-09, cold items after a restart stayed
+        -- ilvl:0 for the session). Next lookup, once loaded, builds it complete.
+        if ItemLevelApplies(identity) and facts.effectiveIlvl == nil then
+            Diag("cache.variant.incomplete", "itemLink=" .. tostring(itemLink))
+        else
+            cache[itemLink] = facts
+        end
     else
         Diag("cache.variant.skipped", "itemID=" .. tostring(identity.itemID))
     end
 
     ApplyVariantFacts(identity, facts)
 
-    explicitFingerprint = explicitFingerprint or NonEmpty(identity.statFingerprint)
-    if explicitFingerprint then
-        local explicitRaw = SplitStatFingerprint(explicitFingerprint)
-        local filteredExplicit, filteredExplicitTokens = BuildFilteredVariantFingerprint(explicitRaw)
-        identity.rawStatTokens = #explicitRaw > 0 and explicitRaw or identity.rawStatTokens
-        identity.variantStatTokens = filteredExplicitTokens
-        identity.statFingerprint = filteredExplicit
-        identity.droppedStatFingerprint = explicitFingerprint ~= filteredExplicit and explicitFingerprint or nil
+    -- Which stats are this item's (design 6.1, 6.7):
+    --   recipe output: the preview link's stats, with a chosen missive's stats
+    --     in place of Blizzard's placeholders
+    --   any other link: the link's own stats
+    --   no stats from a link: the fingerprint handed in
+    local linkTokens = type(facts) == "table" and facts.statFingerprint and facts.variantStatTokens or nil
+    local explicitRaw = explicitFingerprint and SplitStatFingerprint(explicitFingerprint) or nil
+    local finalTokens
+    if linkTokens and #linkTokens > 0 then
+        local source = identity.source or identity.evidenceType
+        if source == "recipeOutput" and explicitRaw then
+            local _, chosenTokens = BuildVariantFingerprint(explicitRaw)
+            finalTokens = FillPlaceholderStats(linkTokens, chosenTokens)
+        else
+            finalTokens = linkTokens
+        end
+    elseif explicitRaw then
+        finalTokens = explicitRaw
+    end
+    if finalTokens then
+        local fingerprint, tokens = BuildVariantFingerprint(finalTokens)
+        if explicitRaw and #explicitRaw > 0 and not (linkTokens and #linkTokens > 0) then
+            identity.rawStatTokens = explicitRaw
+        end
+        identity.variantStatTokens = tokens
+        identity.statFingerprint = fingerprint
+        identity.droppedStatFingerprint = explicitFingerprint and explicitFingerprint ~= fingerprint and explicitFingerprint or nil
     end
     return identity
 end
@@ -928,9 +1062,18 @@ function IdentityAdapters:FromEvidence(evidence)
     return nil, "unsupportedEvidenceType"
 end
 
+--- Any stat fingerprint (either form) -> the identity form, "A+B" (design 6.5).
 function IdentityAdapters:NormalizeVariantStatFingerprint(value)
-    local fingerprint = BuildFilteredVariantFingerprint(SplitStatFingerprint(value))
+    local fingerprint = BuildVariantFingerprint(SplitStatFingerprint(value))
     return fingerprint
+end
+
+--- The stats the pre-2026-11-10 rule counted, in its old form ("|"-joined
+-- long names). Only for rebuilding an old key (design 6.3) and for the AH
+-- item label, which still shows just these stats until the display rule
+-- (design 6.6) is built.
+function IdentityAdapters:LegacyVariantStatFingerprint(value)
+    return BuildLegacyVariantFingerprint(SplitStatFingerprint(value))
 end
 
 -- Builds a full identity from a TRADE_SKILL_ITEM_CRAFTED_RESULT event payload.

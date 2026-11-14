@@ -107,6 +107,25 @@ function PostingRuleRepository:GetRecipeRule(target)
         end
     end
 
+    -- Last: a rule saved before the 2026-11-10 identity rule, still under the
+    -- item's old config key (Item_Identity_Unification_Design.md 6.3). It
+    -- moves to the current key the next time it's saved (SaveRecipeRule).
+    local oldConfigKey = target.identity and target.identity.legacyConfigKey
+    if oldConfigKey then
+        for existingKey, existingRule in pairs(rules) do
+            if type(existingRule) == "table"
+                and (existingRule.configKey == oldConfigKey or tostring(existingKey) == oldConfigKey) then
+                diag.selectedStorageKey = tostring(existingKey)
+                diag.matchPath = "legacyConfigKey"
+                local identityService = PocketCFO and PocketCFO.ItemIdentityService
+                if identityService and identityService.RecordLegacyMatch then
+                    identityService:RecordLegacyMatch()
+                end
+                return existingRule, tostring(existingKey), diag
+            end
+        end
+    end
+
     return nil, nil, diag
 end
 
@@ -148,11 +167,15 @@ function PostingRuleRepository:SaveRecipeRule(target, mode, profileKey, values)
 
     local keptKey = tostring(target.key)
     local identityConfigKey = target.identity and target.identity.configKey
+    -- The same item's rule saved under its old config key (before the
+    -- 2026-11-10 identity rule) is replaced too, so saving re-keys it.
+    local oldConfigKey = target.identity and target.identity.legacyConfigKey
     if identityConfigKey then
         for existingKey, existingRule in pairs(rules) do
             if tostring(existingKey) ~= keptKey
             and type(existingRule) == "table"
-            and existingRule.configKey == identityConfigKey then
+            and (existingRule.configKey == identityConfigKey
+                or (oldConfigKey ~= nil and existingRule.configKey == oldConfigKey)) then
                 SessionLog("PostingRuleRepository: removed duplicate recipe rule itemName=%s configKey=%s removedKey=%s keptKey=%s oldProfile=%s newProfile=%s",
                     tostring(target.identity and target.identity.itemName),
                     tostring(identityConfigKey),

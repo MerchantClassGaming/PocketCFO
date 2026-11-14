@@ -55,6 +55,11 @@ VendorPriceService.diagnosticCounters = VendorPriceService.diagnosticCounters or
     ignoredNotPurchasable = 0,
     ignoredZeroPrice = 0,
     ignoredInvalidQuantity = 0,
+    ignoredLimitedStock = 0,
+    -- Last limited-stock row seen: { itemID, numAvailable, merchantName }.
+    -- Confirms numAvailable on each flavor:
+    -- /dump PocketCFO_Valuation:GetModule("VendorPriceService").diagnosticCounters.lastLimitedStock
+    lastLimitedStock = nil,
 
     ignoredMerchantCountAPIUnavailable = 0,
     ignoredItemInfoAPIUnavailable = 0,
@@ -90,6 +95,25 @@ local function GetDBRoot()
     end
     db.global.vendorPriceObservations = db.global.vendorPriceObservations or {}
     return db.global.vendorPriceObservations
+end
+
+-- Gathered reagents (Brian, 2026-11-13): anything from mining, herbalism,
+-- skinning or disenchanting is never sold in unlimited stock by a vendor
+-- (Maria Lumere: 2 Peacebloom at 40c, usually sold out), so a vendor price
+-- for one is never used or saved, including prices saved before this rule.
+-- Vendor-only reagents (thread, vials, flux, salt, dyes) keep their price.
+-- Trade Goods (classID 7) subclasses: 6 Leather, 7 Metal & Stone, 9 Herb,
+-- 12 Enchanting. Theoretical on Forever: same subclass numbers (Classic
+-- item data uses them for these four). Flavor: Both.
+local TRADE_GOODS_CLASS = 7
+local GATHERED_SUBCLASSES = { [6] = true, [7] = true, [9] = true, [12] = true }
+
+local function IsGatheredReagent(itemID)
+    if not itemID or type(GetItemInfoInstant) ~= "function" then
+        return false
+    end
+    local ok, _, _, _, _, _, classID, subclassID = pcall(GetItemInfoInstant, itemID)
+    return ok and classID == TRADE_GOODS_CLASS and GATHERED_SUBCLASSES[subclassID] == true
 end
 
 local function DescribeFields(value)
@@ -184,6 +208,7 @@ local function ReadMerchantItemInfo(index, apiPath)
             purchaseQuantity = tonumber(info.stackCount),
             isPurchasable = info.isPurchasable == true,
             hasExtendedCost = info.hasExtendedCost == true,
+            numAvailable = tonumber(info.numAvailable),
         }, nil, nil
     end
 
@@ -204,6 +229,7 @@ local function ReadMerchantItemInfo(index, apiPath)
             purchaseQuantity = tonumber(quantity),
             isPurchasable = isPurchasable == true,
             hasExtendedCost = extendedCost == true,
+            numAvailable = tonumber(numAvailable),
         }, nil, nil
     end
 
@@ -344,6 +370,29 @@ local function ObserveMerchantItem(index, apiPath, merchantName, observedAt)
     end
 
     counters.lastIdentityAPIUsed = identityAPIUsed
+
+    -- Limited stock (Brian, 2026-11-13): a vendor with a few that are
+    -- usually sold out (Maria Lumere, 2 Peacebloom at 40c) is not a price
+    -- anyone can buy at, so it's never a vendor price. Any price already
+    -- saved for the item is dropped. numAvailable: -1 = unlimited, a count
+    -- = limited stock. Theoretical on Forever until lastLimitedStock shows
+    -- a real limited row. Flavor: Both.
+    local numAvailable = tonumber(info.numAvailable)
+    if (numAvailable and numAvailable >= 0) or IsGatheredReagent(itemID) then
+        counters.ignoredLimitedStock = counters.ignoredLimitedStock + 1
+        counters.lastLimitedStock = {
+            itemID = itemID,
+            numAvailable = numAvailable,
+            merchantName = merchantName,
+        }
+        local root = GetDBRoot()
+        if root and root[itemID] then
+            root[itemID] = nil
+            PocketCFO_Valuation:BumpValueVersion()
+        end
+        return
+    end
+
     counters.validGoldOnlyRows = counters.validGoldOnlyRows + 1
     StoreObservation(itemID, price / quantity, price, quantity, merchantName, observedAt)
 end
@@ -421,6 +470,9 @@ function VendorPriceService:GetPrice(itemID)
     if not itemID then
         return { resolved = false, itemID = itemID, reason = "vendorPriceUnavailable" }
     end
+    if IsGatheredReagent(itemID) then
+        return { resolved = false, itemID = itemID, reason = "vendorPriceUnavailable" }
+    end
 
     local root = GetDBRoot()
     local observation = root and root[itemID]
@@ -470,7 +522,7 @@ end
 -- uses it to skip items that can't have a PocketCFO value (2026-11-07).
 function VendorPriceService:HasPrice(itemID)
     itemID = tonumber(itemID)
-    if not itemID then
+    if not itemID or IsGatheredReagent(itemID) then
         return false
     end
     local root = GetDBRoot()

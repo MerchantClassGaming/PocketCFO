@@ -27,9 +27,6 @@ local DB_DEFAULTS = {
             queue = {
                 preserveLastQueue = false,
             },
-            debug = {
-                captureCompetitionRows = false,
-            },
             ui = {},
         },
     },
@@ -54,9 +51,13 @@ local function ItemStatLabel(statFingerprint)
     if statFingerprint == nil or tostring(statFingerprint) == "" then
         return nil
     end
+    -- The label keeps showing only the stats it always showed (secondaries,
+    -- profession stats). Identity now keys on every stat (2026-11-10); which
+    -- stats players see is the separate display rule, not built yet
+    -- (Item_Identity_Unification_Design.md 6.6).
     local adapters = _G.PocketCFO and _G.PocketCFO.ItemIdentityAdapters
-    if adapters and adapters.NormalizeVariantStatFingerprint then
-        local ok, filtered = pcall(adapters.NormalizeVariantStatFingerprint, adapters, statFingerprint)
+    if adapters and adapters.LegacyVariantStatFingerprint then
+        local ok, filtered = pcall(adapters.LegacyVariantStatFingerprint, adapters, statFingerprint)
         if ok then
             statFingerprint = filtered
         end
@@ -203,11 +204,6 @@ local function EnsurePostingSettings(globalDB)
     settings.queue = settings.queue or {}
     if settings.queue.preserveLastQueue == nil then
         settings.queue.preserveLastQueue = false
-    end
-
-    settings.debug = settings.debug or {}
-    if settings.debug.captureCompetitionRows == nil then
-        settings.debug.captureCompetitionRows = false
     end
 
     settings.ui = settings.ui or {}

@@ -275,6 +275,7 @@ function AHSessionController:OnAuctionHouseShow(event)
     if scanner and scanner.QueryOwnedAuctions then
         local queryOK = scanner:QueryOwnedAuctions()
         self.awaitingOwnedAuctionSync = queryOK and true or false
+        self.ownedQuerySentAt = queryOK and GetTime and GetTime() or nil
         SessionLog("AHManager: owned auction query requested ok=%s", tostring(queryOK))
     else
         self.awaitingOwnedAuctionSync = false
@@ -375,6 +376,17 @@ function AHSessionController:RequestOwnedAuctionsRefresh(reason, callback, timeo
         return false, "scannerUnavailable"
     end
 
+    -- The AH-open query (OnAuctionHouseShow) is usually still out when Post /
+    -- Cancel Auctions asks for a refresh a moment later. Wait for that answer
+    -- instead of sending a second query (2026-11-10). Only a query sent within
+    -- the timeout counts, so a stale flag can't leave a refresh waiting on
+    -- nothing.
+    local now = GetTime and GetTime() or nil
+    local joinInFlight = self.session ~= nil
+        and self.awaitingOwnedAuctionSync == true
+        and now ~= nil and self.ownedQuerySentAt ~= nil
+        and now - self.ownedQuerySentAt <= timeoutSeconds
+
     if not self.session then
         self.session = MakeNewSession({ postingRefresh = true })
         SessionLog("AHManager: owned auction refresh session created reason=%s openedAt=%s",
@@ -391,11 +403,15 @@ function AHSessionController:RequestOwnedAuctionsRefresh(reason, callback, timeo
     AddCallback(pending.callbacks, callback)
     self.pendingOwnedAuctionRefresh = pending
 
-    SessionLog("AHManager: owned auction refresh requested requestID=%s reason=%s timeout=%.2f",
-        tostring(requestID), tostring(reason), timeoutSeconds)
-    local queryOK = scanner:QueryOwnedAuctions()
-    if queryOK then
-        self.awaitingOwnedAuctionSync = true
+    SessionLog("AHManager: owned auction refresh requested requestID=%s reason=%s timeout=%.2f joinedInFlightQuery=%s",
+        tostring(requestID), tostring(reason), timeoutSeconds, tostring(joinInFlight))
+    local queryOK = true
+    if not joinInFlight then
+        queryOK = scanner:QueryOwnedAuctions()
+        if queryOK then
+            self.awaitingOwnedAuctionSync = true
+            self.ownedQuerySentAt = now
+        end
     end
     if not queryOK then
         if self.pendingOwnedAuctionRefresh == pending then

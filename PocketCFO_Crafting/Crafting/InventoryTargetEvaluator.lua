@@ -59,15 +59,7 @@ local function NormalizePositiveQuantity(value, fallback)
     return fallback or 0
 end
 
-local function BuildTargetEvidence(config)
-    if type(config) ~= "table" then
-        return nil
-    end
-
-    if config.configKey and config.configKey ~= "" then
-        return config.configKey
-    end
-
+local function BuildTargetFieldEvidence(config)
     return {
         evidenceType        = "recipeOutput",
         recipeID            = config.recipeID,
@@ -84,6 +76,85 @@ local function BuildTargetEvidence(config)
         statFingerprint     = config.statFingerprint or config.statTarget,
         statTarget          = config.statTarget,
     }
+end
+
+local function BuildTargetEvidence(config)
+    if type(config) ~= "table" then
+        return nil
+    end
+
+    if config.configKey and config.configKey ~= "" then
+        return config.configKey
+    end
+
+    return BuildTargetFieldEvidence(config)
+end
+
+-- Targets saved before the 2026-11-10 identity rule hold the item's old
+-- config key (Item_Identity_Unification_Design.md 6.3). Once per target, when
+-- the item's data is loaded, the target's identity is worked out again from
+-- its own fields; if the old rule gives the saved key, the target moves to the
+-- new key and remembers the old one (legacyConfigKey) so copies still saved
+-- under it (an unvisited bank or mailbox) keep counting. Not done while item
+-- data is still loading: a cold item would build a key without its stats.
+local IDENTITY_RULE_VERSION = 2
+
+local function RekeyTarget(config)
+    if type(config) ~= "table" or config.identityRuleVersion == IDENTITY_RULE_VERSION then
+        return
+    end
+    local savedKey = config.configKey
+    if not savedKey or savedKey == "" then
+        return
+    end
+    local identityService = GetItemIdentityService()
+    if not identityService or not identityService.Identify then
+        return
+    end
+    local ok, identity = pcall(identityService.Identify, identityService, BuildTargetFieldEvidence(config))
+    if not ok or type(identity) ~= "table" or identity.unresolved or identity.pendingItemData or not identity.configKey then
+        return
+    end
+    if identity.configKey ~= savedKey and identity.legacyConfigKey == savedKey then
+        config.legacyConfigKey = savedKey
+        config.configKey = identity.configKey
+        if type(config.identity) == "table" then
+            config.identity.configKey = identity.configKey
+        end
+        if identityService.RecordLegacyMatch then
+            identityService:RecordLegacyMatch()
+        end
+        SessionLog("InventoryTargetEvaluator: target re-keyed configID=%s old=%s new=%s",
+            tostring(config.configID), tostring(savedKey), tostring(identity.configKey))
+    end
+    config.identityRuleVersion = IDENTITY_RULE_VERSION
+end
+
+-- Two availability results for the same item (current key + old key) as one.
+local function MergeAvailability(primary, secondary)
+    if type(secondary) ~= "table" or (tonumber(secondary.totalQuantity) or 0) <= 0
+        and (tonumber(secondary.availableQuantity) or 0) <= 0 then
+        return primary
+    end
+    local merged = {}
+    for key, value in pairs(primary or {}) do
+        merged[key] = value
+    end
+    merged.availableQuantity = (tonumber(primary and primary.availableQuantity) or 0) + (tonumber(secondary.availableQuantity) or 0)
+    merged.totalQuantity = (tonumber(primary and primary.totalQuantity) or 0) + (tonumber(secondary.totalQuantity) or 0)
+    local function Sum(field)
+        local out = {}
+        for key, value in pairs(primary and primary[field] or {}) do
+            out[key] = (tonumber(value) or 0)
+        end
+        for key, value in pairs(secondary[field] or {}) do
+            out[key] = (out[key] or 0) + (tonumber(value) or 0)
+        end
+        return out
+    end
+    merged.byLocation = Sum("byLocation")
+    merged.byOwner = Sum("byOwner")
+    return merged
 end
 
 local function ResolveIdentity(evidence)
@@ -155,6 +226,7 @@ local function GetAvailability(evidence, characterGUID, batchCache)
 end
 
 local function GetTotalOwnedQuantity(config, characterGUID, batchCache)
+    RekeyTarget(config)
     local evidence = BuildTargetEvidence(config)
     local configKey, resolved = ResolveIdentity(evidence)
     if not configKey then
@@ -164,6 +236,10 @@ local function GetTotalOwnedQuantity(config, characterGUID, batchCache)
     end
 
     local availability = GetAvailability(configKey, characterGUID, batchCache)
+    local oldKey = config and config.legacyConfigKey
+    if oldKey and oldKey ~= "" and oldKey ~= configKey then
+        availability = MergeAvailability(availability, GetAvailability(oldKey, characterGUID, batchCache))
+    end
     return NormalizePositiveQuantity(availability.availableQuantity, 0), configKey, availability
 end
 

@@ -26,15 +26,10 @@ local function PositiveQuantity(value)
     return 0
 end
 
+-- Debug lines only while PocketCFO debug is on (MCG_Diagnostic enabled, or
+-- /mcg debug). Players never have it (Brian, 2026-11-10).
 local function PostingEvaluationDebugEnabled()
-    local settings = PocketCFO_AH
-        and PocketCFO_AH.db
-        and PocketCFO_AH.db.global
-        and PocketCFO_AH.db.global.postingSettings
-        or nil
-    return settings
-        and settings.debug
-        and settings.debug.captureCompetitionRows == true
+    return PocketCFO ~= nil and PocketCFO.debugEnabled == true
 end
 
 local function GetItemIdentityService()
@@ -519,7 +514,13 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
 
         RefreshSmartBounds(row, auctions)
 
-        local ownedIDs, ownedAuctionMapCount = BuildOwnedAuctionIDSet()
+        -- Built once per evaluation pass, not once per row (2026-11-10).
+        -- Posting is locked while a pass runs, so the set can't go stale.
+        if controller.ownedIDsGeneration ~= generation then
+            controller.ownedIDs, controller.ownedIDsCount = BuildOwnedAuctionIDSet()
+            controller.ownedIDsGeneration = generation
+        end
+        local ownedIDs, ownedAuctionMapCount = controller.ownedIDs, controller.ownedIDsCount
         local annotatedCount = AnnotateAuctionsWithOwnership(auctions, ownedIDs, row)
         SessionLog("PostingEvaluationPipeline: ownership annotation ownedInMap=%d annotatedInResults=%d", ownedAuctionMapCount, annotatedCount)
 

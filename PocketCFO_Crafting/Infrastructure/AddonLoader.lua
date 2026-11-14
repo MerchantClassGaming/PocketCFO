@@ -13,9 +13,14 @@ end
 function AddonLoader:OnEnable()
     self:RegisterEvent("TRADE_SKILL_SHOW", "OnTradeSkillShow")
 
-    if IsProfessionWindowVisible() and C_Timer and C_Timer.After then
+    -- Loaded during the core's TRADE_SKILL_SHOW handler, so that event has
+    -- already passed. Blizzard may not have shown the profession window yet
+    -- at this point, so check on the next frame.
+    if C_Timer and C_Timer.After then
         C_Timer.After(0, function()
-            self:OnTradeSkillShow()
+            if IsProfessionWindowVisible() then
+                self:OnTradeSkillShow()
+            end
         end)
     end
 end

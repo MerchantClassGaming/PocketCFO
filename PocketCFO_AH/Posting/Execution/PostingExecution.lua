@@ -43,7 +43,28 @@ local function PositiveInteger(value)
     return nil
 end
 
+-- WoW Forever (Forever-only, gated): durations are 2 / 8 / 24 hours (Brian,
+-- 2026-11-05), default 2h (Brian, 2026-11-10: not sold in 2h = probably
+-- undercut). Retail keeps 12 / 24 / 48, default 12h.
+-- Forever has no Enum.AuctionHouseDuration; the post calls take raw 1 / 2 / 3.
+-- Confirmed 2026-11-10 from Blizzard's own Sell tab: 2h = 1, 24h = 3 (8h = 2
+-- by order, not yet seen). Never pass any other value: a guessed duration
+-- crashed the Forever client in CalculateCommodityDeposit (2026-11-10).
+local FOREVER_DURATIONS = { [2] = true, [8] = true, [24] = true }
+local FOREVER_DEFAULT_DURATION = 2
+
+local function IsForever()
+    return PocketCFO and PocketCFO.flavor == "forever"
+end
+
 local function NormalizeDuration(value, fallback)
+    if IsForever() then
+        local foreverDuration = tonumber(value) or tonumber(fallback)
+        if not foreverDuration or not FOREVER_DURATIONS[foreverDuration] then
+            foreverDuration = FOREVER_DEFAULT_DURATION
+        end
+        return foreverDuration
+    end
     local duration = tonumber(value) or tonumber(fallback) or 12
     if duration ~= 12 and duration ~= 24 and duration ~= 48 then
         duration = 12
@@ -66,6 +87,16 @@ end
 
 local function AuctionDurationEnum(hours)
     hours = NormalizeDuration(hours, GetGlobalDuration())
+    if IsForever() then
+        local durations = _G.Enum and Enum.AuctionHouseDuration
+        if hours == 24 then
+            return durations and durations.Long or 3
+        end
+        if hours == 8 then
+            return durations and durations.Medium or 2
+        end
+        return durations and durations.Short or 1
+    end
     if _G.Enum and Enum.AuctionHouseDuration then
         if hours == 48 and Enum.AuctionHouseDuration.Long then
             return Enum.AuctionHouseDuration.Long
@@ -97,15 +128,12 @@ local function ApplyEvaluationAliases(row)
     row.selectable = false
 end
 
+-- Debug output only while PocketCFO debug is on: on at login when the
+-- dev-only MCG_Diagnostic addon is enabled, /mcg debug toggles it. Players
+-- never have it (Brian, 2026-11-10). Replaces the postingSettings
+-- captureCompetitionRows flag, which nothing could turn on.
 local function IsDebugCaptureEnabled()
-    local settings = PocketCFO_AH
-        and PocketCFO_AH.db
-        and PocketCFO_AH.db.global
-        and PocketCFO_AH.db.global.postingSettings
-        or nil
-    return settings
-        and settings.debug
-        and settings.debug.captureCompetitionRows == true
+    return PocketCFO ~= nil and PocketCFO.debugEnabled == true
 end
 
 -- Bag and item location helpers
@@ -210,17 +238,20 @@ local function RowMatchesBagSlot(row, bagSlot)
         return false
     end
 
+    -- Item ID first (2026-11-10): the config key carries the item ID, so a
+    -- different item ID can never match. Saves a full item identification
+    -- for every other slot in the bags on each Post Selected click.
+    local expectedItemID = ExpectedItemID(row)
+    if expectedItemID and tonumber(bagSlot.itemID) ~= expectedItemID then
+        return false
+    end
+
     local expectedConfigKey = ExpectedConfigKey(row)
     if expectedConfigKey and tostring(expectedConfigKey) ~= "" then
         local identity = ResolveBagSlotIdentity(bagSlot.containerID, bagSlot.slot)
         if identity and identity.configKey then
             return tostring(identity.configKey) == tostring(expectedConfigKey)
         end
-    end
-
-    local expectedItemID = ExpectedItemID(row)
-    if expectedItemID and tonumber(bagSlot.itemID) ~= expectedItemID then
-        return false
     end
 
     local expectedLink = ExpectedItemLink(row)
@@ -934,7 +965,11 @@ function PostingExecution:PostSelectedRow(row, retryCount)
                 [5] = buyoutPrice,
             },
     }
-    self:LogPostAttemptDump(row, bagSlot, call)
+    -- Full row dump: debug only (2026-11-10). It walks every nested table,
+    -- including every competing auction from the search, on each click.
+    if IsDebugCaptureEnabled() then
+        self:LogPostAttemptDump(row, bagSlot, call)
+    end
     self:RecordTransition("post-api-called", {
         attemptID = attemptID, rowID = row.rowID, postAPI = postAPI, quantity = quantity, price = buyoutPrice,
     })

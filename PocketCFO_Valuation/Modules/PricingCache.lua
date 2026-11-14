@@ -133,6 +133,162 @@ local function MaintainSavedPrices(db, currentKey, store)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Market key migration (Item_Identity_Unification_Design.md 7, 2026-11-10).
+-- Market keys now take their stats from ItemIdentityService: short names
+-- joined with "+", armor left out, profession accessories without stats, and
+-- fixed-stat gear keyed with its stats ("4308|ilvl12|stats:SPIRIT"). Saved
+-- prices and scan history move to the new keys automatically so players
+-- keep their prices and history without a rescan:
+--   key with stats      -> its stats in the new form (or none, accessories)
+--   "id|ilvlN", no stats -> + the row's saved stats when the item is gear
+--   anything else        -> unchanged
+-- Two old keys landing on one new key keep the newer price / the history
+-- with more days seen. A row whose item type can't be read yet (no item
+-- data) stays as it is and is tried again next session; the work is marked
+-- done (marketKeyVersion) once nothing is left. Runs before anything reads
+-- the cache, every realm group.
+-- ---------------------------------------------------------------------------
+
+local MARKET_KEY_VERSION = 2
+local migrationChecked = false
+
+local function IdentityService()
+    local core = _G.PocketCFO
+    return core and core.ItemIdentityService or nil
+end
+
+-- New key for an old one; nil, "unknown" when it can't be worked out yet.
+local function MigratedKey(service, marketKey, row)
+    marketKey = tostring(marketKey)
+    local itemID = tonumber(marketKey:match("^(%d+)|"))
+    if not itemID then
+        return marketKey
+    end
+    local statsAt = marketKey:find("|stats:", 1, true)
+    local base = statsAt and marketKey:sub(1, statsAt - 1) or marketKey
+    local oldStats = statsAt and marketKey:sub(statsAt + #"|stats:") or nil
+    if not oldStats then
+        local savedStats = type(row) == "table" and row.statFingerprint or nil
+        if not base:match("^%d+|ilvl%d+$") or not savedStats or tostring(savedStats) == "" then
+            return marketKey
+        end
+        oldStats = savedStats
+    end
+    local stats, reason = service:GetVariantStats(nil, itemID, oldStats)
+    if reason == "unknown" then
+        return nil, "unknown"
+    end
+    if stats and tostring(stats) ~= "" then
+        return base .. "|stats:" .. tostring(stats), stats
+    end
+    return base
+end
+
+local function MigrateGroupPrices(service, store, keyMap)
+    local cache = store.pricingCache
+    if type(cache) ~= "table" then
+        return 0, 0, 0
+    end
+    local migrated, moved, pending, merged = {}, 0, 0, 0
+    for oldKey, row in pairs(cache) do
+        local newKey, stats = MigratedKey(service, oldKey, row)
+        if not newKey then
+            newKey = tostring(oldKey)
+            pending = pending + 1
+        elseif newKey ~= tostring(oldKey) then
+            moved = moved + 1
+            keyMap[tostring(oldKey)] = newKey
+            if type(row) == "table" then
+                row.marketKey = newKey
+                row.statFingerprint = type(stats) == "string" and stats or nil
+            end
+        end
+        local existing = migrated[newKey]
+        if existing == nil then
+            migrated[newKey] = row
+        else
+            merged = merged + 1
+            local rowTime = type(row) == "table" and tonumber(row.timestamp) or 0
+            local existingTime = type(existing) == "table" and tonumber(existing.timestamp) or 0
+            if rowTime > existingTime then
+                migrated[newKey] = row
+            end
+        end
+    end
+    store.pricingCache = migrated
+    return moved, pending, merged
+end
+
+local function MigrateGroupHistory(service, history, keyMap)
+    if type(history) ~= "table" then
+        return 0, 0
+    end
+    local migrated, moved, pending = {}, 0, 0
+    for oldKey, rec in pairs(history) do
+        local newKey = keyMap[tostring(oldKey)]
+        if not newKey then
+            local reason
+            newKey, reason = MigratedKey(service, oldKey, nil)
+            if not newKey then
+                newKey = tostring(oldKey)
+                pending = pending + 1
+            end
+        end
+        if newKey ~= tostring(oldKey) then
+            moved = moved + 1
+        end
+        local existing = migrated[newKey]
+        if existing == nil
+            or (type(rec) == "table" and (tonumber(rec.n) or 0) > (type(existing) == "table" and tonumber(existing.n) or 0)) then
+            migrated[newKey] = rec
+        end
+    end
+    return moved, pending, migrated
+end
+
+local function MigrateMarketKeys(db)
+    if migrationChecked then
+        return
+    end
+    migrationChecked = true
+    local service = IdentityService()
+    if not service or type(service.GetVariantStats) ~= "function" or type(db.global.realmGroups) ~= "table" then
+        return
+    end
+    db.global.scanHistory = db.global.scanHistory or {}
+    local totals = { moved = 0, pending = 0, merged = 0, historyMoved = 0 }
+    for groupKey, store in pairs(db.global.realmGroups) do
+        if type(store) == "table" and store.marketKeyVersion ~= MARKET_KEY_VERSION then
+            local ok, err = pcall(function()
+                local keyMap = {}
+                local moved, pending, merged = MigrateGroupPrices(service, store, keyMap)
+                local historyMoved, historyPending, history = MigrateGroupHistory(service, db.global.scanHistory[groupKey], keyMap)
+                if history then
+                    db.global.scanHistory[groupKey] = history
+                end
+                totals.moved = totals.moved + moved
+                totals.pending = totals.pending + pending + historyPending
+                totals.merged = totals.merged + merged
+                totals.historyMoved = totals.historyMoved + historyMoved
+                if pending == 0 and historyPending == 0 then
+                    store.marketKeyVersion = MARKET_KEY_VERSION
+                end
+            end)
+            if not ok then
+                totals.error = tostring(err)
+            end
+        end
+    end
+    local core = _G.PocketCFO
+    if core and core.AppendSessionLog then
+        core:AppendSessionLog(string.format(
+            "[MCG] PricingCache: market keys moved to identity form - prices moved=%d merged=%d, history moved=%d, waiting on item data=%d%s",
+            totals.moved, totals.merged, totals.historyMoved, totals.pending,
+            totals.error and (" error=" .. totals.error) or ""))
+    end
+end
+
 -- This realm group's saved data:
 --   { pricingCache = {}, timeOfLastReplicateScan = n, timeOfLastReplicateRequest = n }
 local function GetGroupStore()
@@ -146,6 +302,7 @@ local function GetGroupStore()
     end
 
     db.global.realmGroups = db.global.realmGroups or {}
+    MigrateMarketKeys(db)
     local store = db.global.realmGroups[key]
     if not store then
         store = {}

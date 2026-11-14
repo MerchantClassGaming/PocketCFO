@@ -274,11 +274,19 @@ local function ObserveContainers(location, ownerKey, containers)
                         aggregatedRows[configKey].quantity = (aggregatedRows[configKey].quantity or 0) + quantity
 
                         -- Annotate bind-state while slot context is available.
-                        -- Conservative: if any slot for this configKey is bound, the whole row is marked bound.
                         -- InventoryFilterService uses isBound to exclude bound items from posting workflows.
-                        if not aggregatedRows[configKey].isBound then
-                            if GetSlotBoundState(containerID, slot) then
-                                aggregatedRows[configKey].isBound = true
+                        -- Per copy (2026-11-10, same as BagScanner): bound copies are counted and the row is
+                        -- bound only when every copy is (set after the loop), so a soulbound copy doesn't hide
+                        -- BoE copies. A copy whose bind state isn't known yet marks the row bindPending (3s rescan).
+                        local classifier = PocketCFO and PocketCFO.SoulboundClassifier or _G.PocketCFO_SoulboundClassifier
+                        if not GetSlotBoundState(containerID, slot) then
+                            if classifier and type(classifier.BagSlotBindUnknown) == "function"
+                                and classifier:BagSlotBindUnknown(containerID, slot) then
+                                aggregatedRows[configKey].bindPending = true
+                            end
+                        else
+                            do
+                                aggregatedRows[configKey].boundQuantity = (aggregatedRows[configKey].boundQuantity or 0) + quantity
                                 annotatedBoundCount = annotatedBoundCount + 1
                                 annotatedBoundDetails[#annotatedBoundDetails + 1] = {
                                     itemID      = tonumber(identity.itemID) or tonumber(info.itemID),
@@ -297,6 +305,11 @@ local function ObserveContainers(location, ownerKey, containers)
                 end
             end
         end
+    end
+
+    for _, row in ipairs(rows) do
+        local bound = tonumber(row.boundQuantity) or 0
+        row.isBound = (bound > 0 and bound >= (tonumber(row.quantity) or 0)) or nil
     end
 
     table.sort(rows, function(a, b)
@@ -432,6 +445,52 @@ function BankScanner:ScanOpenBankSession(reason)
             + (tonumber(bankObservation.unresolvedIdentitySlots) or 0)
             + (tonumber(warbankObservation.unresolvedIdentitySlots) or 0),
         tostring(reason))
+
+    self:ScheduleItemLevelRescan({ bagObservation.rows, bankObservation.rows, warbankObservation.rows }, reason)
+end
+
+-- Item level pending (2026-11-10, same as BagScanner): a bank session scan
+-- that saved any row at item level 0 (item not loaded yet; the identity
+-- service already asked the game to load it) scans again once, 3s later, while
+-- the bank is still open. At most 3 in a row. Bank closed before then: the row
+-- is fixed at the next bank visit.
+local ILVL_RESCAN_DELAY = 3
+local ILVL_RESCAN_MAX = 3
+
+local function IsItemLevelPending(configKey)
+    return type(configKey) == "string" and configKey:find("|ilvl:0", 1, true) ~= nil
+end
+
+function BankScanner:ScheduleItemLevelRescan(rowLists, reason)
+    local pending = 0
+    for _, rows in ipairs(rowLists or {}) do
+        for _, row in ipairs(rows or {}) do
+            if IsItemLevelPending(row.configKey) or row.bindPending then
+                pending = pending + 1
+            end
+        end
+    end
+    if pending == 0 then
+        self.ilvlRescanCount = 0
+        return
+    end
+    if reason ~= "ilvl-pending-rescan" then
+        self.ilvlRescanCount = 0
+    end
+    if self.ilvlRescanTimer or (self.ilvlRescanCount or 0) >= ILVL_RESCAN_MAX
+        or not C_Timer or type(C_Timer.NewTimer) ~= "function" then
+        SessionLog("BankScanner: item level pending rows=%d rescan=%s", pending,
+            self.ilvlRescanTimer and "queued" or "limit")
+        return
+    end
+    self.ilvlRescanCount = (self.ilvlRescanCount or 0) + 1
+    SessionLog("BankScanner: item level pending rows=%d rescan in %ds (try %d)", pending, ILVL_RESCAN_DELAY, self.ilvlRescanCount)
+    self.ilvlRescanTimer = C_Timer.NewTimer(ILVL_RESCAN_DELAY, function()
+        self.ilvlRescanTimer = nil
+        if self.bankOpen then
+            self:ScanOpenBankSession("ilvl-pending-rescan")
+        end
+    end)
 end
 
 function BankScanner:QueueBankSessionScan(reason)

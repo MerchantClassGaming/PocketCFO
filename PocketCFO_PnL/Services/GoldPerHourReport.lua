@@ -34,6 +34,13 @@
 --     (Dungeons, Raids, Delves, Scenarios) with each instance below. Valued by
 --     ActivitySessions:GetStats (gold in - gold out + loot sold + loot kept at
 --     today's price). Details are split into Items and Gold, per hour.
+--   Trip overhead (Brian, 2026-11-13): every run and every session adds
+--     TRIP_OVERHEAD_SECONDS to the time its rates are worked out on, for
+--     getting out to the farm and back, which no run sees. Applied to
+--     every rate: ranking rows, their details, recent lines and the top line
+--     (Now / Last, 2026-11-14, so the same run shows the same rate
+--     everywhere). Saved runs and sessions stay first loot to last loot;
+--     time shown and the ranking minimum use the real time.
 --   Hiding (2026-10-27): every automatic row has a hideKey ("gathering:<label>",
 --     "fishing", "beasts", "type:<dungeon|raid|delve|scenario>"). Rows whose
 --     key is hidden (ActivityRuns ui.hidden, account-wide, set from the
@@ -52,6 +59,8 @@ PocketCFO_PnL.GoldPerHourReport = GoldPerHourReport
 local MIN_RANK_SECONDS = 600
 local MIN_RATE_SECONDS = 60   -- ActivityRuns:PerHour gives no rate below a minute
 local RECENT_RUNS = 10
+-- Getting out to the farm and back, per run or session (Brian, 2026-11-13).
+local TRIP_OVERHEAD_SECONDS = 120
 
 GoldPerHourReport.MIN_RANK_SECONDS = MIN_RANK_SECONDS
 
@@ -184,8 +193,15 @@ local function RunNow(runs, run, active)
         title = title,
         seconds = stats.seconds,
         copper = stats.copper,
-        perHour = stats.perHour,
+        -- Trip overhead in the rate, same as the ranking (2026-11-14).
+        perHour = (not select(2, runs:GetRunCost(run))) and runs:PerHour(stats.copper, stats.seconds + TRIP_OVERHEAD_SECONDS) or nil,
     }
+end
+
+-- Session top-line rate with trip overhead, same as the session rows (2026-11-14).
+local function SessionRate(stats)
+    local runs = Runs()
+    return runs and runs:PerHour(stats.copper, stats.seconds + TRIP_OVERHEAD_SECONDS) or nil
 end
 
 -- Top line (2026-10-27): what is running now (a session first, then a
@@ -212,7 +228,7 @@ function GoldPerHourReport:BuildNow()
             title = "Session: " .. tostring(session.name),
             seconds = stats.seconds,
             copper = stats.copper,
-            perHour = stats.perHour,
+            perHour = SessionRate(stats),
         }
     end
     local runs = Runs()
@@ -244,7 +260,7 @@ function GoldPerHourReport:BuildNow()
             title = title,
             seconds = stats.seconds,
             copper = stats.copper,
-            perHour = stats.perHour,
+            perHour = SessionRate(stats),
         }
     end
     if lastRun then
@@ -279,7 +295,7 @@ local function RecentRunLine(runs, run, priceCache)
         seconds = seconds,
         copper = copper,
         costUnpriced = costUnpriced,
-        perHour = (not costUnpriced) and runs:PerHour(copper, seconds) or nil,
+        perHour = (not costUnpriced) and runs:PerHour(copper, seconds + TRIP_OVERHEAD_SECONDS * (run.tripShare or 1)) or nil,
     }
 end
 
@@ -339,6 +355,7 @@ local function SplitDroppedGathering(run, dropped)
             share = share + Share(part)
         end
         slice.seconds = totalSeconds * share
+        slice.tripShare = share  -- this piece's part of the run's trip overhead
         return slice
     end
     local list = {}
@@ -374,14 +391,16 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
         local activity = run.activity or "gathering"
         local key = droppedKey and (guid .. ":gathering:dropped:" .. droppedKey) or (guid .. ":" .. activity)
         local character = byCharacter[key] or { guid = guid, activity = activity, droppedKey = droppedKey,
-            runs = 0, seconds = 0, cost = 0, items = {}, parts = {}, zones = {}, runList = {} }
+            runs = 0, seconds = 0, rateSeconds = 0, cost = 0, items = {}, parts = {}, zones = {}, runList = {} }
         byCharacter[key] = character
         character.runs = character.runs + 1
         character.runList[#character.runList + 1] = run
         local cost, costUnpriced = runs:GetRunCost(run)
         character.cost = character.cost + cost
         character.costUnpriced = character.costUnpriced or costUnpriced
-        character.seconds = character.seconds + runs:GetRunSeconds(run)
+        local runSeconds = runs:GetRunSeconds(run)
+        character.seconds = character.seconds + runSeconds
+        character.rateSeconds = character.rateSeconds + runSeconds + TRIP_OVERHEAD_SECONDS * (run.tripShare or 1)
         MergeItems(character.items, run.items)
         for partKey, part in pairs(run.parts or {}) do
             local merged = character.parts[partKey] or { loots = 0, items = {} }
@@ -442,8 +461,8 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
             copper = copper,
             cost = character.cost,
             costUnpriced = character.costUnpriced,
-            costPerHour = runs:PerHour(character.cost, character.seconds),
-            perHour = (not character.costUnpriced) and runs:PerHour(copper, character.seconds) or nil,
+            costPerHour = runs:PerHour(character.cost, character.rateSeconds),
+            perHour = (not character.costUnpriced) and runs:PerHour(copper, character.rateSeconds) or nil,
             parts = {},
             zones = {},
             recent = {},
@@ -456,7 +475,7 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
                 copper = partCopper,
                 share = gross > 0 and (partCopper / gross) or 0,
                 loots = part.loots,
-                perHour = runs:PerHour(partCopper, character.seconds),
+                perHour = runs:PerHour(partCopper, character.rateSeconds),
             }
         end
         -- By profession: what the character has (2026-10-31). Gathering rows
@@ -608,12 +627,13 @@ end
 -- { { label, copper, perHour } } (gold spending negative).
 
 local function NewGroup()
-    return { runs = 0, seconds = 0, copper = 0, kept = 0, sold = 0, currencies = 0, keptUnpriced = 0, income = {}, spend = {} }
+    return { runs = 0, seconds = 0, rateSeconds = 0, copper = 0, kept = 0, sold = 0, currencies = 0, keptUnpriced = 0, income = {}, spend = {} }
 end
 
 local function AddStats(group, stats)
     group.runs = group.runs + 1
     group.seconds = group.seconds + stats.seconds
+    group.rateSeconds = group.rateSeconds + stats.seconds + TRIP_OVERHEAD_SECONDS
     group.copper = group.copper + stats.copper
     group.kept = group.kept + stats.keptCopper
     group.sold = group.sold + stats.soldCopper
@@ -631,12 +651,12 @@ local function FillFromGroup(target, group, runs)
     target.runs = group.runs
     target.seconds = group.seconds
     target.copper = group.copper
-    target.perHour = runs:PerHour(group.copper, group.seconds)
+    target.perHour = runs:PerHour(group.copper, group.rateSeconds)
     target.keptUnpriced = group.keptUnpriced
     target.items, target.gold = {}, {}
     local function Add(list, label, copper)
         if copper ~= 0 then
-            list[#list + 1] = { label = label, copper = copper, perHour = runs:PerHour(copper, group.seconds) }
+            list[#list + 1] = { label = label, copper = copper, perHour = runs:PerHour(copper, group.rateSeconds) }
         end
     end
     Add(target.items, "Still in your bags", group.kept)
@@ -691,7 +711,7 @@ function GoldPerHourReport:AddSessionRows(model, runs, cutoff, characterGUID, mi
                 active = session.endedAt == nil,
                 seconds = stats.seconds,
                 copper = stats.copper,
-                perHour = stats.perHour,
+                perHour = runs:PerHour(stats.copper, stats.seconds + TRIP_OVERHEAD_SECONDS),
             }
         end
     end

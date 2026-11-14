@@ -417,6 +417,15 @@ end
 
 local OVERRIDE_R, OVERRIDE_G, OVERRIDE_B = 1, 0.82, 0
 local DURATION_CYCLE = { [12] = 24, [24] = 48, [48] = 12 }
+-- WoW Forever (Forever-only, gated): click cycles 2h -> 8h -> 24h.
+local FOREVER_DURATION_CYCLE = { [2] = 8, [8] = 24, [24] = 2 }
+
+local function DurationCycle()
+    if PocketCFO and PocketCFO.flavor == "forever" then
+        return FOREVER_DURATION_CYCLE
+    end
+    return DURATION_CYCLE
+end
 
 local function IsSmartView()
     local smart = PocketCFO_AH:GetModule("SmartPricing", true)
@@ -507,7 +516,7 @@ function PostingUI:StartEdit(button, field)
     self:SelectRow(button.queueIndex, false)
     if field == "duration" then
         local current = tonumber(row.duration) or 12
-        controller:ApplyOverride(row, "duration", DURATION_CYCLE[current] or 12)
+        controller:ApplyOverride(row, "duration", DurationCycle()[current] or 12)
         return
     end
     local cell = (field == "price" and button.PriceText) or (field == "usually" and button.InBagsText) or button.ToPostText
@@ -1167,7 +1176,7 @@ function PostingUI:Render(parent)
             if GameTooltip then
                 GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
                 GameTooltip:SetText("Keep", 1, 1, 1)
-                GameTooltip:AddLine("Don't sell this item on this character. Change how many to keep on the Keep List tab.", 0.8, 0.8, 0.8, true)
+                GameTooltip:AddLine("Don't sell this item. Change how many to keep, or share the list with your other characters, on the Keep List tab.", 0.8, 0.8, 0.8, true)
                 GameTooltip:Show()
             end
         end)

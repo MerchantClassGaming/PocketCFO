@@ -718,6 +718,14 @@ end
 
 function InventoryManagerWindow:Show()
     if not mainFrame then return end
+    -- Hidden -> shown: always place it first (saved spot, or beside the
+    -- profession window). ActivateMode (Orders) can show the window before
+    -- CraftQueueController:OnTradeSkillShow runs; that path then saw the
+    -- window as already shown, skipped Position(), and left it with no
+    -- anchor (invisible). Brian, 2026-11-13, reproduced on /reload.
+    if not mainFrame:IsShown() then
+        self:Position()
+    end
     if PocketCFO_Crafting.HelperWindow then
         PocketCFO_Crafting.HelperWindow:ShowOrRaise(mainFrame)
     else
@@ -871,6 +879,104 @@ function InventoryManagerWindow:Position()
             mainFrame:ClearAllPoints()
             mainFrame:SetPoint("TOPLEFT", profFrame, "TOPRIGHT", 4, -300)
         end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Keep the window out from under the profession window (both flavors)
+-- ---------------------------------------------------------------------------
+-- Blizzard's profession window draws its border and pages at frame level
+-- 500+, so any part of this window that overlaps it is hidden underneath.
+-- Two guards, both using CoveredFraction:
+--   * dropping the window mostly on the profession window slides it to the
+--     nearest side (OnDragStop)
+--   * EnsureVisible() (the PCFO button) moves a mostly covered or unplaced
+--     window back to its default spot beside the profession window
+-- "Mostly" = more than half of this window's area. Positions are worked out
+-- in UIParent units and saved the same way OnDragStop saves them.
+
+local COVER_THRESHOLD = 0.5
+local SNAP_GAP        = 4
+local DEFAULT_DROP_Y  = 300 -- same as Position()'s default: 300 below the profession window's top
+
+-- Frame edges in UIParent units, or nil if the frame has no position.
+local function EdgesInUIParent(frame)
+    local l, r, t, b = frame:GetLeft(), frame:GetRight(), frame:GetTop(), frame:GetBottom()
+    if not (l and r and t and b) then return nil end
+    local k = frame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    return l * k, r * k, t * k, b * k
+end
+
+-- Share of mainFrame's area that sits on the profession window (0 to 1).
+-- nil when mainFrame has no position at all (nothing drawn).
+local function CoveredFraction()
+    local profFrame = _G["ProfessionsFrame"]
+    local l, r, t, b = EdgesInUIParent(mainFrame)
+    if not l then return nil end
+    if not profFrame or not profFrame:IsShown() then return 0 end
+    local pl, pr, pt, pb = EdgesInUIParent(profFrame)
+    if not pl then return 0 end
+    local w = math.max(0, math.min(r, pr) - math.max(l, pl))
+    local h = math.max(0, math.min(t, pt) - math.max(b, pb))
+    local area = (r - l) * (t - b)
+    if area <= 0 then return 0 end
+    return (w * h) / area
+end
+
+-- Put mainFrame beside the profession window at the given top (UIParent
+-- units). Right side unless preferLeft or the right side runs off screen.
+local function PlaceBesideProfessionFrame(top, preferLeft)
+    local profFrame = _G["ProfessionsFrame"]
+    local pl, pr = EdgesInUIParent(profFrame)
+    if not pl then return false end
+    local k = mainFrame:GetEffectiveScale() / UIParent:GetEffectiveScale()
+    local width = mainFrame:GetWidth() * k
+    local screenRight = UIParent:GetRight() or 0
+    local rightX = pr + SNAP_GAP
+    local leftX = pl - SNAP_GAP - width
+    local x
+    if preferLeft then
+        x = (leftX >= 0) and leftX or rightX
+    else
+        x = (rightX + width <= screenRight) and rightX or leftX
+    end
+    -- SetPoint offsets are in mainFrame's own units.
+    local fx, fy = x / k, top / k
+    mainFrame:ClearAllPoints()
+    mainFrame:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", fx, fy)
+    PocketCFO.db.char.craftQueuePosition = { x = fx, y = fy }
+    PocketCFO:Debug("InventoryManagerWindow: placed beside profession window x=%.0f y=%.0f", fx, fy)
+    return true
+end
+
+-- Called after a drag: if dropped mostly on the profession window, slide
+-- to the nearer side, keeping the height it was dropped at.
+local function SnapOffProfessionFrame()
+    local covered = CoveredFraction()
+    if not covered or covered <= COVER_THRESHOLD then return false end
+    local l, r, t = EdgesInUIParent(mainFrame)
+    local pl, pr = EdgesInUIParent(_G["ProfessionsFrame"])
+    local preferLeft = ((l + r) / 2) < ((pl + pr) / 2)
+    return PlaceBesideProfessionFrame(t, preferLeft)
+end
+
+-- PCFO button: if the window is open but mostly hidden under the profession
+-- window (or has no position), put it back at its default spot.
+function InventoryManagerWindow:EnsureVisible()
+    if not mainFrame or not mainFrame:IsShown() then return end
+    local covered = CoveredFraction()
+    if covered and covered <= COVER_THRESHOLD then return end
+    local profFrame = _G["ProfessionsFrame"]
+    local pt
+    if profFrame and profFrame:IsShown() then
+        local _, _, top = EdgesInUIParent(profFrame)
+        pt = top
+    end
+    if pt then
+        PlaceBesideProfessionFrame(pt - DEFAULT_DROP_Y, false)
+    else
+        mainFrame:ClearAllPoints()
+        mainFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
     end
 end
 
@@ -1731,6 +1837,9 @@ function InventoryManagerWindow:Build(cbs)
     mainFrame:SetScript("OnDragStart", mainFrame.StartMoving)
     mainFrame:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
+        -- Dropped mostly on the profession window: slide out to its side
+        -- (saves the new spot itself).
+        if SnapOffProfessionFrame() then return end
         local x = self:GetLeft()
         local y = self:GetTop()
         if x and y then
