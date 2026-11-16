@@ -284,8 +284,11 @@ end
 
 -- Average current price of every real-stat version at one quality, or a
 -- plain (no-stats) key's current price.
-local function QualityAverage(rows, base, cutoff)
+local function QualityAverage(rows, base, cutoff, keep)
     local plain = CurrentValue(rows[base], cutoff)
+    if plain and keep and not keep(base, plain) then
+        plain = nil
+    end
     if plain then
         return plain
     end
@@ -294,7 +297,7 @@ local function QualityAverage(rows, base, cutoff)
     for key, row in pairs(rows) do
         if key:sub(1, #prefix) == prefix and RealStats(key) then
             local value = CurrentValue(row, cutoff)
-            if value then
+            if value and (not keep or keep(key, value)) then
                 total = total + value
                 count = count + 1
             end
@@ -346,10 +349,14 @@ PocketCFO_Valuation.StatGroupKey = StatGroupKey
 -- A better quality's price for capping: same stats if current, otherwise
 -- the cheapest current price in the same stat group (2026-11-06), otherwise
 -- the current average at that quality.
-local function BetterQualityPrice(rows, itemID, quality, stats, cutoff)
+local function BetterQualityPrice(rows, itemID, quality, stats, cutoff, keep)
     local base = tostring(itemID) .. "|q" .. tostring(quality)
     if stats then
-        local value = CurrentValue(rows[base .. "|stats:" .. stats], cutoff)
+        local ownKey = base .. "|stats:" .. stats
+        local value = CurrentValue(rows[ownKey], cutoff)
+        if value and keep and not keep(ownKey, value) then
+            value = nil
+        end
         if value then
             return value
         end
@@ -361,6 +368,9 @@ local function BetterQualityPrice(rows, itemID, quality, stats, cutoff)
                 local otherStats = RealStats(key)
                 if otherStats and StatGroupKey(otherStats) == group then
                     local other = CurrentValue(row, cutoff)
+                    if other and keep and not keep(key, other) then
+                        other = nil
+                    end
                     if other and (not cheapest or other < cheapest) then
                         cheapest = other
                     end
@@ -371,7 +381,7 @@ local function BetterQualityPrice(rows, itemID, quality, stats, cutoff)
             return cheapest
         end
     end
-    return QualityAverage(rows, base, cutoff)
+    return QualityAverage(rows, base, cutoff, keep)
 end
 
 -- A better version priced far below the version above it is a deal (a
@@ -443,6 +453,93 @@ local function CostToMake(itemID)
         costCache[itemID] = { cost = cost, t = now }
     end
     return cost
+end
+
+-- Clowns never set a ladder price (Brian, 2026-11-15): the mirror of the
+-- dump rule. A better version's price far ABOVE what it's worth would both
+-- cap and, for a green with no current listing of its own, fill in its
+-- value (a blue Q2 clown at 50,000g -> green Q5 worth 28,571g everywhere).
+-- A price is skipped when it is:
+--   - more than 2x its own scan history (>= 2 days seen; same 2x as the
+--     confidence "far above usual" test), or
+--   - with less history: more than its cost to make x the smart posting
+--     curve +10% (the same clown limit as "Highest we'd match").
+-- Unknown cost and no history: kept, as before.
+-- CLOWN_CURVE is a copy of PocketCFO_AH SmartPricing CURVE (Valuation can't
+-- depend on the AH addon): keep the two in step when tuning.
+local CLOWN_HISTORY_X = 2
+local CLOWN_HISTORY_MIN_DAYS = 2
+local CLOWN_HEADROOM = 1.10
+local CLOWN_CURVE = {
+    { gold = 1, mult = 25 },
+    { gold = 10, mult = 15 },
+    { gold = 100, mult = 10 },
+    { gold = 1000, mult = 5 },
+    { gold = 10000, mult = 3 },
+}
+local CLOWN_MIN_MULT = 2
+local CLOWN_FOREVER_GOLD_SCALE = 0.1 -- Forever curve gold amounts / 10, as SmartPricing
+
+local function ClownCurveMultiplier(costCopper)
+    local gold = costCopper / 10000
+    if PocketCFO and PocketCFO.flavor == "forever" then
+        gold = gold / CLOWN_FOREVER_GOLD_SCALE
+    end
+    local first, last = CLOWN_CURVE[1], CLOWN_CURVE[#CLOWN_CURVE]
+    if gold <= first.gold then
+        return first.mult
+    end
+    if gold >= last.gold then
+        return math.max(CLOWN_MIN_MULT, last.mult)
+    end
+    local log10 = function(x) return math.log(x) / math.log(10) end
+    for index = 1, #CLOWN_CURVE - 1 do
+        local a, b = CLOWN_CURVE[index], CLOWN_CURVE[index + 1]
+        if gold <= b.gold then
+            local t = (log10(gold) - log10(a.gold)) / (log10(b.gold) - log10(a.gold))
+            return math.max(CLOWN_MIN_MULT, a.mult + (b.mult - a.mult) * t)
+        end
+    end
+    return CLOWN_MIN_MULT
+end
+
+-- Shared with ValuationService confidence (2026-11-15): cost to make, and
+-- the most a crafted item posts at from its cost (cost x curve +10%, the
+-- smart posting "Highest we'd match" for a not-confident crafted item).
+PocketCFO_Valuation.CostToMake = function(itemID)
+    return CostToMake(tonumber(itemID))
+end
+PocketCFO_Valuation.CostCurveMax = function(cost)
+    cost = tonumber(cost)
+    if not cost or cost <= 0 then
+        return nil
+    end
+    return cost * ClownCurveMultiplier(cost) * CLOWN_HEADROOM
+end
+
+-- keep(marketKey, price) for BetterQualityPrice: false = clown, skip it.
+local function NotClown(itemID)
+    return function(marketKey, price)
+        price = tonumber(price)
+        if not price then
+            return false
+        end
+        local history = PocketCFO_Valuation:GetModule("ScanHistory", true)
+        local ok, rec = false, nil
+        if history and type(history.Get) == "function" then
+            ok, rec = pcall(history.Get, history, marketKey)
+        end
+        local recent = ok and type(rec) == "table" and tonumber(rec.recent) or nil
+        local days = ok and type(rec) == "table" and tonumber(rec.daysSeen) or 0
+        if recent and recent > 0 and days >= CLOWN_HISTORY_MIN_DAYS then
+            return price <= recent * CLOWN_HISTORY_X
+        end
+        local cost = CostToMake(itemID)
+        if cost then
+            return price <= cost * ClownCurveMultiplier(cost) * CLOWN_HEADROOM
+        end
+        return true
+    end
 end
 
 -- The item's own current price: its own stat only when it has a real stat,
@@ -528,7 +625,8 @@ Rules:Add({
         -- and always counts.
         local priced = {}
         for _, position in ipairs(better) do
-            local price = BetterQualityPrice(RowsFor(position.itemID), position.itemID, position.quality, stats, cutoff)
+            local price = BetterQualityPrice(RowsFor(position.itemID), position.itemID, position.quality, stats, cutoff,
+                NotClown(position.itemID))
             if price then
                 priced[#priced + 1] = { position = position, price = price }
             end
@@ -566,12 +664,15 @@ Rules:Add({
             price = lowestFromPrice,
         } or nil)
         local ownCurrent = OwnCurrentPrice(RowsFor(itemID), itemID, quality, stats, cutoff)
-        local target, note
+        local target, note, filledFromLadder
         if ownCurrent and (not lowestCap or ownCurrent <= lowestCap) then
             target = ownCurrent
             note = "Old listings left out"
         elseif lowestCap then
             target = lowestCap
+            -- The value came from the better version, not this item's own
+            -- listings (2026-11-15): smart posting keeps these in Check.
+            filledFromLadder = true
             local share = math.floor(ownShare * 100 / lowestFrom.share + 0.5)
             local from = string.format("%s quality %d", RARITY_NAME[lowestFrom.rarity] or "?", lowestFrom.quality)
             if ownCurrent then
@@ -587,6 +688,9 @@ Rules:Add({
             ctx:Cap(target, note)
         elseif target > ctx.price then
             ctx:Floor(target, note)
+            if filledFromLadder and type(ctx.result) == "table" then
+                ctx.result.ladderFilled = true
+            end
         end
     end,
 })

@@ -52,6 +52,8 @@
 --   - C_AuctionHouse.PlaceBid / ConfirmCommoditiesPurchase: AH purchases.
 --   - C_AuctionHouse.PostItem / PostCommodity: AH deposits.
 --   - Flight paths, bank slots, barber, transmog, guild bank: window rules.
+--   - ConfirmTalentWipe (Forever only, 2026-11-15): respec at the class
+--     trainer, cost from CONFIRM_TALENT_WIPE. See OnConfirmTalentWipe.
 --   Claims marked "loose" carry an expected amount but also match by
 --   direction, so a rounding difference never loses the item detail.
 --   All Theoretical until seen in-game; each claim writes a session log line.
@@ -1482,6 +1484,36 @@ function GoldLedger:OnBuyTrainerService(index)
     })
 end
 
+-- Respec (Forever only, Brian 2026-11-15: a talent reset landed in Unknown).
+-- It goes through the trainer's chat menu and a confirm popup, never the
+-- trainer window, so no other rule sees it. Retail respecs are free.
+-- CONFIRM_TALENT_WIPE (cost) fires when the popup opens; the claim is made
+-- only when the popup's Accept calls ConfirmTalentWipe(), so a cancelled
+-- popup claims nothing. Loose: a cost that doesn't match still matches by
+-- direction. Theoretical on Forever: the event exists and passes the cost;
+-- Accept goes through ConfirmTalentWipe.
+local RESPEC_QUOTE_TTL = 120
+
+function GoldLedger:OnConfirmTalentWipe(_, cost)
+    self.respecQuote = { cost = tonumber(cost), at = GetTime() }
+    SessionLog("respec quote cost=%s", cost and FormatCopper(-(tonumber(cost) or 0)) or "?")
+end
+
+function GoldLedger:OnTalentWipeConfirmed()
+    local quote = self.respecQuote
+    self.respecQuote = nil
+    local cost = quote and (GetTime() - quote.at) <= RESPEC_QUOTE_TTL and quote.cost or nil
+    SessionLog("respec claim expected=%s", cost and FormatCopper(-cost) or "?")
+    self:AddClaim({
+        category = "respec",
+        amount = (cost and cost > 0) and -cost or nil,
+        loose = true,
+        direction = -1,
+        reason = "respec",
+        ttl = LOOSE_CLAIM_TTL,
+    })
+end
+
 -- AH purchases. Item auctions: PlaceBid(auctionID, bidAmount) charges the bid
 -- at once; the item is the one last searched (ITEM_SEARCH_RESULTS_UPDATED).
 -- Commodities: the total comes from COMMODITY_PRICE_UPDATED after
@@ -1577,6 +1609,9 @@ function GoldLedger:InstallSpendingHooks()
     HookGlobal("BuybackItem", function(index) GoldLedger:OnBuybackItem(index) end)
     HookGlobal("RepairAllItems", function(guildBankRepair) GoldLedger:OnRepairAllItems(guildBankRepair) end)
     HookGlobal("BuyTrainerService", function(index) GoldLedger:OnBuyTrainerService(index) end)
+    if PocketCFO.flavor == "forever" then
+        HookGlobal("ConfirmTalentWipe", function() GoldLedger:OnTalentWipeConfirmed() end)
+    end
     local ah = C_AuctionHouse
     HookTable(ah, "PlaceBid", function(auctionID, bidAmount) GoldLedger:OnPlaceBid(auctionID, bidAmount) end)
     HookTable(ah, "StartCommoditiesPurchase", function(itemID, quantity) GoldLedger:OnStartCommoditiesPurchase(itemID, quantity) end)
@@ -1653,6 +1688,9 @@ function GoldLedger:OnEnable()
     self:RegisterOptionalEvent("UPDATE_INVENTORY_DURABILITY", "OnRepairCostEvent")
     self:RegisterOptionalEvent("COMMODITY_PRICE_UPDATED", "OnCommodityPriceUpdated")
     self:RegisterOptionalEvent("ITEM_SEARCH_RESULTS_UPDATED", "OnItemSearchResults")
+    if PocketCFO.flavor == "forever" then
+        self:RegisterOptionalEvent("CONFIRM_TALENT_WIPE", "OnConfirmTalentWipe")
+    end
     self:OnEnteringWorld()
 end
 

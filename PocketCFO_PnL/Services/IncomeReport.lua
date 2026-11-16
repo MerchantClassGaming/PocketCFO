@@ -61,6 +61,7 @@ local CATEGORY_LABELS = {
     -- Spending categories (2026-10-27)
     repair          = "Repairs",
     training        = "Training",
+    respec          = "Respec",
     flight          = "Flight Paths",
     auction_buy     = "AH Purchases",
     auction_deposit = "AH Deposits",

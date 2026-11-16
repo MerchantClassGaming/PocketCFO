@@ -87,6 +87,7 @@ ItemLedger.CATEGORIES = {
     auction_deposit = "Auction House deposits",
     repair = "Repairs",
     training = "Training",
+    respec = "Respec",
     flight = "Flights",
     guild_bank = "Guild bank",
     services = "Services",

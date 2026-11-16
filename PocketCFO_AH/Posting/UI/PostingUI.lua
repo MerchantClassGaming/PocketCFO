@@ -261,22 +261,39 @@ local function GoldText(copper)
     return PocketCFO:FormatMoney(copper)
 end
 
--- "Capped by <item> Q2   999g" (Brian, 2026-11-07): the one better version
--- that set the most we'd post, in place of listing every better version.
--- Shown only when that cap is what set "Highest we'd post". Price = that
--- item's own price; "Highest we'd post" above shows what it works out to.
-local function CappedByText(from)
+-- "Better version - <item> Q5          3,200g" (Brian, 2026-11-07; reworded
+-- 2026-11-15 from "Capped by"): the one better version that set the most
+-- we'd match. Name in its rarity color so a higher tier reads as one.
+-- Returns the name only; the price goes in the right column.
+-- Shown only when that cap is what set "Highest we'd match".
+local function BetterVersionText(from)
     local itemID = type(from) == "table" and tonumber(from.itemID) or nil
     if not itemID then
         return nil
     end
     local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
-    local ok, name = pcall(getInfo, itemID)
-    local text = "Capped by " .. ((ok and name) or "a better version")
+    local ok, name, _, rarity = pcall(getInfo, itemID)
+    local text = (ok and name) or "a better version"
     if tonumber(from.quality) then
         text = text .. " Q" .. tostring(from.quality)
     end
+    local color = ok and rarity and ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[rarity]
+    if color and color.hex then
+        text = color.hex .. text .. "|r"
+    end
     return text
+end
+
+-- What share of the better version's price the cap is (2026-11-15), so
+-- "Highest we'd match 1,280g  40% of the better version" adds up against
+-- the 3,200g on the next line. nil when it can't be worked out.
+local function BetterVersionShare(bounds)
+    local cap = tonumber(bounds.ruleCap)
+    local price = type(bounds.ruleCapFrom) == "table" and tonumber(bounds.ruleCapFrom.price) or nil
+    if not cap or not price or price <= 0 then
+        return nil
+    end
+    return math.floor(cap / price * 100 + 0.5)
 end
 
 local function AddCompareLines(tooltip, row)
@@ -293,16 +310,23 @@ local function AddCompareLines(tooltip, row)
         return text .. "x "
     end
     local FLOOR_SOURCES = { cost = "cost to make", disenchant = "disenchant value", vendor = "vendor price" }
+    -- Label and reason on the left, gold alone on the right, so every gold
+    -- amount lines up in one column (Brian, 2026-11-15).
+    local function Label(label, why)
+        if why and why ~= "" then
+            return label .. "|cff999999 - " .. why .. "|r"
+        end
+        return label
+    end
     if tonumber(bounds.floor) then
-        tooltip:AddDoubleLine("Lowest we'd post",
-            GoldText(bounds.floor) .. "  |cff999999" .. (FLOOR_SOURCES[bounds.floorSource] or "?") .. " +10%|r",
-            1, 0.82, 0, 1, 1, 1)
+        tooltip:AddDoubleLine(Label("Lowest we'd match", (FLOOR_SOURCES[bounds.floorSource] or "?") .. " +10%"),
+            GoldText(bounds.floor), 1, 0.82, 0, 1, 1, 1)
     elseif bounds.needsRecipe then
         local why = bounds.needsRecipe == "ours" and "Open the recipe, then Refresh" or "Materials not priced yet"
         if bounds.pricesLoading then
             why = "Loading prices..."
         end
-        tooltip:AddDoubleLine("Lowest we'd post", "|cff999999" .. why .. "|r", 1, 0.82, 0, 1, 1, 1)
+        tooltip:AddDoubleLine(Label("Lowest we'd match", why), "-", 1, 0.82, 0, 1, 1, 1)
     end
     if tonumber(bounds.ceiling) then
         local why
@@ -311,28 +335,42 @@ local function AddCompareLines(tooltip, row)
         elseif bounds.ceilingBase == "cost" then
             why = Times(bounds.multiplier) .. "cost to make"
         elseif bounds.ceilingBase == "value" then
-            why = "market value"
+            why = Times(bounds.multiplier) .. "market value"
         elseif bounds.ceilingBase == "market" then
-            why = "market value, few listings"
+            why = Times(bounds.multiplier) .. "market value, few listings"
         elseif bounds.ceilingBase == "pastmarket" then
-            why = "market value (older expansion)"
+            why = Times(bounds.multiplier) .. "market value (older expansion)"
         elseif bounds.ceilingBase == "lowvalue" then
-            why = "market value (lower than usual)"
+            why = Times(bounds.multiplier) .. "market value (lower than usual)"
         elseif bounds.ceilingBase == "rule" then
-            why = "below the better version"
+            local share = BetterVersionShare(bounds)
+            if share and share >= 100 then
+                why = "no more than the better version"
+            elseif share then
+                why = share .. "% of the better version"
+            else
+                why = "below the better version"
+            end
         else
             why = "?"
         end
         -- Raised to the floor (SmartPricing bounds.ceilingAtFloor, 2026-11-07).
+        -- Kept, not hidden (Brian, 2026-11-15: a missing line reads as a
+        -- bug), with why it equals the lowest.
         if bounds.ceilingAtFloor then
-            why = "lowest match"
+            local base = bounds.ceilingBase == "rule" and "better version"
+                or bounds.ceilingBase == "sale" and "last sale" or "value"
+            -- "matches lowest because value is below cost to make" (Brian,
+            -- 2026-11-15: one sentence, words not symbols).
+            why = "matches lowest because " .. base .. " is below " .. (FLOOR_SOURCES[bounds.floorSource] or "the lowest")
         end
-        tooltip:AddDoubleLine("Highest we'd post", GoldText(bounds.ceiling) .. "  |cff999999" .. why .. "|r",
-            1, 0.82, 0, 1, 1, 1)
-        if bounds.ceilingBase == "rule" then
-            local cappedBy = CappedByText(bounds.ruleCapFrom)
-            if cappedBy then
-                tooltip:AddDoubleLine(cappedBy, GoldText(bounds.ruleCapFrom.price), 1, 0.82, 0, 1, 1, 1)
+        tooltip:AddDoubleLine(Label("Highest we'd match", why), GoldText(bounds.ceiling), 1, 0.82, 0, 1, 1, 1)
+        -- Shown whenever there is a better version (Brian, 2026-11-15), not
+        -- only when it set the max: it's what the blue is going for.
+        if bounds.ruleCapFrom then
+            local better = BetterVersionText(bounds.ruleCapFrom)
+            if better then
+                tooltip:AddDoubleLine("Better version - " .. better, GoldText(bounds.ruleCapFrom.price), 1, 0.82, 0, 1, 1, 1)
             end
         end
     end
@@ -346,15 +384,16 @@ local function AddCompareLines(tooltip, row)
     -- it (Brian, 2026-11-04). Costs are read when the list is built, and so
     -- is "ours" (bounds.needsRecipe, SmartPricing:GetBounds).
     local costText = bounds.costToMake and GoldText(bounds.costToMake) or "-"
+    local costWhy
     -- From the recipe at today's prices, not recipe analysis (no
     -- Resourcefulness / multicraft, so a little high). Brian, 2026-11-06.
     if bounds.costToMake and bounds.costSource == "estimate" then
-        costText = costText .. "  |cff999999estimate|r"
+        costWhy = "estimate"
     end
     if not bounds.costToMake and bounds.needsRecipe == "ours" then
-        costText = "|cff999999Open the recipe, then Refresh|r"
+        costWhy = "Open the recipe, then Refresh"
     end
-    tooltip:AddDoubleLine("Cost to make", costText, 1, 0.82, 0, 1, 1, 1)
+    tooltip:AddDoubleLine(Label("Cost to make", costWhy), costText, 1, 0.82, 0, 1, 1, 1)
     tooltip:AddDoubleLine("Your last sale", bounds.lastSale and GoldText(bounds.lastSale) or "-", 1, 0.82, 0, 1, 1, 1)
 end
 

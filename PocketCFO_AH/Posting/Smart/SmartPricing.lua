@@ -70,6 +70,16 @@ local MIN_MULT = 2
 -- Max price from our own last sale: 2x it (knife sold at 2,000g against
 -- competition -> 4,000g when nobody else lists; Brian 2026-11-04).
 local SALE_MULTIPLIER = 2
+-- Max price headroom (Brian, 2026-11-15). The max is a boundary worked
+-- out from everything we know about the item, never from competitors: it
+-- is the absolute most we post at. Competitors only set where we post
+-- inside floor..max. Confident value: 1.5x (a real seller above our value
+-- gets matched, a clown far above it doesn't). Every other max: 1.1x, the
+-- 10% the evaluator used to allow above the max (NEAR_MAX_MATCH, 2026-11-07),
+-- now in the number itself so "Highest we'd match" is the real limit.
+-- Better-version cap ("rule") gets no headroom. Tuning levers.
+local CONFIDENT_MAX_MULT = 1.5
+local MAX_HEADROOM = 1.10
 local FOREVER_GOLD_SCALE = 0.1
 
 local function IsForever()
@@ -555,8 +565,9 @@ end
 --   pastExpansion, pricesLoading (estimate asked for mat data), checkPrice,
 --   valueAtFloor, needsRecipe ("ours" | "seed"),
 --   lastSale, lastSaleSource, confidence ("confident" | "uncertain"),
---   valuePrice (confident value, between floor and max), ruleCap,
---   ruleCapFrom ({ itemID, quality, price } of the better item behind ruleCap), stackSize,
+--   valuePrice (confident value, between floor and max), salePrice (2x last sale), ruleCap,
+--   ruleCapFrom ({ itemID, quality, price } of the better item behind ruleCap),
+--   valueFromLadder (value filled in from a better version), stackSize,
 --   usuallyPost (saved Usually Post, nil = default) }
 -- Any field can be nil. Never throws.
 function SmartPricing:GetBounds(candidate)
@@ -580,18 +591,22 @@ function SmartPricing:GetBounds(candidate)
             marketResult.configKey = marketResult.configKey or configKey
             bounds.confidence, bounds.confidenceReason = Confidence(marketResult)
         end
-        -- Valuation's sanity caps (quality-sibling-cap, tool-tier-cap: a lower
-        -- quality is never worth more than a higher one) lowered this item's
-        -- value: that value is also the most we post at (Brian, 2026-11-04:
-        -- green 206 quill posted at 5,252g while a blue 212 sat at 800g).
-        if bounds.marketValue and unadjusted and bounds.marketValue < unadjusted then
-            bounds.ruleCap = bounds.marketValue
-        end
+        -- A value a rule lowered is NOT a max by itself (2026-11-15). It used
+        -- to be (2026-11-04: green 206 quill posted at 5,252g while a blue
+        -- 212 sat at 800g), but any lowered value counted, so a War Within
+        -- green Q5 quill whose own old listings were left out ("Old listings
+        -- left out") showed "below the better version" with no better
+        -- version. The fixed value goes through the normal max path; only a
+        -- rule that names the better item (ladderCap below) caps the max.
         -- The cap a rule worked out even when it didn't lower the value
         -- (ValuationRuleSet NoteCap): never post above a better version.
         -- ruleCapFrom (2026-11-07): the better item that set that cap, for the
         -- post window's single "Capped by" line. Equal caps count, so a value
         -- lowered by the cap (ruleCap above) still names the item.
+        -- The value was filled in from a better version because this item
+        -- has no current listing of its own (ValuationRuleSet tool-tier-cap,
+        -- 2026-11-15). Posting keeps those rows in Check.
+        bounds.valueFromLadder = (marketResult and marketResult.ladderFilled) and true or nil
         local ladderCap = marketResult and tonumber(marketResult.ladderCap)
         if ladderCap and ladderCap > 0 and (not bounds.ruleCap or ladderCap <= bounds.ruleCap) then
             bounds.ruleCap = ladderCap
@@ -635,9 +650,9 @@ function SmartPricing:GetBounds(candidate)
             bounds.floor = SilverUp(base * FLOOR_MARKUP)
         end
 
-        -- Max price (stage 2, Brian 2026-11-06). Fix the value, don't
-        -- multiply it: a value we trust IS the max.
-        --   1. Confident market value -> the value.            ("value")
+        -- Max price (stage 2, Brian 2026-11-06; headroom 2026-11-15, see
+        -- CONFIDENT_MAX_MULT / MAX_HEADROOM).
+        --   1. Confident market value -> the value x 1.5.      ("value")
         --   2. Not confident:
         --      a. current-expansion crafted -> Cost to Make x curve: anyone
         --         can level a crafter, so cost holds the price down. ("cost")
@@ -653,8 +668,8 @@ function SmartPricing:GetBounds(candidate)
         local ceiling, ceilingKind = nil, nil
         local currentCraft = bounds.costToMake and not bounds.pastExpansion
         if bounds.marketValue and bounds.confidence == "confident" then
-            bounds.multiplier = 1
-            ceiling, ceilingKind = bounds.marketValue, "value"
+            bounds.multiplier = CONFIDENT_MAX_MULT
+            ceiling, ceilingKind = bounds.marketValue * CONFIDENT_MAX_MULT, "value"
         elseif currentCraft then
             bounds.multiplier = self:CurveMultiplier(bounds.costToMake)
             ceiling, ceilingKind = bounds.costToMake * (bounds.multiplier or MIN_MULT), "cost"
@@ -674,6 +689,12 @@ function SmartPricing:GetBounds(candidate)
         elseif bounds.lastSale then
             bounds.multiplier = SALE_MULTIPLIER
             ceiling, ceilingKind = bounds.lastSale * SALE_MULTIPLIER, "sale"
+        end
+        -- Headroom on every max except the confident value (already 1.5x).
+        -- 2026-11-15: replaces the evaluator's 10% near-max match.
+        if ceiling and ceilingKind ~= "value" then
+            bounds.multiplier = (bounds.multiplier or 1) * MAX_HEADROOM
+            ceiling = ceiling * MAX_HEADROOM
         end
         if ceiling then
             bounds.ceilingBase = ceilingKind
@@ -697,12 +718,28 @@ function SmartPricing:GetBounds(candidate)
         end
         -- Nobody else listing: post at the value only when there's enough
         -- evidence behind it (Brian, 2026-11-04). Kept between floor and max.
+        -- No one else listing and only a last sale: post at 2x it, not at
+        -- the max (the max has 10% headroom on top, 2026-11-15).
+        if bounds.ceilingBase == "sale" and bounds.lastSale then
+            local price = math.max(SilverDown(bounds.lastSale * SALE_MULTIPLIER), bounds.floor or 0)
+            bounds.salePrice = math.min(price, bounds.ceiling)
+        end
         if bounds.marketValue and bounds.confidence == "confident" then
             local price = math.max(SilverDown(bounds.marketValue), bounds.floor or 0)
             if bounds.ceiling then
                 price = math.min(price, bounds.ceiling)
             end
             bounds.valuePrice = price
+        -- Value from few listings, but a better version caps the max
+        -- (Brian, 2026-11-15): post at the max, Ready. We'd never post above
+        -- it whatever else we learned, so it needs no check (Farstrider
+        -- Hobbyist Rod: few-listings value 177g, 40% of the blue = 280g ->
+        -- 280g). Not when the max was raised to the floor.
+        -- Not when the value itself came from the better version
+        -- (valueFromLadder): then nothing about this item backs it.
+        elseif bounds.marketValue and bounds.ceilingBase == "rule" and bounds.ruleCapFrom
+            and bounds.ceiling and not bounds.ceilingAtFloor and not bounds.valueFromLadder then
+            bounds.valuePrice = bounds.ceiling
         -- Value from few listings: still a price, but the player checks it
         -- ("Check the price" group, Brian 2026-11-06). Same floor / max.
         -- valueAtFloor = the value was below the floor, so this is the floor.

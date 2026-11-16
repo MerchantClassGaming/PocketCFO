@@ -7,7 +7,6 @@ local PostingEvaluator = {}
 
 -- Smart view: a cheapest listing up to this much above the max is matched,
 -- not undercut (Brian, 2026-11-07).
-local NEAR_MAX_MATCH = 1.10
 
 local function NumberOrNil(value)
     value = tonumber(value)
@@ -158,6 +157,14 @@ local function Gold(copper)
     end
     -- Two biggest coins (core PocketCFO:FormatMoney, 2026-11-05).
     return _G.PocketCFO:FormatMoney(copper)
+end
+
+-- The max comes from a better version (not raised to the floor), and the
+-- value is this item's own (not filled in from that better version): a
+-- price at that max needs no check (Brian, 2026-11-15).
+local function BetterVersionMax(bounds)
+    return bounds and bounds.ceilingBase == "rule" and bounds.ruleCapFrom ~= nil
+        and not bounds.ceilingAtFloor and not bounds.valueFromLadder
 end
 
 local function BelowFloorNote(bounds)
@@ -352,32 +359,118 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         -- floor it's ignored (never a reason to skip), above the max it's
         -- the max. Check the price.
         local groupPrice = NumberOrNil(bounds.groupPrice)
-        if groupPrice and groupPrice > 0 and not (floor and groupPrice < floor) then
-            local price, note = groupPrice, "No other listings for this stat. Matched a similar stat (" .. Gold(groupPrice) .. ")."
-            if ceiling and ceiling > 0 and groupPrice > ceiling then
-                price = ceiling
-                note = "No other listings for this stat. A similar stat is listed higher (" .. Gold(groupPrice) .. "). Priced at the max."
+        -- Confident value and a similar-stat listing (Brian, 2026-11-15:
+        -- Turbo Junker's, value 2,053g, Multicraft at 2,020g): the higher of
+        -- the two, never above the max. Ready.
+        local confidentPrice = bounds.confidence == "confident" and NumberOrNil(bounds.valuePrice) or nil
+        if confidentPrice and confidentPrice > 0 and groupPrice and groupPrice > 0
+            and not (floor and groupPrice < floor) then
+            local price, note = confidentPrice, "No other listings. Priced at its value."
+            if groupPrice > confidentPrice then
+                price, note = groupPrice, "No other listings. Matched a similar stat (" .. Gold(groupPrice) .. ")."
             end
-            local result = Result(true, price, note .. dealNote)
+            if ceiling and ceiling > 0 and price >= ceiling then
+                price, note = ceiling, "No other listings. Priced at the highest we'd match."
+            end
+            return Result(true, price, note .. dealNote)
+        end
+        -- Value not confident and the max comes from cost to make x curve
+        -- (Brian, 2026-11-15: Farstrider Clampers, value 177g, similar stat
+        -- 564g, max 758g): post at the max, Check. Cost doesn't come from
+        -- listings, so our post can't raise the next max (no runaway); a
+        -- similar stat never pulls it down. Not for a value under the floor
+        -- (the floor rules below), not for maxes built from market value
+        -- (drops, older expansions: those would feed on our own post).
+        local valueForCost = NumberOrNil(bounds.marketValue)
+        if bounds.confidence ~= "confident" and bounds.ceilingBase == "cost"
+            and not bounds.ceilingAtFloor and ceiling and ceiling > 0
+            and valueForCost and not (floor and valueForCost < floor) then
+            local result = Result(true, ceiling, "No other listings. Priced at the highest we'd match." .. dealNote)
             result.check = true
             return result
         end
-        if bounds.ceilingBase == "sale" and ceiling and ceiling > 0 then
-            local result = Result(true, ceiling, "No other listings. 2x your last sale." .. dealNote)
+        if groupPrice and groupPrice > 0 and not (floor and groupPrice < floor) then
+            local price, note = groupPrice, "No other listings. Matched a similar stat (" .. Gold(groupPrice) .. ")."
+            local check = true
+            if ceiling and ceiling > 0 and groupPrice > ceiling then
+                price = ceiling
+                note = "No other listings. Similar stat at " .. Gold(groupPrice) .. ", priced at highest we'd match."
+                -- A better version set the max: we'd never post above it,
+                -- so it's Ready, and the similar stat's price doesn't matter
+                -- (Brian, 2026-11-15: Junker's Multi-Tool).
+                if BetterVersionMax(bounds) then
+                    check = false
+                    note = "No other listings. Priced at the highest we'd match."
+                end
+            end
+            local result = Result(true, price, note .. dealNote)
+            result.check = check or nil
+            return result
+        end
+        -- Nobody listing and the price would land on the floor (Brian,
+        -- 2026-11-15): value under the floor, 2x last sale under it, or the
+        -- max raised to it. Nobody to compete with, so supply is the
+        -- limit and the floor is a fair price:
+        --   - a better version is priced below our floor -> Too Cheap (Your
+        --     call), no price: buyers take the better one for less;
+        --   - floor from disenchant / vendor -> Too Cheap, no price: a few
+        --     % over a sure thing isn't worth the deposit and reposting;
+        --   - floor from cost to make -> Ready at the floor.
+        -- A similar-stat listing below the floor doesn't count (Brian:
+        -- the buyer who wants this stat still buys ours). Found: War Within
+        -- Lapidary Bismuth Clamps (Ingenuity), value 75g, cost 246g -> 270g.
+        local marketValue = NumberOrNil(bounds.marketValue)
+        local lastSale = NumberOrNil(bounds.lastSale)
+        local wouldPost = NumberOrNil(bounds.valuePrice) or NumberOrNil(bounds.checkPrice)
+            or (bounds.ceilingBase == "sale" and NumberOrNil(bounds.salePrice))
+        -- A better version that caps above the floor keeps its own rule
+        -- (post at the max, 2026-11-15 Farstrider Hobbyist Rod).
+        local capAboveFloor = bounds.ceilingBase == "rule" and not bounds.ceilingAtFloor
+        if floor and floor > 0 and wouldPost and wouldPost > 0 and not capAboveFloor
+            and ((marketValue and marketValue < floor)
+                or bounds.ceilingAtFloor
+                or (bounds.ceilingBase == "sale" and lastSale and lastSale * 2 < floor)) then
+            local tooCheap
+            if bounds.floorSource == "disenchant" then
+                tooCheap = "Consider disenchanting."
+            elseif bounds.floorSource == "vendor" then
+                tooCheap = "Consider selling to a vendor."
+            elseif bounds.ceilingBase == "rule" and bounds.ceilingAtFloor then
+                tooCheap = "Better version sells for less than it costs to make."
+            end
+            if bounds.ceilingBase == "rule" and bounds.ceilingAtFloor and bounds.floorSource ~= "cost" then
+                tooCheap = "Better version sells for less. " .. tooCheap
+            end
+            if tooCheap then
+                local result = Result(false, nil, "No other listings. " .. tooCheap .. dealNote)
+                result.status = "Too Cheap"
+                result.suggestedPrice = nil
+                return result
+            end
+            return Result(true, floor, "No other listings. Priced at the lowest we'd match." .. dealNote)
+        end
+        local salePrice = NumberOrNil(bounds.salePrice) or ceiling
+        if bounds.ceilingBase == "sale" and salePrice and salePrice > 0 then
+            local result = Result(true, salePrice, "No other listings. 2x your last sale." .. dealNote)
             result.check = true
             return result
         end
         local valuePrice = NumberOrNil(bounds.valuePrice)
         if valuePrice and valuePrice > 0 then
-            local why = bounds.ceilingBase == "rule" and "Priced below the better version." or "Priced at its value."
+            -- At the better-version max (2026-11-15: also the few-listings
+            -- case, SmartPricing) vs at the value below it.
+            local why = "Priced at its value."
+            if bounds.ceilingBase == "rule" and ceiling and valuePrice >= ceiling then
+                why = "Priced at the highest we'd match."
+            end
             if bounds.ceilingAtFloor then
-                why = "Its value is under the lowest we'd post, so priced there."
+                why = "Its value is under the lowest we'd match, so priced there."
             end
             return Result(true, valuePrice, "No other listings. " .. why .. dealNote)
         end
         local checkPrice = NumberOrNil(bounds.checkPrice)
         if checkPrice and checkPrice > 0 then
-            local note = bounds.valueAtFloor and "No other listings. Few listings seen, and the value is under the lowest we'd post, so priced there."
+            local note = bounds.valueAtFloor and "No other listings. Few listings seen, and the value is under the lowest we'd match, so priced there."
                 or "No other listings. Based on few listings, check the price."
             local result = Result(true, checkPrice, note .. dealNote)
             result.check = true
@@ -385,7 +478,7 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         end
         -- No starting price here: the floor (vendor / cost) isn't a price
         -- suggestion when we know nothing about the market (Brian, 2026-11-04).
-        local result = Result(false, nil, "Not enough price data. Type a price to post." .. dealNote)
+        local result = Result(false, nil, "No other listings. Type a price to post." .. dealNote)
         result.suggestedPrice = nil
         -- Not "Skipped": the player should act on it, so it stays bright and
         -- sorts above posted and skipped rows (Brian, 2026-11-04).
@@ -433,29 +526,21 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         result.suggestedPrice = nil
         return result
     end
-    -- Never undercut over a small gap (Brian, 2026-11-07): the max is there
-    -- to keep us off clown prices, not to shave a silver off a normal one.
-    -- Cheapest listing within 10% above the max -> match it. Not for a
-    -- better-version cap ("rule"): we never post above a better version.
-    if ceiling and ceiling > 0 and lowestPrice > ceiling
-        and bounds.ceilingBase ~= "rule"
-        and lowestPrice <= ceiling * NEAR_MAX_MATCH then
-        return Result(true, lowestPrice, "Matched lowest price." .. dealNote, lowestAuction)
-    end
+    -- The 10% near-max match (2026-11-07) moved into the max itself
+    -- (SmartPricing MAX_HEADROOM, 2026-11-15): above the max is always the max.
     if ceiling and ceiling > 0 and lowestPrice > ceiling then
         -- Nobody is listed at the max: we picked it (check, 2026-11-06).
         local note = "Others listed far higher. Priced at the max."
+        local check = true
         if bounds.ceilingBase == "rule" then
-            note = "Priced below the better version."
-        elseif bounds.ceilingBase == "value" or bounds.ceilingBase == "market"
-            or bounds.ceilingBase == "pastmarket" or bounds.ceilingBase == "lowvalue" then
-            note = "Others listed above its value. Priced at its value."
+            note = "Others higher. Priced at highest we'd match."
+            check = not BetterVersionMax(bounds)
         end
         if bounds.ceilingAtFloor then
-            note = "Others listed higher. Priced at the lowest we'd post."
+            note = "Others listed higher. Priced at the lowest we'd match."
         end
         local result = Result(true, ceiling, note .. dealNote, lowestAuction)
-        result.check = true
+        result.check = check or nil
         return result
     end
     return Result(true, lowestPrice, "Matched lowest price." .. dealNote, lowestAuction)

@@ -326,7 +326,23 @@ end
 -- shape core reads from C_TooltipInfo; else the tooltip's own left lines.
 -- ---------------------------------------------------------------------------
 
-local function IsBoundTooltip(tooltip, data)
+-- Recipes (Brian, 2026-11-15: Pattern: Stormrider's Leather Helm on Forever
+-- showed no PCFO Value): a recipe tooltip also shows the crafted item's
+-- tooltip, bind line included, so a pattern for a Binds when picked up item
+-- read as bound. For recipes the recipe's own bind type decides instead:
+-- Binds when picked up (1) or account / warband bound (7, 8, 9) = bound.
+-- Item data not loaded yet: the line check below, as before.
+-- Theoretical: bindType values on Forever (same C_Item.GetItemInfo call).
+local RECIPE_CLASS_ID = 9
+local RECIPE_BOUND_BIND_TYPES = { [1] = true, [7] = true, [8] = true, [9] = true }
+
+local function IsBoundTooltip(tooltip, data, itemLink)
+    if itemLink then
+        local ok, _, _, _, _, _, _, _, _, _, _, _, classID, _, bindType = pcall(GetItemInfo, itemLink)
+        if ok and tonumber(classID) == RECIPE_CLASS_ID then
+            return RECIPE_BOUND_BIND_TYPES[tonumber(bindType)] == true
+        end
+    end
     local core = _G.PocketCFO
     local classifier = (core and core.SoulboundClassifier) or _G.PocketCFO_SoulboundClassifier
     if not classifier or type(classifier.TooltipTextIsBound) ~= "function" then
@@ -568,7 +584,7 @@ local function OnItemTooltip(tooltip, data)
         SetLastLookup(itemLink, nil, nil, nil, "Quality reagent slot - per-quality lines")
         return
     end
-    local rows = GetRows(tooltip, itemLink, IsBoundTooltip(tooltip, data))
+    local rows = GetRows(tooltip, itemLink, IsBoundTooltip(tooltip, data, itemLink))
     DrawRows(tooltip, rows)
     SetLastLookup(itemLink, rows.marketKey, rows.value, rows.freshness, rows.note)
 end

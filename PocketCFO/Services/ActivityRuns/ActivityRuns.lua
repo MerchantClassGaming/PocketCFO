@@ -113,16 +113,11 @@
 --   was 10) without loot, ending at the last loot. Picking something else
 --   later just starts a new run.
 --
--- Questing (Brian, 2026-11-09): a quest accepted, an objective done or a
---   quest turned in ends the gathering run in progress at its last loot
---   (filed if it has MIN_RUN_LOOTS+, dropped otherwise). Herbs picked up
---   while questing then never reach a saved run or the popup, and don't drag
---   the gathering rate down with questing time. A real farm with one turn-in
---   splits into two runs. Gathering runs only: fishing, beast and paused runs
---   are left alone. Events confirmed on Forever 2026-11-09 (QUEST_ACCEPTED,
---   QUEST_WATCH_UPDATE, QUEST_TURNED_IN, each once with the quest ID).
---   Theoretical: retail payloads; QUEST_WATCH_UPDATE on kill objectives
---   (seen on an interact objective; a crafting objective fired nothing).
+-- Questing (Brian, 2026-11-15; replaces the 2026-11-09 rule): quest
+--   activity no longer ends a run. Players gathering while leveling were
+--   getting their runs cut on every quest pickup, objective and turn-in.
+--   Questing time counts in the run like any other gap; the run keeps its
+--   normal label. Only Stop or RUN_END_SECONDS without loot ends a run.
 --
 -- Messages (split 2026-10-26: rebuilding the ranking on every loot lagged each skin):
 --   MCG_ACTIVITY_RUNS_UPDATED - loot added to the run in progress (live numbers only)
@@ -1124,22 +1119,6 @@ function ActivityRuns:IsRunPaused(run)
     return run ~= nil and run.pausedAt ~= nil
 end
 
--- Quest activity ends the gathering run in progress (see "Questing" above).
--- Event arguments aren't used (CraftSim's bundled AceEvent can shift them).
-function ActivityRuns:OnQuestActivity(event)
-    local db = RunsDB()
-    local guid = PlayerGUID()
-    local run = db and guid and db.current[guid]
-    if not run or run.pausedAt or (run.activity or "gathering") ~= "gathering" then
-        return
-    end
-    local loots = run.loots or 0
-    if self:FinishRunIfEnded(guid, time(), true) then
-        SessionLog("run ended by quest activity (%s, loots=%d)", tostring(event), loots)
-        self:SendMessage("MCG_ACTIVITY_RUNS_FILED")
-    end
-end
-
 function ActivityRuns:StopRun(characterGUID)
     characterGUID = characterGUID or PlayerGUID()
     if self:FinishRunIfEnded(characterGUID, time(), true) then
@@ -1306,10 +1285,6 @@ function ActivityRuns:OnEnable()
     self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE", "OnInteractionHide")
     -- A container's average contents changed: its value may have too.
     self:RegisterMessage("MCG_CONTAINER_OPENED", "ClearPriceCache")
-    -- Questing ends a gathering run (2026-11-09).
-    for _, event in ipairs({ "QUEST_ACCEPTED", "QUEST_WATCH_UPDATE", "QUEST_TURNED_IN" }) do
-        pcall(self.RegisterEvent, self, event, "OnQuestActivity")
-    end
     if C_Timer and C_Timer.NewTicker then
         self.ticker = C_Timer.NewTicker(CHECK_SECONDS, function()
             ActivityRuns:CheckEndedRuns()

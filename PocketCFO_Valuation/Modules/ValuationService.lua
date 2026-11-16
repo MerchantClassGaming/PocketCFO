@@ -1468,9 +1468,16 @@ end
 --     the value is within 50%-2x of that sale price (2026-11-06)
 --   - stackable priced from >= MIN_UNITS units across >= 2 listings
 --   - anything else with >= MIN_LISTINGS listings of that exact version
---   - seen on >= MIN_DAYS days (ScanHistory)
--- Uncertain, whatever the above: today's price under 50% or over 2x the
--- item's recent history (MIN_DAYS+ days) - a dump or a clown.
+--   Listings alone (the two above, no sale of ours near the price), for a
+--   current-expansion crafted item: only when the value is no more than
+--   COST_CURVE_X x its cost to make x the posting curve (Brian, 2026-11-15:
+--   Sin'dorei Clampers, one 15,000g listing, cost 228g).
+--   Removed 2026-11-15: "seen on >= MIN_DAYS days" on its own. One seller
+--   holding a price for days is a seller waiting, not a market (the
+--   clampers: 1 listing, 8 days -> confident at 15,000g).
+-- Uncertain, unless our own recent sale backs the value (checked first,
+-- 2026-11-15): today's price under 50% or over 2x the item's recent
+-- history (MIN_DAYS+ days) - a dump or a clown.
 -- ---------------------------------------------------------------------------
 
 local CONFIDENCE_MIN_UNITS = 10
@@ -1479,6 +1486,47 @@ local CONFIDENCE_MIN_DAYS = 3
 local CONFIDENCE_SALE_DAYS = 30
 local CONFIDENCE_LOW_PCT = 0.5
 local CONFIDENCE_HIGH_X = 2
+-- Listings-only confidence for current-expansion crafted items: value at
+-- most this many times the cost-based max (2026-11-15). Tuning lever.
+local CONFIDENCE_COST_CURVE_X = 3
+
+-- True when GetItemInfo says the item is from an earlier expansion (same
+-- check as smart posting's past-expansion rule; unknown = current). Few
+-- players go back to craft old items, so cost doesn't hold their price down.
+local function IsPastExpansion(itemID)
+    local current = type(LE_EXPANSION_LEVEL_CURRENT) == "number" and LE_EXPANSION_LEVEL_CURRENT or nil
+    if not current and type(GetServerExpansionLevel) == "function" then
+        local ok, level = pcall(GetServerExpansionLevel)
+        current = ok and type(level) == "number" and level or nil
+    end
+    if not current or not itemID then
+        return false
+    end
+    local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+    local ok, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, expansion = pcall(getInfo, itemID)
+    expansion = ok and tonumber(expansion) or nil
+    return expansion ~= nil and expansion < current
+end
+
+-- Listings back the value up only when it's sane against cost: nil = no
+-- cost known (drops, mats, past-expansion crafted), true/false otherwise.
+local function WithinCostCurve(result, value)
+    local itemID = tonumber(result.itemID)
+    local costFn = PocketCFO_Valuation and PocketCFO_Valuation.CostToMake
+    local maxFn = PocketCFO_Valuation and PocketCFO_Valuation.CostCurveMax
+    if not itemID or type(costFn) ~= "function" or type(maxFn) ~= "function" or IsPastExpansion(itemID) then
+        return nil
+    end
+    local okCost, cost = pcall(costFn, itemID)
+    if not okCost or not tonumber(cost) then
+        return nil
+    end
+    local okMax, max = pcall(maxFn, cost)
+    if not okMax or not tonumber(max) then
+        return nil
+    end
+    return value <= max * CONFIDENCE_COST_CURVE_X
+end
 
 -- Answers are remembered with the price sheet (same version and time
 -- limit; Brian, 2026-11-07): the tooltip, the vendor-ceiling check and smart
@@ -1524,6 +1572,24 @@ ComputeConfidence = function(result)
     local daysSeen = rec and tonumber(rec.daysSeen) or 0
     local recent = rec and tonumber(rec.recent)
 
+    -- Our own sale first (Brian, 2026-11-15): someone paid that price,
+    -- which beats a history that clowns or dumps can pull around (Farstrider
+    -- Hardhat: value 991.50g, sold at 991g, uncertain because the raw
+    -- 2,888,888g clown was "far above usual").
+    if sales then
+        local ok, price, at = pcall(sales.GetLastSale, sales, result.configKey, result.itemID)
+        local now = GetServerTime and GetServerTime() or time()
+        -- A recent sale only backs the value up when it's close to it (same
+        -- 50%-2x band as the history check; Brian 2026-11-06: a 400g sale
+        -- made a 1,285g value "confident"). Far off, it says nothing either
+        -- way and the checks below decide.
+        price = tonumber(price)
+        if ok and price and price > 0 and at and now - at <= CONFIDENCE_SALE_DAYS * 86400
+            and value >= price * CONFIDENCE_LOW_PCT and value <= price * CONFIDENCE_HIGH_X then
+            return "confident", "soldRecently"
+        end
+    end
+
     if daysSeen >= CONFIDENCE_MIN_DAYS and recent and recent > 0 then
         -- A value from scan history is history: compare it, not the stale
         -- cached row it replaced (2026-11-06).
@@ -1540,32 +1606,22 @@ ComputeConfidence = function(result)
         end
     end
 
-    if sales then
-        local ok, price, at = pcall(sales.GetLastSale, sales, result.configKey, result.itemID)
-        local now = GetServerTime and GetServerTime() or time()
-        -- A recent sale only backs the value up when it's close to it (same
-        -- 50%-2x band as the history check; Brian 2026-11-06: a 400g sale
-        -- made a 1,285g value "confident"). Far off, it says nothing either
-        -- way and the checks below decide.
-        price = tonumber(price)
-        if ok and price and price > 0 and at and now - at <= CONFIDENCE_SALE_DAYS * 86400
-            and value >= price * CONFIDENCE_LOW_PCT and value <= price * CONFIDENCE_HIGH_X then
-            return "confident", "soldRecently"
-        end
-    end
-
     local listings = row and tonumber(row.listingCount)
     local units = row and tonumber(row.unitCount)
+    local byListings
     if listings and units and units > listings then
         -- Stackable: units across listings.
         if units >= CONFIDENCE_MIN_UNITS and listings >= 2 then
-            return "confident", "manyUnits"
+            byListings = "manyUnits"
         end
     elseif listings and listings >= CONFIDENCE_MIN_LISTINGS then
-        return "confident", "manyListings"
+        byListings = "manyListings"
     end
-    if daysSeen >= CONFIDENCE_MIN_DAYS then
-        return "confident", "seenManyDays"
+    if byListings then
+        if WithinCostCurve(result, value) == false then
+            return "uncertain", "farAboveCost"
+        end
+        return "confident", byListings
     end
     return "uncertain", "fewListings"
 end
