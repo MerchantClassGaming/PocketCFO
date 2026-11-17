@@ -1,4 +1,5 @@
-Retail and Forever
-Fixed an issue where completing quest objectives sometimes turned off an automated gold tracking run.
+Forever and Retail
 
-Additional work has been done to fine tune smart pricing rules for the auction house posting (still in beta). This feature is disabled by default but you can enable it in the settings which gives you a new way to post on the auction house much faster without needing to configure groups. This will be out of beta soon!
+Item Watcher now available. The item watcher will watch any item on the auction house and report back sales, new listings, expired and cancelled auctions of that item. There is a caveat here that it is a best guess, as Blizzard does not expose anywhere the actual successful auction data other than your own, so nobody knows for sure but Blizzard. This is the next best thing.
+
+To enable, you must go into settings and enable Auction House postings (and smart posting on Retail) which will give you a few more buttons on your Pocket CFO tab, including the item watcher tab. There will be a user guide up on our youtube channel, https://www.youtube.com/@MerchantClassGaming shortly.

@@ -707,9 +707,15 @@ function SmartPricing:GetBounds(candidate)
                 bounds.ceilingAtFloor = true
             end
         end
+        -- A better version for sale sets the max before cost to make does
+        -- (Brian, 2026-11-16: Farstrider Clampers max was cost x 12.1 while a
+        -- Sin'dorei Clampers Q5 sat at 3,997g). Cost x curve is only the max
+        -- when there's no better version; every other max is still only
+        -- lowered by the cap.
         if bounds.ruleCap then
             local capped = math.max(SilverDown(bounds.ruleCap), bounds.floor or 0)
-            if not bounds.ceiling or capped < bounds.ceiling then
+            if not bounds.ceiling or capped < bounds.ceiling
+                or (ceilingKind == "cost" and bounds.ruleCapFrom) then
                 bounds.ceiling = capped
                 bounds.ceilingBase = "rule"
                 ceilingKind = "rule"

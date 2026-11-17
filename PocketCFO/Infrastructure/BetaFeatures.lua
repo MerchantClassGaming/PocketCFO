@@ -268,7 +268,7 @@ function BetaFeatures:BuildBetaSection(panel, anchor)
     ahCheck, bottom = CreateSettingsCheck(panel, bottom, ahDef.label, ahDef.description, -12, -25)
     local smartCheck
     smartCheck = CreateSettingsCheck(panel, bottom, "Smart Posting",
-        "Prices everything in your bags for you. No rules to set up. Leave off to post with your own rules.",
+        "Prices everything in your bags for you. No rules to set up. Adds Item Watch: see if an item is selling. Leave off to post with your own rules.",
         -12, SUB_INDENT - 25)
 
     local function RefreshSmartEnabled()
@@ -318,7 +318,7 @@ function BetaFeatures:BuildForeverBetaSection(panel, anchor)
     intro:SetText("These features are still being built. Turn them on to try them out. Some things may not work yet.")
 
     local ahCheck = CreateSettingsCheck(panel, intro, "Auction House Posting",
-        "Adds Post and Cancel pages to the auction house tab. Prices everything in your bags for you. No rules to set up. Price scanning works without this.",
+        "Adds Post, Cancel and Item Watch pages to the auction house tab. Prices everything in your bags for you. No rules to set up. Item Watch shows if an item is selling. Price scanning works without this.",
         -14, BETA_INDENT)
 
     local function Refresh()

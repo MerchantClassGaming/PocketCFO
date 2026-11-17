@@ -167,6 +167,15 @@ local function BetterVersionMax(bounds)
         and not bounds.ceilingAtFloor and not bounds.valueFromLadder
 end
 
+-- Nobody lists this exact item and a better version for sale sets the max
+-- (Brian, 2026-11-16): say so, so "no other listings" doesn't read as "post
+-- it as high as I like", and the player doesn't need the tooltip to see why.
+local CAPPED_BY_BETTER_NOTE = "No exact listings. Capped by a better version for sale."
+
+local function CappedByBetter(bounds)
+    return bounds and bounds.ceilingBase == "rule" and not bounds.ceilingAtFloor
+end
+
 local function BelowFloorNote(bounds)
     local source = bounds and bounds.floorSource
     if source == "disenchant" then
@@ -371,6 +380,9 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
             end
             if ceiling and ceiling > 0 and price >= ceiling then
                 price, note = ceiling, "No other listings. Priced at the highest we'd match."
+                if CappedByBetter(bounds) then
+                    note = CAPPED_BY_BETTER_NOTE
+                end
             end
             return Result(true, price, note .. dealNote)
         end
@@ -400,7 +412,7 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
                 -- (Brian, 2026-11-15: Junker's Multi-Tool).
                 if BetterVersionMax(bounds) then
                     check = false
-                    note = "No other listings. Priced at the highest we'd match."
+                    note = CAPPED_BY_BETTER_NOTE
                 end
             end
             local result = Result(true, price, note .. dealNote)
@@ -466,7 +478,11 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
             if bounds.ceilingAtFloor then
                 why = "Its value is under the lowest we'd match, so priced there."
             end
-            return Result(true, valuePrice, "No other listings. " .. why .. dealNote)
+            local note = "No other listings. " .. why
+            if why == "Priced at the highest we'd match." and CappedByBetter(bounds) then
+                note = CAPPED_BY_BETTER_NOTE
+            end
+            return Result(true, valuePrice, note .. dealNote)
         end
         local checkPrice = NumberOrNil(bounds.checkPrice)
         if checkPrice and checkPrice > 0 then

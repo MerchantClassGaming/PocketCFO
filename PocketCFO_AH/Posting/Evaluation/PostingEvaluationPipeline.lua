@@ -422,6 +422,53 @@ local function SortEvaluatedRows(rows)
         return 3
     end
 
+    -- Smart view: inside each group, rows with the same note sit together, and
+    -- "Matched lowest price." goes first (Brian, 2026-11-16: those need no
+    -- thought; the rest he reads one kind at a time). The key is the note's
+    -- first sentence (two when it opens "No other listings."), cut at the
+    -- first number, "(" or color code so gold amounts don't split a kind.
+    -- Other kinds keep the order they first appear in, so re-sorting an
+    -- already sorted list changes nothing. Rules view rows keep their order.
+    local function NoteKey(row)
+        if not (row and row.resolvedRule and row.resolvedRule.smart == true) then
+            return ""
+        end
+        local note = tostring(row.evaluation and row.evaluation.note or row.note or "")
+        local stop = note:find("%. ")
+        if stop and note:sub(1, stop) == "No other listings." then
+            stop = note:find("%. ", stop + 2)
+        end
+        local key = stop and note:sub(1, stop) or note
+        local cut = key:find("[%d%(|]")
+        if cut then
+            key = key:sub(1, cut - 1)
+        end
+        return key
+    end
+
+    local function GroupByNote(bucketRows)
+        local order, byKey = {}, {}
+        for _, row in ipairs(bucketRows) do
+            local key = NoteKey(row)
+            if not byKey[key] then
+                byKey[key] = {}
+                if key == "Matched lowest price." then
+                    table.insert(order, 1, key)
+                else
+                    order[#order + 1] = key
+                end
+            end
+            byKey[key][#byKey[key] + 1] = row
+        end
+        local sorted = {}
+        for _, key in ipairs(order) do
+            for _, row in ipairs(byKey[key]) do
+                sorted[#sorted + 1] = row
+            end
+        end
+        return sorted
+    end
+
     for _, row in ipairs(rows or {}) do
         local bucket = GetSortBucket(row)
         buckets[bucket][#buckets[bucket] + 1] = row
@@ -429,7 +476,7 @@ local function SortEvaluatedRows(rows)
 
     local index = 1
     for bucketIndex = 1, #buckets do
-        for _, row in ipairs(buckets[bucketIndex]) do
+        for _, row in ipairs(GroupByNote(buckets[bucketIndex])) do
             rows[index] = row
             index = index + 1
         end

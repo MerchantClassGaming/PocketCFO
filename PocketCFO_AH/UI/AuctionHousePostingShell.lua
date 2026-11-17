@@ -52,6 +52,8 @@ local PAGE_ORDER = {
     { key = "ignore", title = "Ignore List", short = "Ignore List", frameKey = "IgnoreListPage" },
     -- Smart AH view only (replaces the four rule pages; SmartPricing.lua).
     { key = "keep", title = "Keep List", short = "Keep List", frameKey = "KeepListPage" },
+    -- Item Watch (2026-11-16, UI/SalesWatchUI.lua; was "Sales Watch"): smart view only.
+    { key = "watch", title = "Item Watch", short = "Item Watch", frameKey = "SalesWatchPage" },
 }
 
 local PAGE_BY_KEY = {}
@@ -68,9 +70,11 @@ local PAGE_TAB_WIDTHS = {
     noncrafted = 88,
     ignore = 88,
     keep = 82,
+    watch = 96,
 }
 
 local PAGE_DESCRIPTIONS = {
+    watch = "Is it selling? Pick an item and watch it for 3 minutes. Stay on this page while it runs.",
     keep = "Items this character won't sell. Leave Keep blank to keep them all, or type a number to sell only what's over it.",
     recipes = "Review and manage posting profiles and custom rules assigned to crafted items. For detailed recipe configuration, use the profession recipe window.",
     noncrafted = "Configure auction posting rules for non-crafted items such as gathered materials, world drops, transmog, and other sellable inventory.",
@@ -1161,6 +1165,41 @@ function AHPostingUI:EnsureShell()
     description:Hide()
     main.HeaderDescriptionLabel = description
 
+    -- Settings gear (Brian, 2026-11-16): same as the Gold window's gear
+    -- (PocketCFO_PnL GoldWindow.lua), so Smart Posting can be turned on from
+    -- the AH. Belongs to this tab (hidden with it), placed left of Blizzard's
+    -- close X. THEORETICAL: AuctionHouseFrame.CloseButton; falls back to our
+    -- tab's top-right corner. The AH stays open; settings changes apply live
+    -- (OnSettingsChanged).
+    local gear = CreateFrame("Button", nil, main)
+    gear:SetSize(18, 18)
+    local closeButton = _G.AuctionHouseFrame and _G.AuctionHouseFrame.CloseButton
+    if closeButton then
+        gear:SetPoint("RIGHT", closeButton, "LEFT", -10, 0)
+        -- Above the AH frame's border art, like the X itself.
+        gear:SetFrameLevel(closeButton:GetFrameLevel() + 1)
+    else
+        gear:SetPoint("TOPRIGHT", main, "TOPRIGHT", -12, -12)
+    end
+    gear:SetNormalTexture("Interface\\Buttons\\UI-OptionsButton")
+    gear:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+    gear:SetScript("OnClick", function()
+        local beta = PocketCFO and PocketCFO.GetModule and PocketCFO:GetModule("BetaFeatures", true)
+        if beta and beta.OpenSettings then
+            beta:OpenSettings()
+        end
+    end)
+    gear:SetScript("OnEnter", function(button)
+        GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Settings", 1, 1, 1)
+        GameTooltip:AddLine("Open the Pocket CFO settings.", nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    gear:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
+    main.SettingsButton = gear
+
     local panel = CreateFrame("Frame", "PocketCFOAHActiveContentPanel", main)
     panel:SetPoint("TOPLEFT", main, "TOPLEFT", 12, -44)
     panel:SetPoint("BOTTOMRIGHT", main, "BOTTOMRIGHT", -12, 42)
@@ -1201,9 +1240,9 @@ local function IsAuctionHouseBetaEnabled()
 end
 
 -- Smart AH view (SmartPricing.lua, not a beta feature): Dashboard, Post,
--- Cancel and Keep List only. The rules view keeps its pages and stays
+-- Cancel, Keep List and Item Watch only. The rules view keeps its pages and stays
 -- behind the beta toggle, unchanged.
-local SMART_PAGES = { dashboard = true, post = true, cancel = true, keep = true }
+local SMART_PAGES = { dashboard = true, post = true, cancel = true, keep = true, watch = true }
 
 local function IsSmartView()
     local smart = PocketCFO_AH and PocketCFO_AH.GetModule and PocketCFO_AH:GetModule("SmartPricing", true)
@@ -1214,7 +1253,9 @@ function AHPostingUI:IsPageAllowed(pageKey)
     if IsSmartView() then
         return SMART_PAGES[pageKey] == true
     end
-    if pageKey == "keep" then
+    -- Keep List and Item Watch are smart view only (Item Watch: Brian,
+    -- 2026-11-16, a reason to switch from rules to smart posting).
+    if pageKey == "keep" or pageKey == "watch" then
         return false
     end
     return pageKey == "dashboard" or IsAuctionHouseBetaEnabled()
@@ -1332,6 +1373,8 @@ function AHPostingUI:RefreshPage(pageKey)
         self:RenderIgnoreList(frame)
     elseif pageKey == "keep" then
         self:RenderKeepList(frame)
+    elseif pageKey == "watch" then
+        self:RenderSalesWatch(frame)
     elseif pageKey == "post" then
         self:RenderPostAuctions(frame)
     elseif pageKey == "cancel" then
@@ -2150,6 +2193,16 @@ function AHPostingUI:RefreshKeepListRows()
                 button:Show()
             end
         end
+    end
+end
+
+-- Item Watch page (UI/SalesWatchUI.lua builds it once, then refreshes).
+function AHPostingUI:RenderSalesWatch(parent)
+    local watchUI = PocketCFO_AH:GetModule("SalesWatchUI", true)
+    if watchUI and watchUI.Render then
+        watchUI:Render(parent)
+    else
+        AddChild(parent, CreateLabel(parent, "Item Watch unavailable.", 10, -12, 320, "GameFontRedSmall"))
     end
 end
 
