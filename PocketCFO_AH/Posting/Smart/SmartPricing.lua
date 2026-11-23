@@ -81,6 +81,8 @@ local SALE_MULTIPLIER = 2
 local CONFIDENT_MAX_MULT = 1.5
 local MAX_HEADROOM = 1.10
 local FOREVER_GOLD_SCALE = 0.1
+-- A sale of this exact version this recent raises the max (2026-11-17).
+local RECENT_SALE_SECONDS = 30 * 24 * 60 * 60
 
 local function IsForever()
     return PocketCFO and PocketCFO.flavor == "forever"
@@ -543,16 +545,16 @@ end
 -- Our own most recent sale (PocketCFO_Valuation SaleIndex: one quick lookup
 -- built once per few minutes from our listings and gold income). A sale is
 -- real evidence of what a buyer paid, so it sets the max price.
--- Returns copper per unit, source ("listing" | "income").
+-- Returns copper per unit, source ("listing" | "income"), sale time.
 local function LastSalePrice(configKey, itemID)
     local valuation = _G.PocketCFO_Valuation
     local index = valuation and valuation.GetModule and valuation:GetModule("SaleIndex", true)
     if not index or type(index.GetLastSale) ~= "function" then
         return nil
     end
-    local ok, price, _, source = pcall(index.GetLastSale, index, configKey, itemID)
+    local ok, price, at, source = pcall(index.GetLastSale, index, configKey, itemID)
     if ok and price then
-        return price, source
+        return price, source, tonumber(at)
     end
     return nil
 end
@@ -564,10 +566,12 @@ end
 --   ceiling, ceilingBase ("value" | "cost" | "lowvalue" | "market" | "pastmarket" | "sale" | "rule"), multiplier,
 --   pastExpansion, pricesLoading (estimate asked for mat data), checkPrice,
 --   valueAtFloor, needsRecipe ("ours" | "seed"),
---   lastSale, lastSaleSource, confidence ("confident" | "uncertain"),
+--   lastSale, lastSaleSource, lastSaleAt, ceilingFromSale, confidence ("confident" | "uncertain"),
 --   valuePrice (confident value, between floor and max), salePrice (2x last sale), ruleCap,
 --   ruleCapFrom ({ itemID, quality, price } of the better item behind ruleCap),
 --   valueFromLadder (value filled in from a better version), stackSize,
+--   ladderPrice (like item: the tool ladder set the max, 2026-11-20),
+--   ladderSameStat (a same-stat better version is listed), ladderUnchecked,
 --   usuallyPost (saved Usually Post, nil = default) }
 -- Any field can be nil. Never throws.
 function SmartPricing:GetBounds(candidate)
@@ -612,7 +616,15 @@ function SmartPricing:GetBounds(candidate)
             bounds.ruleCap = ladderCap
             bounds.ruleCapFrom = marketResult.ladderCapFrom
         end
-        bounds.lastSale, bounds.lastSaleSource = LastSalePrice(configKey, itemID)
+        -- Like item (Brian, 2026-11-20): the cap came from the tool ladder
+        -- (ValuationRuleSet tool-tier-cap), so a better version for sale is
+        -- the closest price signal. ladderSameStat: one with this item's own
+        -- stat. ladderUnchecked: posting couldn't search the better versions
+        -- live this pass (PostingEvaluationPipeline), so the ladder keeps
+        -- its old role (only lowers the max).
+        bounds.ladderSameStat = (marketResult and marketResult.ladderSameStat) and true or nil
+        bounds.ladderUnchecked = candidate.ladderUnchecked and true or nil
+        bounds.lastSale, bounds.lastSaleSource, bounds.lastSaleAt = LastSalePrice(configKey, itemID)
         bounds.groupPrice, bounds.groupStats = SameGroupListing(itemLink, itemID)
         bounds.stackSize = StackSize(itemLink, itemID)
 
@@ -623,7 +635,17 @@ function SmartPricing:GetBounds(candidate)
         -- crafted item still has a replacement cost). needsRecipe = "ours"
         -- (open the recipe) | "seed" (mats not priced yet). The evaluator
         -- skips the row.
-        if not bounds.costToMake then
+        -- Also-looted items (RecipeSeed:IsAlsoLooted, Brian 2026-11-20:
+        -- Midnight motes) price like drops: never asks for a recipe.
+        local alsoLooted = false
+        do
+            local seed = PocketCFO and PocketCFO.RecipeSeed
+            if seed and type(seed.IsAlsoLooted) == "function" then
+                local okLooted, looted = pcall(seed.IsAlsoLooted, seed, itemID)
+                alsoLooted = okLooted and looted == true
+            end
+        end
+        if not bounds.costToMake and not alsoLooted then
             local seed = PocketCFO and PocketCFO.RecipeSeed
             local okCraftable, craftable = pcall(function()
                 return seed and seed:IsCraftable(itemID, candidate.itemName)
@@ -712,14 +734,42 @@ function SmartPricing:GetBounds(candidate)
         -- Sin'dorei Clampers Q5 sat at 3,997g). Cost x curve is only the max
         -- when there's no better version; every other max is still only
         -- lowered by the cap.
+        -- Like items (Brian, 2026-11-20): a better version for sale on the
+        -- tool ladder sets the max before every other max, our confident
+        -- value x 1.5 included: it's what a buyer weighs this item against
+        -- today. Not when posting couldn't search the better versions live
+        -- (bounds.ladderUnchecked): then the cap only lowers, as before.
+        local ladderSetsMax = bounds.ruleCapFrom and bounds.ruleCapFrom.ladder and not bounds.ladderUnchecked
         if bounds.ruleCap then
             local capped = math.max(SilverDown(bounds.ruleCap), bounds.floor or 0)
             if not bounds.ceiling or capped < bounds.ceiling
-                or (ceilingKind == "cost" and bounds.ruleCapFrom) then
+                or (ceilingKind == "cost" and bounds.ruleCapFrom) or ladderSetsMax then
                 bounds.ceiling = capped
                 bounds.ceilingBase = "rule"
                 ceilingKind = "rule"
                 bounds.ceilingAtFloor = (bounds.floor and SilverDown(bounds.ruleCap) < bounds.floor) or nil
+                bounds.ladderPrice = ladderSetsMax and true or nil
+            end
+        end
+        -- A recent sale of this exact version raises the max to it (Brian,
+        -- 2026-11-17: Turbo Junker's Multi-Tool Resourcefulness, max 700g
+        -- from cost x curve, our sale at 1,059g, others at 2,928g). A buyer
+        -- paid it, so it's evidence; it only ever raises the max, no
+        -- headroom on top. Exact version only: SaleIndex "listing" source
+        -- (configKey). Its "income" fallback is by itemID, so a Multicraft
+        -- sale would raise a Resourcefulness max. Not over a better-version
+        -- max ("rule": never above a better version) or a max that is
+        -- already 2x the last sale ("sale").
+        local saleAt = tonumber(bounds.lastSaleAt)
+        local nowTime = (GetServerTime and GetServerTime()) or time()
+        if bounds.lastSale and bounds.lastSaleSource == "listing" and saleAt and saleAt > 0
+            and nowTime - saleAt <= RECENT_SALE_SECONDS
+            and bounds.ceiling and bounds.ceilingBase ~= "rule" and bounds.ceilingBase ~= "sale" then
+            local salePrice = SilverDown(bounds.lastSale)
+            if salePrice > bounds.ceiling then
+                bounds.ceiling = salePrice
+                bounds.ceilingFromSale = true
+                bounds.ceilingAtFloor = nil
             end
         end
         -- Nobody else listing: post at the value only when there's enough

@@ -56,13 +56,34 @@
 -- Item Ledger writes (2026-10-30, claude/Item_Ledger_Design.md build step 1):
 -- this reader is the only writer of items and currencies coming in (and
 -- currency spends). Each thing is written once:
---   - Loot windows: every item slot (slotType 1), at LOOT_CLOSED, category
---     from the context (gathering, fishing, looted = kill, disenchant, other,
---     container), src = the slot's first source ID (node object ID, mob npcID,
---     disenchanted itemID). "Looted" chat lines are never written (every one
---     matched a window slot in-game 2026-10-30). Currency and gold slots are
---     left to the currency event and GoldLedger. Activity counted per window
---     (per corpse for kills).
+--   - Loot windows: item slots (slotType 1), category from the context
+--     (gathering, fishing, looted = kill, disenchant, other, container), src =
+--     the slot's first source ID (node object ID, mob npcID, disenchanted
+--     itemID). Currency and gold slots are left to the currency event and
+--     GoldLedger. Activity counted per window (per corpse for kills, only
+--     corpses something was taken from).
+--   - Proof of loot (2026-11-22, Brian; Flavor: Both): a slot is written only
+--     as far as "You receive loot" lines show it reached your bags. Before
+--     this every slot was written at LOOT_CLOSED, so on Forever group loot a
+--     roll item counted whether you won it or not, and reopening the corpse
+--     counted it again; full bags or a window closed with items left did the
+--     same on both clients. Rules:
+--       - "Looted" lines are collected on the open window, or on the window
+--         that closed within LINE_GRACE_SECONDS. A normal window is written
+--         LINE_GRACE_SECONDS after it closes (container windows with their
+--         opening); each slot takes what the lines show for its item.
+--       - Slots not taken are kept UNCLAIMED_SECONDS (one per item per
+--         source, so reopening a corpse doesn't add another). A later
+--         "looted" line for that item (a roll win) is written then, with the
+--         slot's category and source.
+--       - A "looted" line that matches nothing is written as looted, no
+--         source (it is in your bags). Skipped in craft context (the craft
+--         capture writes those).
+--     In-game 2026-10-30 (retail): every "looted" line matched a window slot.
+--     Theoretical: Forever prints "You receive loot" for normal loot and for
+--     roll wins; lines arrive within LINE_GRACE_SECONDS of LOOT_CLOSED (a
+--     late line is still written through the unclaimed slot; only a
+--     disenchant's out entry and the corpse count need it in time).
 --   - Container openings: everything attached (lines, windows, currencies) is
 --     written as category container, src = container itemID, at the finish,
 --     with the openings counted. Ambiguous or not-opened records: each
@@ -195,6 +216,9 @@ local CONTAINER_FINISH_SECONDS = 2
 local MAX_CAST_SECONDS = 10
 local LOG_LIMIT = 300  -- raised from 50 for testing (2026-10-30): a crushing run filled 50 lines
 local DISENCHANT_SPELL_ID = 13262
+-- Proof of loot (2026-11-22, see header). Starting values, not measured.
+local LINE_GRACE_SECONDS = 2
+local UNCLAIMED_SECONDS = 300
 
 -- The one gathering spell list (2026-10-30: moved here from GatheringCapture,
 -- which reads it as LootReader.GATHER_SPELLS). spellID -> { profession =
@@ -261,6 +285,8 @@ local currencyTotals = {} -- [currencyID] = last total seen this session
 local openings = {}       -- container opening records not finished yet
 local current = nil       -- window being read
 local nextID = 0
+local lastClosed = nil    -- window closed within LINE_GRACE_SECONDS, still taking "looted" lines
+local unclaimed = {}      -- slots not taken: { iid, link, qty, cat, src, prof, x, guid, at }
 
 -- What's happening, for the ledger category of "received" lines and
 -- currencies (see header). Memory only.
@@ -550,32 +576,55 @@ local function WriteWindowItems(window, cat, src, countActivity)
         prof = GATHER_SPELLS[window.cast.spellID].profession
     end
     local activity, corpses = nil, {}
+    -- Proof of loot (2026-11-22): what the "looted" lines show, per item.
+    window.itemsWritten = true
+    local got = window.looted or {}
     for _, slot in ipairs(window.slots or {}) do
         local quantity = tonumber(slot.quantity) or 0
         if slot.slotType == 1 and slot.itemID and quantity > 0 then
-            local base = 0
-            for _, source in ipairs(slot.sources or {}) do
-                base = base + (tonumber(source.qty) or 0)
-                if source.type == "Creature" or source.type == "Vehicle" then
-                    corpses[source.guid] = source.id
-                end
-            end
             local slotSrc = src
             if not slotSrc and window.context == "container" then
                 slotSrc = window.containerUse and window.containerUse.itemID
             end
             slotSrc = slotSrc or SlotSource(slot)
-            activity = activity or slotSrc
-            local id = SafeWrite({
-                dir = "in", cat = cat, src = slotSrc, kind = "item", iid = slot.itemID, link = slot.link,
-                qty = quantity, base = (cat == "gathering" or cat == "fishing") and base > 0 and base or nil,
-                x = extra, prof = prof,
-            })
-            if id then
-                ids[#ids + 1] = id
+            local taken = math.min(quantity, got[slot.itemID] or 0)
+            got[slot.itemID] = (got[slot.itemID] or 0) - taken
+            if taken < quantity then
+                local first = slot.sources and slot.sources[1]
+                LootReader:RememberUnclaimed({ iid = slot.itemID, link = slot.link, qty = quantity - taken,
+                    cat = cat, src = slotSrc, prof = prof, x = extra, guid = first and first.guid })
+                window.notTaken = window.notTaken or {}
+                window.notTaken[#window.notTaken + 1] = { itemID = slot.itemID, link = slot.link, quantity = quantity - taken }
+            end
+            if taken > 0 then
+                local base = 0
+                for _, source in ipairs(slot.sources or {}) do
+                    base = base + (tonumber(source.qty) or 0)
+                    if source.type == "Creature" or source.type == "Vehicle" then
+                        corpses[source.guid] = source.id
+                    end
+                end
+                activity = activity or slotSrc
+                local id = SafeWrite({
+                    dir = "in", cat = cat, src = slotSrc, kind = "item", iid = slot.itemID, link = slot.link,
+                    qty = taken,
+                    base = (cat == "gathering" or cat == "fishing") and base > 0 and taken == quantity and base or nil,
+                    x = extra, prof = prof,
+                })
+                if id then
+                    ids[#ids + 1] = id
+                end
             end
         end
     end
+    -- Lines left over (an item that wasn't a slot here, e.g. a roll win that
+    -- landed while this window was open).
+    for itemID, count in pairs(got) do
+        if count > 0 then
+            LootReader:WriteLooseLine(itemID, window.lootedLinks and window.lootedLinks[itemID], count)
+        end
+    end
+    window.looted, window.lootedLinks = nil, nil
     -- Disenchant (Going Out step 2, 2026-11-05): the item destroyed is the
     -- window's Item source (id and link resolved while the window was open,
     -- confirmed 2026-10-25). Written once as disenchant out, src = its itemID,
@@ -629,6 +678,52 @@ local function WriteWindowItems(window, cat, src, countActivity)
         end
     end
     return ids
+end
+
+-- Proof of loot (2026-11-22, see header): a slot not taken, kept for a later
+-- "looted" line (a roll win). One per item per source, so a corpse reopened
+-- doesn't add another.
+function LootReader:RememberUnclaimed(entry)
+    entry.at = GetTime()
+    for index = #unclaimed, 1, -1 do
+        local old = unclaimed[index]
+        if entry.at - old.at > UNCLAIMED_SECONDS then
+            table.remove(unclaimed, index)
+        elseif entry.guid and old.guid == entry.guid and old.iid == entry.iid then
+            table.remove(unclaimed, index)
+        end
+    end
+    unclaimed[#unclaimed + 1] = entry
+end
+
+-- A "looted" line with no window to go with: claims unclaimed slots for that
+-- item first (their category and source), the rest is written as looted.
+function LootReader:WriteLooseLine(itemID, link, quantity)
+    local remaining = tonumber(quantity) or 1
+    local now = GetTime()
+    local index = 1
+    while index <= #unclaimed and remaining > 0 do
+        local slot = unclaimed[index]
+        if now - slot.at > UNCLAIMED_SECONDS then
+            table.remove(unclaimed, index)
+        elseif slot.iid == itemID then
+            local take = math.min(remaining, slot.qty)
+            SafeWrite({ dir = "in", cat = slot.cat, src = slot.src, kind = "item", iid = itemID,
+                link = link or slot.link, qty = take, x = slot.x, prof = slot.prof })
+            remaining = remaining - take
+            slot.qty = slot.qty - take
+            if slot.qty <= 0 then
+                table.remove(unclaimed, index)
+            else
+                index = index + 1
+            end
+        else
+            index = index + 1
+        end
+    end
+    if remaining > 0 then
+        SafeWrite({ dir = "in", cat = "looted", kind = "item", iid = itemID, link = link, qty = remaining })
+    end
 end
 
 local function OnMailTake(mailIndex)
@@ -812,9 +907,23 @@ local function CloseWindow()
         attached = LootReader:AttachWindowToOpening(window, openedClock) or 0
     end
     -- Item Ledger: a window that belongs to a container opening is written
-    -- with the opening; any other window is written now.
+    -- with the opening; any other window LINE_GRACE_SECONDS from now, once
+    -- its last "looted" lines are in (proof of loot, 2026-11-22).
+    window.closedClock = GetTime()
+    lastClosed = window
     if attached == 0 then
-        window.ledgerIDs = WriteWindowItems(window, nil, nil, true)
+        if C_Timer and C_Timer.After then
+            C_Timer.After(LINE_GRACE_SECONDS, function()
+                if lastClosed == window then
+                    lastClosed = nil
+                end
+                if not window.itemsWritten then
+                    window.ledgerIDs = WriteWindowItems(window, nil, nil, true)
+                end
+            end)
+        else
+            window.ledgerIDs = WriteWindowItems(window, nil, nil, true)
+        end
     end
     LootReader:SendMessage("MCG_LOOT_WINDOW", window)
     local log = LogDB()
@@ -838,7 +947,27 @@ local function OnLootLine(text)
     end
     local line = { itemID = itemID, link = link, quantity = quantity, kind = kind, at = time(),
         windowOpen = current ~= nil }
-    if kind == "received" then
+    if kind == "looted" then
+        -- Proof of loot (2026-11-22, see header): the open window, or the one
+        -- that just closed, takes the line; otherwise it's written on its own.
+        local window = current
+        if not window and lastClosed and not lastClosed.itemsWritten
+            and (GetTime() - (lastClosed.closedClock or 0)) <= LINE_GRACE_SECONDS then
+            window = lastClosed
+        end
+        if window then
+            window.looted = window.looted or {}
+            window.lootedLinks = window.lootedLinks or {}
+            window.looted[itemID] = (window.looted[itemID] or 0) + (tonumber(quantity) or 1)
+            window.lootedLinks[itemID] = link
+            line.ctx = "loot window #" .. tostring(window.id)
+        elseif lastCraftAt and (GetTime() - lastCraftAt) <= CRAFT_CONTEXT_SECONDS then
+            line.ctx = "craft (written by craft capture)"
+        else
+            LootReader:WriteLooseLine(itemID, link, quantity)
+            line.ctx = "on its own (roll win or no window)"
+        end
+    elseif kind == "received" then
         -- Item Ledger: written now in its context, or with the container
         -- opening it belongs to (see header).
         local cat, src = ContextFor(GetTime())
@@ -1538,6 +1667,11 @@ function LootReader:BuildReport()
                 lines[#lines + 1] = string.format("        received %d vs sources %d (bonus %d)",
                     tonumber(s.quantity), base, tonumber(s.quantity) - base)
             end
+        end
+        -- Proof of loot (2026-11-22): slots no "looted" line showed reaching your bags.
+        for _, n in ipairs(w.notTaken or {}) do
+            lines[#lines + 1] = string.format("    NOT TAKEN (no loot line): %s x%s", tostring(n.link or n.itemID),
+                tostring(n.quantity))
         end
     end
     lines[#lines + 1] = ""

@@ -259,12 +259,31 @@ local function OptionLabel(option)
     return label
 end
 
-local function ClassifyKnowledge(itemRewards)
+-- First craft bonus: the first time you make a recipe it gives +1 knowledge
+-- (Brian, 2026-11-21). Read from recipeInfo.firstCraft (Blizzard's
+-- TradeSkillRecipeInfo field), with C_TradeSkillUI.IsRecipeFirstCraft as a
+-- backup when the field is missing. THEORETICAL: both are documented but
+-- not yet confirmed in-game on Midnight.
+local function IsFirstCraft(recipeID, recipeInfo)
+    if type(recipeInfo) == "table" and recipeInfo.firstCraft ~= nil then
+        return recipeInfo.firstCraft == true
+    end
+    if recipeID and C_TradeSkillUI and C_TradeSkillUI.IsRecipeFirstCraft then
+        local ok, result = pcall(C_TradeSkillUI.IsRecipeFirstCraft, recipeID)
+        return ok and result == true
+    end
+    return false
+end
+
+-- bonusPoints: knowledge from outside the rewards (the first craft bonus),
+-- added straight into the same total.
+local function ClassifyKnowledge(itemRewards, bonusPoints)
     local registry = PocketCFO_Orders.KnowledgeRewardRegistry
     if not registry then
         return nil
     end
-    local found, totalPoints, unknownAmount = false, 0, false
+    bonusPoints = tonumber(bonusPoints) or 0
+    local found, totalPoints, unknownAmount = bonusPoints > 0, bonusPoints, false
     for _, reward in ipairs(type(itemRewards) == "table" and itemRewards or {}) do
         local isKnowledge, points = registry:Classify(reward.itemID)
         if isKnowledge then
@@ -287,6 +306,45 @@ end
 
 -- The observation with one quality option's mats in place of the existing
 -- estimate, for EvaluateObservation. Shallow copy; the original is untouched.
+-- Concentration check (Brian, 2026-11-22): the board only plans on
+-- concentration you have right now. An option you can't afford isn't
+-- picked; if none of the ways to reach the quality is affordable, the order
+-- is "Can't make" (reason "concentration"). Unknown concentration (API
+-- missing) keeps the old behavior: the option counts as affordable.
+local function OptionAffordable(option)
+    local cost = tonumber(option and option.concentrationCost) or 0
+    if cost <= 0 then
+        return true
+    end
+    local have = GetConcentration(option.concentrationCurrencyID)
+    return have == nil or have >= cost
+end
+
+-- Which options are affordable right now, e.g. "10". A cached entry is
+-- rebuilt when this changes (concentration spent or recharged).
+local function AffordSignature(options)
+    local parts = {}
+    for _, option in ipairs(type(options) == "table" and options or {}) do
+        parts[#parts + 1] = OptionAffordable(option) and "1" or "0"
+    end
+    return table.concat(parts)
+end
+
+-- Asterisk only for mats YOU supply that have no price: they are left out
+-- of cost, so profit is overstated. Unpriced rewards (knowledge items
+-- etc.) only make the estimate conservative and are not flagged; customer
+-- mats never appear in these rows (Brian, 2026-10-12).
+local function HasUnvaluedMats(economics)
+    for _, rows in ipairs({ economics.crafterMaterialRows, economics.finishingReagentRows }) do
+        for _, row in ipairs(type(rows) == "table" and rows or {}) do
+            if row.unvalued then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function CopyWithCrafterRows(observation, crafterRows)
     local copy = {}
     for key, value in pairs(observation) do
@@ -312,6 +370,9 @@ local function BuildEntry(order)
     -- leaves the order treated as known rather than wrongly flagged.
     local okRecipe, recipeInfo = pcall(C_TradeSkillUI.GetRecipeInfo, SafeRead(order, "spellID"))
     entry.recipeKnown = not okRecipe or (type(recipeInfo) == "table" and recipeInfo.learned == true)
+    -- Only a recipe you know can earn the first craft bonus.
+    entry.firstCraft = okRecipe and type(recipeInfo) == "table" and recipeInfo.learned == true
+        and IsFirstCraft(SafeRead(order, "spellID"), recipeInfo) or false
 
     local builder = GetObservationBuilder()
     local economicsService = GetEconomicsService()
@@ -340,7 +401,7 @@ local function BuildEntry(order)
     for _, reward in ipairs(observation.currencyRewards or {}) do
         entry.rewardIcons[#entry.rewardIcons + 1] = { currencyID = reward.currencyID, quantity = reward.quantity }
     end
-    entry.knowledge = ClassifyKnowledge(observation.itemRewards)
+    entry.knowledge = ClassifyKnowledge(observation.itemRewards, entry.firstCraft and 1 or 0)
 
     local okEval, result = pcall(economicsService.EvaluateObservation, economicsService, observation)
     if not okEval or type(result) ~= "table" or result.resolved ~= true then
@@ -354,16 +415,29 @@ local function BuildEntry(order)
     -- a tie goes to the one using less concentration (Brian, 2026-10-23).
     -- No options = the existing single estimate above stands.
     entry.cannotReachQuality = observation.qualityUnreachable == true
+    entry.qualityUnreachable = entry.cannotReachQuality
     if type(observation.qualityOptions) == "table" and #observation.qualityOptions > 0 then
         local bestOption, bestResult, bestNet
         entry.optionResults = {}
+        entry.qualityOptions = observation.qualityOptions
+        entry.affordSignature = AffordSignature(observation.qualityOptions)
+        local cheapestUnaffordable
         for _, option in ipairs(observation.qualityOptions) do
             local optionObservation = CopyWithCrafterRows(observation, option.crafterProvidedReagents)
             local okOption, optionResult = pcall(economicsService.EvaluateObservation, economicsService, optionObservation)
             if okOption and type(optionResult) == "table" and optionResult.resolved == true then
                 local net = tonumber(optionResult.economics.estimatedNetValue)
-                entry.optionResults[#entry.optionResults + 1] = { option = option, net = net }
-                if net and (bestNet == nil or net > bestNet
+                local affordable = OptionAffordable(option)
+                entry.optionResults[#entry.optionResults + 1] = {
+                    option = option, net = net, affordable = affordable, result = optionResult,
+                }
+                if not affordable then
+                    local cost = tonumber(option.concentrationCost) or 0
+                    if not cheapestUnaffordable or cost < (tonumber(cheapestUnaffordable.concentrationCost) or 0) then
+                        cheapestUnaffordable = option
+                    end
+                end
+                if net and affordable and (bestNet == nil or net > bestNet
                     or (net == bestNet and (option.concentrationCost or 0) < (bestOption.concentrationCost or 0))) then
                     bestOption, bestResult, bestNet = option, optionResult, net
                 end
@@ -372,26 +446,21 @@ local function BuildEntry(order)
         if bestOption then
             result = bestResult
             entry.chosenOption = bestOption
+        elseif cheapestUnaffordable then
+            -- Every way to reach the quality needs more concentration than
+            -- you have: same treatment as an unreachable quality.
+            entry.cannotReachQuality = true
+            entry.cannotMakeReason = "concentration"
+            entry.concentrationNeed = tonumber(cheapestUnaffordable.concentrationCost)
+            entry.concentrationHave = GetConcentration(cheapestUnaffordable.concentrationCurrencyID)
         end
     end
 
     local economics = result.economics
     entry.economics = economics
     entry.estimatedNet = tonumber(economics.estimatedNetValue)
-
-    -- Asterisk only for mats YOU supply that have no price: they are left out
-    -- of cost, so profit is overstated. Unpriced rewards (knowledge items
-    -- etc.) only make the estimate conservative and are not flagged; customer
-    -- mats never appear in these rows (Brian, 2026-10-12).
-    local hasUnvalued = false
-    for _, rows in ipairs({ economics.crafterMaterialRows, economics.finishingReagentRows }) do
-        for _, row in ipairs(type(rows) == "table" and rows or {}) do
-            if row.unvalued then
-                hasUnvalued = true
-            end
-        end
-    end
-    entry.hasUnvalued = hasUnvalued
+    entry.baseResult = result
+    entry.hasUnvalued = HasUnvaluedMats(economics)
     return entry
 end
 
@@ -511,9 +580,32 @@ function PatronOrdersBoard:BuildFrames(orderList)
         overlay.expansionButtons[index] = button
     end
 
+    -- Shopping list (Brian, 2026-11-22): add the mats for this expansion's
+    -- orders. Right of the header; the status line sits left of them.
+    local addAll = CreateFrame("Button", nil, header, "UIPanelButtonTemplate")
+    addAll:SetSize(84, 22)
+    addAll:SetPoint("RIGHT", header, "RIGHT", 0, 0)
+    addAll:SetNormalFontObject("GameFontNormalSmall")
+    addAll:SetText("All orders")
+    addAll:SetScript("OnClick", function(clicked) self:AddOrderMats(false, clicked) end)
+    overlay.addAllButton = addAll
+
+    local addProfitable = CreateFrame("Button", nil, header, "UIPanelButtonTemplate")
+    addProfitable:SetSize(84, 22)
+    addProfitable:SetPoint("RIGHT", addAll, "LEFT", -4, 0)
+    addProfitable:SetNormalFontObject("GameFontNormalSmall")
+    addProfitable:SetText("Profitable")
+    addProfitable:SetScript("OnClick", function(clicked) self:AddOrderMats(true, clicked) end)
+    overlay.addProfitableButton = addProfitable
+
+    local addLabel = CreateText(header, "GameFontNormalSmall", "RIGHT")
+    addLabel:SetPoint("RIGHT", addProfitable, "LEFT", -6, 0)
+    addLabel:SetText("Add mats for:")
+    SetColor(addLabel, COLOR_HEADER)
+
     local status = CreateText(header, "GameFontNormalSmall", "RIGHT")
-    status:SetPoint("RIGHT", header, "RIGHT", 0, 0)
-    status:SetWidth(440)
+    status:SetPoint("RIGHT", addLabel, "LEFT", -12, 0)
+    status:SetWidth(300)
     overlay.status = status
 
     -- Column header
@@ -649,6 +741,13 @@ function PatronOrdersBoard:ShowRowTooltip(row)
     if entry.recipeKnown == false then
         GameTooltip:AddLine("You don't know this recipe on this character.", 1, 0.45, 0.45, true)
     end
+    if entry.cannotReachQuality and entry.cannotMakeReason == "concentration" then
+        GameTooltip:AddLine(string.format("Not enough concentration right now: you need %s, you have %s%s.",
+            tostring(entry.concentrationNeed or "?"), tostring(entry.concentrationHave or "?"),
+            entry.concentrationShared and " left after the orders above" or ""), 1, 0.45, 0.45, true)
+        GameTooltip:Show()
+        return
+    end
     if entry.cannotReachQuality then
         GameTooltip:AddLine("Your skill can't reach the quality this order needs, even with concentration.", 1, 0.45, 0.45, true)
         GameTooltip:Show()
@@ -689,6 +788,9 @@ function PatronOrdersBoard:ShowRowTooltip(row)
     local chosen = entry.chosenOption
     if chosen then
         GameTooltip:AddLine("Made with: " .. OptionLabel(chosen), 1, 1, 1, true)
+        if entry.concentrationShared then
+            GameTooltip:AddLine("Not enough concentration left for the concentration plan: it went to orders where it saves more.", 0.7, 0.7, 0.7, true)
+        end
         local cost = tonumber(chosen.concentrationCost) or 0
         local have = cost > 0 and GetConcentration(chosen.concentrationCurrencyID) or nil
         if have and have < cost then
@@ -713,6 +815,81 @@ end
 -- ---------------------------------------------------------------------------
 -- Actions
 -- ---------------------------------------------------------------------------
+
+-- "Add mats for: Profitable / All orders" (Brian, 2026-11-22; design:
+-- claude/Shopping_List_Design.md section 12). Retail-only (Orders addon).
+-- Walks this expansion's orders best profit first (the board's own sort)
+-- and adds each order's own mats - the ones its profit is based on - to the
+-- shopping list. Skips "Can't make" (recipe unknown, quality unreachable,
+-- not enough concentration) and unestimated orders. Concentration is
+-- counted across orders: an order whose concentration doesn't fit in
+-- what's left is skipped, never switched to another plan, so what's bought
+-- always matches a plan the board shows. What you own is taken off once,
+-- across all orders (normal ShoppingList:Add).
+local function OrderMatItems(economics)
+    local items = {}
+    for _, rows in ipairs({ economics.crafterMaterialRows, economics.finishingReagentRows }) do
+        for _, row in ipairs(type(rows) == "table" and rows or {}) do
+            local qty = tonumber(row.quantity)
+            if row.itemID and not row.currencyID and not row.notChosen and qty and qty > 0 then
+                items[#items + 1] = { itemID = row.itemID, qty = math.ceil(qty - 0.000001) }
+            end
+        end
+    end
+    return items
+end
+
+function PatronOrdersBoard:AddOrderMats(profitableOnly, button)
+    local list = PocketCFO and PocketCFO.ShoppingList
+    if not list then
+        return
+    end
+    -- The board already shared your concentration across these orders
+    -- (ShareConcentration), so each order's plan is one you can make.
+    local ordersAdded, concOrders, concUsed, toBuy = 0, 0, 0, 0
+    for _, entry in ipairs(self.lastEntries or {}) do
+        local makeable = entry.economics and entry.recipeKnown ~= false and not entry.cannotReachQuality
+        local wanted = makeable and (not profitableOnly or (entry.estimatedNet and entry.estimatedNet > 0))
+        if wanted then
+            local cost = tonumber(entry.chosenOption and entry.chosenOption.concentrationCost) or 0
+            if cost > 0 then
+                concOrders = concOrders + 1
+                concUsed = concUsed + cost
+            end
+            ordersAdded = ordersAdded + 1
+            for _, item in ipairs(OrderMatItems(entry.economics)) do
+                local result = list:Add(item.itemID, item.qty, "order")
+                toBuy = toBuy + (result and result.toBuy or 0)
+            end
+        end
+    end
+
+    local message
+    local orders = function(n) return n == 1 and "order" or "orders" end
+    if ordersAdded == 0 then
+        message = profitableOnly and "No profitable orders to add." or "No orders you can make right now."
+    else
+        if toBuy == 0 then
+            message = string.format("Mats for %d %s: you have them all", ordersAdded, orders(ordersAdded))
+        else
+            message = string.format("Added mats for %d %s", ordersAdded, orders(ordersAdded))
+        end
+        if concOrders > 0 then
+            message = message .. string.format(", %d %s %d concentration", concOrders,
+                concOrders == 1 and "uses" or "use", concUsed)
+        end
+        message = message .. "."
+    end
+    PocketCFO:Print(message)
+    if button then
+        local original = button.baseText or button:GetText()
+        button.baseText = original
+        button:SetText(ordersAdded > 0 and "Added" or "None")
+        C_Timer.After(2, function()
+            button:SetText(original)
+        end)
+    end
+end
 
 function PatronOrdersBoard:OpenOrder(entry)
     local ordersPage = GetOrdersPage()
@@ -1026,12 +1203,96 @@ local function BoardSignature(entries)
             tostring(entry.recipeKnown),
             tostring(entry.resourcefulnessPct),
             tostring(entry.cannotReachQuality),
+            tostring(entry.cannotMakeReason),
+            tostring(entry.concentrationShared),
             tostring(entry.chosenOption and entry.chosenOption.key),
             tostring(entry.chosenOption and entry.chosenOption.concentrationCost),
             tostring(ItemName(entry.itemID) ~= nil),
         }, ":")
     end
     return table.concat(parts, "|")
+end
+
+-- Shares your concentration across the orders on the board (Brian,
+-- 2026-11-22). BuildEntry picks each order's plan as if it were the only
+-- one; here the orders that want concentration get it in order of how much
+-- gold it saves them (concentration plan minus the best plan without it;
+-- for an order that can only be made with concentration, its whole
+-- profit, since without it the order isn't made at all), until it
+-- runs out. The rest switch to their best plan without concentration, or
+-- show "Can't make" if none reaches the quality. Runs on every refresh
+-- (entries are cached; the plans they choose between are not changed).
+local function ApplyPlan(entry, optionResult)
+    entry.chosenOption = optionResult.option
+    entry.economics = optionResult.result.economics
+    entry.estimatedNet = tonumber(optionResult.result.economics.estimatedNetValue)
+    entry.hasUnvalued = HasUnvaluedMats(entry.economics)
+    entry.cannotReachQuality = false
+    entry.cannotMakeReason = nil
+end
+
+local function ShareConcentration(entries)
+    local wanting = {}
+    for _, entry in ipairs(entries) do
+        entry.concentrationShared = nil
+        if type(entry.optionResults) == "table" and #entry.optionResults > 0
+            and not entry.qualityUnreachable and entry.recipeKnown ~= false then
+            local bestFree, bestConc
+            for _, optionResult in ipairs(entry.optionResults) do
+                local cost = tonumber(optionResult.option.concentrationCost) or 0
+                if optionResult.net then
+                    if cost <= 0 then
+                        if not bestFree or optionResult.net > bestFree.net then
+                            bestFree = optionResult
+                        end
+                    elseif OptionAffordable(optionResult.option) then
+                        if not bestConc or optionResult.net > bestConc.net
+                            or (optionResult.net == bestConc.net and cost < (tonumber(bestConc.option.concentrationCost) or 0)) then
+                            bestConc = optionResult
+                        end
+                    end
+                end
+            end
+            entry.bestFreePlan = bestFree
+            if bestConc and (not bestFree or bestConc.net > bestFree.net) then
+                wanting[#wanting + 1] = {
+                    entry = entry,
+                    plan = bestConc,
+                    gain = bestFree and (bestConc.net - bestFree.net) or bestConc.net,
+                }
+            elseif bestFree then
+                ApplyPlan(entry, bestFree)
+            end
+        end
+    end
+    table.sort(wanting, function(a, b)
+        if a.gain ~= b.gain then
+            return a.gain > b.gain
+        end
+        return tostring(a.entry.orderID) < tostring(b.entry.orderID)
+    end)
+    local remaining = {}
+    for _, want in ipairs(wanting) do
+        local option = want.plan.option
+        local cost = tonumber(option.concentrationCost) or 0
+        local currencyID = option.concentrationCurrencyID or 0
+        if remaining[currencyID] == nil then
+            remaining[currencyID] = GetConcentration(option.concentrationCurrencyID) or math.huge
+        end
+        if remaining[currencyID] >= cost then
+            remaining[currencyID] = remaining[currencyID] - cost
+            ApplyPlan(want.entry, want.plan)
+        elseif want.entry.bestFreePlan then
+            ApplyPlan(want.entry, want.entry.bestFreePlan)
+            want.entry.concentrationShared = true
+        else
+            want.entry.cannotReachQuality = true
+            want.entry.cannotMakeReason = "concentration"
+            want.entry.concentrationShared = true
+            want.entry.concentrationNeed = cost
+            want.entry.concentrationHave = math.max(0, remaining[currencyID])
+        end
+    end
 end
 
 -- Loading message with cycling dots so a long stage doesn't look frozen.
@@ -1131,6 +1392,9 @@ local function OrderFingerprint(order)
         tostring(SafeRead(order, "tipAmount")),
         tostring(SafeRead(order, "consortiumCut")),
         tostring(SafeRead(order, "minQuality")),
+        -- First craft flips off once you make the recipe, so other orders
+        -- for the same recipe drop their +1 without waiting for a reopen.
+        tostring(IsFirstCraft(SafeRead(order, "spellID"), nil)),
     }
     local reagents = SafeRead(order, "reagents")
     parts[#parts + 1] = tostring(type(reagents) == "table" and #reagents or 0)
@@ -1154,6 +1418,11 @@ function PatronOrdersBoard:GetEntry(order)
     local fingerprint = OrderFingerprint(order)
     local cached = orderID and self.entryCache[orderID]
     if cached and cached.fingerprint ~= fingerprint then
+        cached = nil
+    end
+    -- Concentration spent or recharged since: re-pick the plan.
+    if cached and cached.qualityOptions
+        and AffordSignature(cached.qualityOptions) ~= cached.affordSignature then
         cached = nil
     end
     if cached then
@@ -1277,6 +1546,7 @@ function PatronOrdersBoard:Refresh(forcedOrderType)
         entries[#entries + 1] = self:GetEntry(order)
     end
     self:PruneEntryCache(patronOrders)
+    ShareConcentration(entries)
     table.sort(entries, function(a, b)
         -- Orders you can't craft go to the bottom whatever they'd pay -
         -- you can't complete them (Brian, 2026-10-16). Same for orders

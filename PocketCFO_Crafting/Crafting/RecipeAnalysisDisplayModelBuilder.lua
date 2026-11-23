@@ -66,6 +66,9 @@ local function BuildItemRow(source, fallbackName)
         lineValue = source.lineValue,
         unvalued = source.unvalued == true,
         reason = source.reason,
+        -- Shopping list Add skips these (can't be bought on the AH).
+        bound = source.bound == true,
+        notChosen = source.notChosen == true,
     }
     if source.notChosen then
         row.name = source.slotName and string.format("%s (not chosen)", source.slotName) or "Reagent not chosen"

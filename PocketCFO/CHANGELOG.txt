@@ -1,5 +1,29 @@
 Forever and Retail
+Valuation now falls back to last scanned if Blizzard doesn't report a realm on login. This addresses a recent update from Blizzard (bug or "feature") where realm names are not always being sent.
 
-Item Watcher now available. The item watcher will watch any item on the auction house and report back sales, new listings, expired and cancelled auctions of that item. There is a caveat here that it is a best guess, as Blizzard does not expose anywhere the actual successful auction data other than your own, so nobody knows for sure but Blizzard. This is the next best thing.
+Shopping lists
+Add items to a shopping list from the recipe analysis window. This will look at reagents you already have in inventory (bags or bank) and add how many more you need to make the desired quantity of outputs. Open the shopping list at any time by shift+clicking on the Pocket CFO minimap icon. Add things manually to the list when the list is open.
 
-To enable, you must go into settings and enable Auction House postings (and smart posting on Retail) which will give you a few more buttons on your Pocket CFO tab, including the item watcher tab. There will be a user guide up on our youtube channel, https://www.youtube.com/@MerchantClassGaming shortly.
+Fixed 2 bugs causing the gold tracker to double count certain drops in dungeons.
+
+AH Smart Pricing
+Made the notes a little easier to understand what was really happening.
+
+Item Tooltips
+Now shows where and how many of an item you have.
+
+Gold Tracker
+Automatic gathering sessions now include gold earned from mob loot and chests collected during the run.
+
+Forever Only
+Merchant Favor analysis
+On the Pocket CFO Dashboard, you now have an "analysis" section. The first item added here is the crate analysis. Pushing the crate analysis button will run through all of the waylaid crates available and the cheapest way to fill them from current prices, giving you a "cost per favor" calculation and showing you the cheapest way to gain favor. Clicking the "add" button on the right side of the analysis will add missing items to your shopping list (1 add button for each line in the analysis).
+
+Gold Tracker no longer resets if you die in a dungeon and run back/reenter to resurrect.
+
+Retail Only
+Patron Orders
+Orders that will award 1 knowledge point for a first craft bonus now show the bonus in the order summary as +1KP (added to any rewards that also give knowledge points), meaning you can see +1, +2, or +3 KP depending on first craft bonus and rewards.
+
+Shopping lists
+On retail, you get buttons on the orders screens to add missing items to the shopping list to complete profitable orders or all orders.

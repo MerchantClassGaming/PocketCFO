@@ -343,6 +343,39 @@ end
 -- the search into the price cache here (the order SearchRefresh and this
 -- lookup get the search event in isn't guaranteed), then work the bounds
 -- out again. Rows without bounds (rules view) are left alone.
+local function ValuationModule(name)
+    local valuation = _G.PocketCFO_Valuation
+    if not valuation or type(valuation.GetModule) ~= "function" then
+        return nil
+    end
+    local ok, module = pcall(valuation.GetModule, valuation, name, true)
+    return ok and module or nil
+end
+
+-- Feed an item search's results into the price cache (SearchRefresh).
+-- Theoretical: each result row's itemKey is the key that was searched (one
+-- search per item key).
+local function FeedItemSearch(auctions)
+    local refresh = ValuationModule("SearchRefresh")
+    if not refresh or type(refresh.ProcessItemResults) ~= "function" then
+        return
+    end
+    local seen = {}
+    for _, auction in ipairs(auctions or {}) do
+        local itemKey = auction and auction.rawRow and auction.rawRow.itemKey
+        if type(itemKey) == "table" then
+            local token = table.concat({
+                tostring(itemKey.itemID), tostring(itemKey.itemLevel),
+                tostring(itemKey.itemSuffix), tostring(itemKey.battlePetSpeciesID),
+            }, ":")
+            if not seen[token] then
+                seen[token] = true
+                pcall(refresh.ProcessItemResults, refresh, itemKey)
+            end
+        end
+    end
+end
+
 local function RefreshSmartBounds(row, auctions)
     local rule = row and row.resolvedRule
     if type(rule) ~= "table" or type(rule.bounds) ~= "table" or not row.candidate then
@@ -352,31 +385,15 @@ local function RefreshSmartBounds(row, auctions)
     if not smart or type(smart.GetBounds) ~= "function" then
         return
     end
-    local valuation = _G.PocketCFO_Valuation
-    local refresh = valuation and valuation.GetModule and valuation:GetModule("SearchRefresh", true)
+    local refresh = ValuationModule("SearchRefresh")
     if refresh then
         if row.target and row.target.postAPI == "PostCommodity" then
             local itemID = tonumber(row.candidate.itemID or row.target.targetItemID)
             if itemID and type(refresh.ProcessCommodityResults) == "function" then
                 pcall(refresh.ProcessCommodityResults, refresh, itemID)
             end
-        elseif type(refresh.ProcessItemResults) == "function" then
-            -- Theoretical: each result row's itemKey is the key that was
-            -- searched (one search per item key).
-            local seen = {}
-            for _, auction in ipairs(auctions or {}) do
-                local itemKey = auction and auction.rawRow and auction.rawRow.itemKey
-                if type(itemKey) == "table" then
-                    local token = table.concat({
-                        tostring(itemKey.itemID), tostring(itemKey.itemLevel),
-                        tostring(itemKey.itemSuffix), tostring(itemKey.battlePetSpeciesID),
-                    }, ":")
-                    if not seen[token] then
-                        seen[token] = true
-                        pcall(refresh.ProcessItemResults, refresh, itemKey)
-                    end
-                end
-            end
+        else
+            FeedItemSearch(auctions)
         end
     end
     local ok, bounds = pcall(smart.GetBounds, smart, row.candidate)
@@ -386,6 +403,148 @@ local function RefreshSmartBounds(row, auctions)
         rule.minPrice = bounds.floor
         rule.maxPrice = bounds.ceiling
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Live better versions for like items (Brian, 2026-11-20). A green
+-- profession tool/accessory is priced from its blue partner on the tool
+-- ladder (Valuation ValuationRuleSet tool-tier-cap), so the blue needs the
+-- same live look as the item itself: one search per blue item ID per
+-- evaluation pass, shared by every row of that tool. Higher qualities of
+-- the item's own ID come back with its own search.
+-- After each finished search, price cache rows of that item ID it didn't
+-- see are marked "not listed" (PricingCache MarkNotListed) so a sold-out
+-- better version stops capping, in posting and in the item tooltip.
+-- Search not finished: the row keeps the old ladder role (only lowers the
+-- max) and goes to Check.
+-- Theoretical: the equipment search (SendSellSearchQuery, item level 0)
+-- returns every item level, so every quality, of the item ID. If it only
+-- returned one, other qualities would be marked not listed wrongly; the
+-- session log line "better versions" lists the item levels seen.
+-- Flavor: Both (Forever has no tool pairs, so nothing runs there).
+-- ---------------------------------------------------------------------------
+
+local GetItemInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+local GREEN = 2
+
+local function ServerNow()
+    return (GetServerTime and GetServerTime()) or time()
+end
+
+-- Mark rows the finished search didn't see as not listed. Returns the
+-- count marked, or nil when the search didn't finish (nothing marked).
+local function MarkSearched(itemID, sentAt, meta)
+    itemID = tonumber(itemID)
+    if not itemID or not sentAt or type(meta) ~= "table" then
+        return nil
+    end
+    if meta.completed ~= true or meta.requestMade ~= true or meta.sourceError then
+        return nil
+    end
+    local cache = ValuationModule("PricingCache")
+    if not cache or type(cache.MarkNotListed) ~= "function" then
+        return nil
+    end
+    local ok, marked = pcall(cache.MarkNotListed, cache, itemID, sentAt, ServerNow())
+    return ok and (tonumber(marked) or 0) or nil
+end
+
+local function ItemLevelsSeen(auctions)
+    local levels, seen = {}, {}
+    for _, auction in ipairs(auctions or {}) do
+        local ilvl = tonumber(auction and auction.ilvl)
+        if ilvl and not seen[ilvl] then
+            seen[ilvl] = true
+            levels[#levels + 1] = ilvl
+        end
+    end
+    table.sort(levels)
+    return table.concat(levels, ",")
+end
+
+-- Profession tool or accessory: the only items on the tool ladder.
+local LADDER_SLOTS = { INVTYPE_PROFESSION_TOOL = true, INVTYPE_PROFESSION_GEAR = true }
+local function IsLadderItem(candidate)
+    if type(candidate) ~= "table" then
+        return false
+    end
+    local equipLoc = candidate.equipLoc or candidate.inventoryType
+    if not equipLoc or equipLoc == "" then
+        local ok, _, _, _, _, _, _, _, _, loc = pcall(GetItemInfo, candidate.itemLink or candidate.itemID)
+        equipLoc = ok and loc or nil
+    end
+    return LADDER_SLOTS[equipLoc] == true
+end
+
+-- The blue partner of a green tool/accessory, or nil.
+local function BetterVersionPartner(candidate)
+    local itemID = tonumber(candidate and candidate.itemID)
+    local pairsModule = ValuationModule("ProfessionGearPairs")
+    if not itemID or not pairsModule or type(pairsModule.GetPartner) ~= "function" then
+        return nil
+    end
+    local okPartner, partnerID = pcall(pairsModule.GetPartner, pairsModule, itemID)
+    partnerID = okPartner and tonumber(partnerID) or nil
+    if not partnerID then
+        return nil
+    end
+    local okInfo, _, _, rarity = pcall(GetItemInfo, candidate.itemLink or itemID)
+    if not okInfo or tonumber(rarity) ~= GREEN then
+        return nil
+    end
+    return partnerID
+end
+
+local function CheckBetterVersions(controller, generation, row, continue)
+    local candidate = row and row.candidate
+    if type(candidate) ~= "table" then
+        continue()
+        return
+    end
+    candidate.ladderUnchecked = nil
+    local partnerID = IsLadderItem(candidate) and BetterVersionPartner(candidate) or nil
+    if not partnerID then
+        continue()
+        return
+    end
+    controller.ladderChecks = controller.ladderChecks or {}
+    local prior = controller.ladderChecks[partnerID]
+    if prior and prior.generation == generation then
+        candidate.ladderUnchecked = (not prior.ok) or nil
+        continue()
+        return
+    end
+    local lookup = PocketCFO_AH.AuctionLookupService or _G.AuctionLookupService
+    if not lookup or type(lookup.GetAuctionsForRow) ~= "function" then
+        candidate.ladderUnchecked = true
+        continue()
+        return
+    end
+    local partnerName, partnerLink, _, _, _, _, _, _, partnerEquipLoc = GetItemInfo(partnerID)
+    local equipLoc = partnerEquipLoc
+    if not equipLoc or equipLoc == "" then
+        equipLoc = candidate.equipLoc or candidate.inventoryType or "INVTYPE_PROFESSION_TOOL"
+    end
+    local partnerRow = {
+        itemName = partnerName,
+        itemLink = partnerLink,
+        candidate = { itemID = partnerID, itemName = partnerName, itemLink = partnerLink, equipLoc = equipLoc },
+    }
+    local sentAt = ServerNow()
+    lookup:GetAuctionsForRow(partnerRow, function(auctions, meta)
+        if generation ~= controller.generation then
+            return
+        end
+        FeedItemSearch(auctions)
+        local marked = MarkSearched(partnerID, sentAt, meta)
+        local ok = marked ~= nil
+        controller.ladderChecks[partnerID] = { generation = generation, ok = ok }
+        candidate.ladderUnchecked = (not ok) or nil
+        SessionLog("PostingEvaluationPipeline: better versions itemID=%s partnerID=%s finished=%s rows=%d itemLevels=%s markedNotListed=%s path=%s",
+            tostring(candidate.itemID), tostring(partnerID), tostring(ok), #(auctions or {}),
+            ItemLevelsSeen(auctions), tostring(marked), tostring(type(meta) == "table" and meta.path))
+        continue()
+    end)
 end
 
 local function SortEvaluatedRows(rows)
@@ -399,6 +558,21 @@ local function SortEvaluatedRows(rows)
         {},
     }
 
+    -- Smart view: a row in the middle of posting ("1 of 4 posted.") stays at
+    -- the very top, above "Matched lowest price.", until the rest are posted
+    -- (Brian, 2026-11-19). Without this its note changes after the first
+    -- post and it drops below the Matched lowest price rows.
+    local function InProgress(row)
+        if not (row and row.resolvedRule and row.resolvedRule.smart == true) then
+            return false
+        end
+        local status = row.evaluation and row.evaluation.status or row.status
+        local posting = row.posting
+        return status == "Ready" and type(posting) == "table"
+            and PositiveQuantity(posting.postedCount) > 0
+            and PositiveQuantity(posting.remainingToPost) > 0
+    end
+
     -- Smart view groups (Brian, 2026-11-04, 2026-11-06): Ready to post;
     -- Check the price (Ready with evaluation.check, until the player types a
     -- price); Your call (Needs Price, errors, then Too Cheap); Probably not
@@ -406,6 +580,9 @@ local function SortEvaluatedRows(rows)
     local function GetSortBucket(row)
         local status = row and row.evaluation and row.evaluation.status or row and row.status
         local smart = row and row.resolvedRule and row.resolvedRule.smart == true
+        if InProgress(row) then
+            return 1
+        end
         if status == "Ready" then
             local check = row.evaluation and row.evaluation.check == true
                 and not (row.overrides and row.overrides.price)
@@ -448,19 +625,27 @@ local function SortEvaluatedRows(rows)
 
     local function GroupByNote(bucketRows)
         local order, byKey = {}, {}
+        local inProgress = {}
         for _, row in ipairs(bucketRows) do
-            local key = NoteKey(row)
-            if not byKey[key] then
-                byKey[key] = {}
-                if key == "Matched lowest price." then
-                    table.insert(order, 1, key)
-                else
-                    order[#order + 1] = key
+            if InProgress(row) then
+                inProgress[#inProgress + 1] = row
+            else
+                local key = NoteKey(row)
+                if not byKey[key] then
+                    byKey[key] = {}
+                    if key == "Matched lowest price." then
+                        table.insert(order, 1, key)
+                    else
+                        order[#order + 1] = key
+                    end
                 end
+                byKey[key][#byKey[key] + 1] = row
             end
-            byKey[key][#byKey[key] + 1] = row
         end
         local sorted = {}
+        for _, row in ipairs(inProgress) do
+            sorted[#sorted + 1] = row
+        end
         for _, key in ipairs(order) do
             for _, row in ipairs(byKey[key]) do
                 sorted[#sorted + 1] = row
@@ -554,7 +739,7 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
     self.lookupCallActive = true
     self.continuePending = false
 
-    local function OnLookupComplete(auctions, lookupMeta)
+    local function FinishRow(auctions, lookupMeta)
         if generation ~= controller.generation then
             return
         end
@@ -588,6 +773,14 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
             lookupIncomplete = type(lookupMeta) == "table" and lookupMeta.completed == false or nil,
         }
         local result = AttachCanonicalResult(row, evaluator:Evaluate(row, matchedAuctions, marketSettings, evaluationContext), matchAnalysis)
+        -- Like item whose better versions couldn't be searched live this
+        -- pass (CheckBetterVersions): priced the old way, player checks it.
+        local rowBounds = row.resolvedRule and row.resolvedRule.bounds
+        if row.candidate and row.candidate.ladderUnchecked and type(result) == "table" and result.shouldPost
+            and type(rowBounds) == "table" and type(rowBounds.ruleCapFrom) == "table" and rowBounds.ruleCapFrom.ladder then
+            result.check = true
+            result.note = tostring(result.note or "") .. " Couldn't check the better versions."
+        end
         row.matchDebug = BuildMatchDebugReport(row, matchAnalysis, lookupMeta or {}, result, marketSettings)
         local coverageDebug = result and result.debug or {}
         local coverageDecision = result and result.shouldPost == true and "post" or "skip"
@@ -635,6 +828,23 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
         else
             self:EvaluateRow(controller, generation)
         end
+    end
+
+    -- Own search first, then the better versions (like items only), then
+    -- the bounds and the decision (FinishRow). Equipment only: commodities
+    -- have no ladder.
+    local searchSentAt = ServerNow()
+    local function OnLookupComplete(auctions, lookupMeta)
+        if generation ~= controller.generation then
+            return
+        end
+        if not (row.target and row.target.postAPI == "PostCommodity") and IsLadderItem(row.candidate) then
+            MarkSearched(row.candidate and row.candidate.itemID or row.target and row.target.targetItemID,
+                searchSentAt, lookupMeta)
+        end
+        CheckBetterVersions(controller, generation, row, function()
+            FinishRow(auctions, lookupMeta)
+        end)
     end
 
     -- Re-resolve the posting API at evaluation time so item cache is warm.

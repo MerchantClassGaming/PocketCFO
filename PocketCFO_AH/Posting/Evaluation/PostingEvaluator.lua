@@ -172,6 +172,26 @@ end
 -- it as high as I like", and the player doesn't need the tooltip to see why.
 local CAPPED_BY_BETTER_NOTE = "No exact listings. Capped by a better version for sale."
 
+-- The max was raised to a recent sale of this exact version (SmartPricing
+-- bounds.ceilingFromSale, Brian 2026-11-17): "your last sale (1,059g, 6
+-- days ago)".
+local function LastSaleText(bounds)
+    local text = "your last sale (" .. Gold(bounds.ceiling)
+    local at = tonumber(bounds.lastSaleAt)
+    local now = (GetServerTime and GetServerTime()) or time()
+    if at and at > 0 then
+        local days = math.floor((now - at) / 86400)
+        if days <= 0 then
+            text = text .. ", today"
+        elseif days == 1 then
+            text = text .. ", 1 day ago"
+        else
+            text = text .. ", " .. days .. " days ago"
+        end
+    end
+    return text .. ")"
+end
+
 local function CappedByBetter(bounds)
     return bounds and bounds.ceilingBase == "rule" and not bounds.ceilingAtFloor
 end
@@ -368,6 +388,31 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         -- floor it's ignored (never a reason to skip), above the max it's
         -- the max. Check the price.
         local groupPrice = NumberOrNil(bounds.groupPrice)
+        -- Like items (Brian, 2026-11-20): a better version for sale on the
+        -- tool ladder, searched live this pass, set the max
+        -- (bounds.ladderPrice). Use the closest signal:
+        --   1. a better version with our own stat is listed -> the max. Ready.
+        --   2. otherwise a similar-stat listing at our quality -> match it
+        --      (never above the max). Check.
+        --   3. otherwise (better version priced from another stat) -> the
+        --      max. Check.
+        -- Comes before our own value, confident or not. A max raised to the
+        -- floor goes to the floor rules below (Too Cheap / lowest we'd match).
+        if bounds.ladderPrice and ceiling and ceiling > 0 and not bounds.ceilingAtFloor then
+            if bounds.ladderSameStat then
+                return Result(true, ceiling, "No exact listings. Priced from a better version for sale." .. dealNote)
+            end
+            if groupPrice and groupPrice > 0 and not (floor and groupPrice < floor) and groupPrice < ceiling then
+                local result = Result(true, groupPrice,
+                    "No exact listings. Matched a similar stat (" .. Gold(groupPrice) .. ")." .. dealNote)
+                result.check = true
+                return result
+            end
+            local result = Result(true, ceiling,
+                "No exact listings. Priced from a better version with another stat." .. dealNote)
+            result.check = true
+            return result
+        end
         -- Confident value and a similar-stat listing (Brian, 2026-11-15:
         -- Turbo Junker's, value 2,053g, Multicraft at 2,020g): the higher of
         -- the two, never above the max. Ready.
@@ -397,6 +442,11 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         if bounds.confidence ~= "confident" and bounds.ceilingBase == "cost"
             and not bounds.ceilingAtFloor and ceiling and ceiling > 0
             and valueForCost and not (floor and valueForCost < floor) then
+            -- Max raised to a recent sale (2026-11-17): a buyer paid it, and
+            -- nobody is listing, so Ready.
+            if bounds.ceilingFromSale then
+                return Result(true, ceiling, "No other listings. Priced at " .. LastSaleText(bounds) .. "." .. dealNote)
+            end
             local result = Result(true, ceiling, "No other listings. Priced at the highest we'd match." .. dealNote)
             result.check = true
             return result
@@ -505,11 +555,9 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
     local lowestPrice = validAuctions[1].price
     local lowestAuction = validAuctions[1].auction
     debug.selectedCompetitionPrice = lowestPrice
-    if keptForCost then
-        local times = lowestPrice / NumberOrNil(bounds.costToMake)
-        dealNote = " Below other listings, but " .. string.format("%.1f", times):gsub("%.0$", "")
-            .. "x cost." .. dealNote
-    end
+    -- keptForCost (a cheap listing kept because it's still well above cost)
+    -- adds no Note (Brian, 2026-11-21): it read as different from a plain
+    -- match. Still in debug.keptForCost.
 
     -- Ours already selling next at the lowest price count toward Usually
     -- Post (Brian, 2026-11-04). Only those at the lowest price: undercut
@@ -554,6 +602,12 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         end
         if bounds.ceilingAtFloor then
             note = "Others listed higher. Priced at the lowest we'd match."
+        end
+        -- Max raised to a recent sale (2026-11-17): Check, since others
+        -- list higher and the player may want to go up.
+        if bounds.ceilingFromSale then
+            note = "Others listed far higher. Priced at " .. LastSaleText(bounds) .. "."
+            check = true
         end
         local result = Result(true, ceiling, note .. dealNote, lowestAuction)
         result.check = check or nil

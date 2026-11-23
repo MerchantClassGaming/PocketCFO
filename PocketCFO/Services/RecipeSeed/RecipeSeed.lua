@@ -172,6 +172,25 @@ function RecipeSeed:IsOurs(itemID, itemName)
     return false
 end
 
+-- Craftable, but mostly looted (Brian, 2026-11-20). These have a recipe
+-- (alchemy transmutes) but players get them from drops, so the recipe never
+-- sets the price: smart posting prices them like a drop and never asks for
+-- a recipe. IsCraftable still says yes, so Cost to Make and craft tracking
+-- keep working if someone does craft them. No item property says "also
+-- looted", so this is a hand-kept list. Add an itemID only when the item
+-- drops as is and the recipe is rarely used.
+local ALSO_LOOTED = {
+    [236949] = true, -- Midnight mote
+    [236950] = true, -- Midnight mote
+    [236951] = true, -- Midnight mote
+    [236952] = true, -- Midnight mote (Mote of Light)
+}
+
+function RecipeSeed:IsAlsoLooted(itemID)
+    itemID = NormalizeID(itemID)
+    return itemID ~= nil and ALSO_LOOTED[itemID] == true
+end
+
 -- Diagnostics: number of output items in the shipped seed.
 function RecipeSeed:SeedCount()
     local count = 0

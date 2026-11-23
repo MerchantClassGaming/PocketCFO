@@ -1489,11 +1489,33 @@ function AHPostingUI:SelectPage(pageKey)
     end
 end
 
+-- Forever only (PocketCFO.flavor == "forever"): the Dashboard splits 50/50,
+-- Pricing on the left, the Analysis box (UI/CrateAnalysisUI.lua, loaded only
+-- by PocketCFO_AH_Camelot.toc) on the right (Brian, 2026-11-19; was a 220px
+-- Pricing column). The split is anchored to the page's middle so it holds
+-- at any width. Retail keeps the full-width Pricing section below unchanged.
+local DASHBOARD_COLUMN_GAP = 12
+
 function AHPostingUI:RenderDashboard(parent)
     AddChild(parent, CreateLabel(parent, "Pricing", 16, -12, 200, "GameFontNormal"))
     local mount = CreateFrame("Frame", nil, parent)
     mount:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, -40)
-    mount:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
+    local crateUI = PocketCFO and PocketCFO.flavor == "forever"
+        and PocketCFO_AH:GetModule("CrateAnalysisUI", true) or nil
+    if crateUI and crateUI.Render then
+        mount:SetPoint("BOTTOMRIGHT", parent, "BOTTOM", -DASHBOARD_COLUMN_GAP, 16)
+        local analysisLabel = CreateLabel(parent, "Analysis", 0, -12, 200, "GameFontNormal")
+        analysisLabel:ClearAllPoints()
+        analysisLabel:SetPoint("TOPLEFT", parent, "TOP", DASHBOARD_COLUMN_GAP, -12)
+        AddChild(parent, analysisLabel)
+        local analysisMount = CreateFrame("Frame", nil, parent)
+        analysisMount:SetPoint("TOPLEFT", parent, "TOP", DASHBOARD_COLUMN_GAP, -40)
+        analysisMount:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
+        AddChild(parent, analysisMount)
+        crateUI:Render(analysisMount)
+    else
+        mount:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
+    end
     AddChild(parent, mount)
     self.pricingMount = mount
     self:EmbedPricingSection()

@@ -29,7 +29,8 @@
 --     the value version moves (Core.lua), so the game refreshing a bag
 --     tooltip while you hover redraws stored rows instead of re-pricing.
 -- Never calls tooltip:Show() (Midnight finding: never inside a tooltip hook).
--- Flavor: Both.
+-- Flavor: Both, except Waylaid Crate "Cost to fill" rows (Forever only,
+-- gated on PocketCFO.flavor == "forever"; see ReadCrateBundles).
 
 -- Patch compat: Blizzard moved the coin-icon formatter to C_CurrencyInfo.
 local GetCoinTextureString = (C_CurrencyInfo and C_CurrencyInfo.GetCoinTextureString)
@@ -80,9 +81,9 @@ local function TooltipHasRow(tooltip, label, valueText)
     return FindLineIndex(tooltip, label, valueText) ~= nil
 end
 
--- Always gold, silver and copper, silver and copper two digits (Brian,
--- 2026-11-03), so the coin icons line up between right-aligned rows.
--- GetCoinTextureString leaves out zero coins, which breaks the alignment.
+-- Coin icons for FormatCopper (see its comment for which coins show).
+-- Own markup rather than GetCoinTextureString so the two-digit padding of
+-- the coins after the first stays under our control.
 -- Theoretical: icon paths are Blizzard's own MoneyFrame textures (the ones
 -- the GOLD/SILVER/COPPER_AMOUNT_TEXTURE strings use); not yet seen in-game
 -- with this markup.
@@ -99,8 +100,17 @@ local function FormatCopper(value)
     local gold = math.floor(value / 10000)
     local silver = math.floor((value % 10000) / 100)
     local copper = value % 100
-    local goldText = BreakUpLargeNumbers and BreakUpLargeNumbers(gold) or tostring(gold)
-    return string.format("%s%s %02d%s %02d%s", goldText, GOLD_ICON, silver, SILVER_ICON, copper, COPPER_ICON)
+    -- Brian, 2026-11-17 (replaces the 2026-11-03 always-three-coins rule):
+    -- zero leading coins are dropped and the first coin shown has no
+    -- leading zero ("1s 60c", not "0g 01s 60c"); coins after it keep two
+    -- digits ("1g 05s 03c").
+    if gold > 0 then
+        local goldText = BreakUpLargeNumbers and BreakUpLargeNumbers(gold) or tostring(gold)
+        return string.format("%s%s %02d%s %02d%s", goldText, GOLD_ICON, silver, SILVER_ICON, copper, COPPER_ICON)
+    elseif silver > 0 then
+        return string.format("%d%s %02d%s", silver, SILVER_ICON, copper, COPPER_ICON)
+    end
+    return string.format("%d%s", copper, COPPER_ICON)
 end
 
 local HIGHEST_COLOR = { 0.1, 1.0, 0.1 }
@@ -114,6 +124,97 @@ local function AddValueRow(tooltip, label, valueText)
             VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3],
             VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3])
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Waylaid Crates (Forever only, Brian 2026-11-17). A crate is filled with
+-- any ONE bundle from its list, so the tooltip shows each bundle's cost
+-- (count x that mat's PCFO Value, the same number the mat's own tooltip
+-- shows) and the cheapest in green. Unpriced bundle = "No price", never a
+-- partial or zero total.
+-- Confirmed in-game 2026-11-17 (/mcgd crate, Journeyman Textiles 248688):
+--   - the whole list is ONE tooltip data line (the use line, has spellID,
+--     type 44): "Use: Fill the crate with any bundle from the following
+--     list:\n- 20 Wool Cloth\n- 40 Silk Cloth\n- 20 Medium Leather"
+--   - C_Item.GetItemIDForItemInfo(name) returns the mat's itemID (2592,
+--     4306, 2319); GetItemInfo(name) returns nil.
+--   - GetItemIDForItemInfo returns 0 for a mat the player doesn't hold
+--     (Bronze Tube), even after the item is loaded (verify, 75 of 96 mats),
+--     so names resolve through ForeverCrateMats:GetItemIDByName. A name
+--     that still doesn't resolve: the rows aren't remembered and the next
+--     hover tries again.
+-- Theoretical: every crate uses the same "- <count> <name>" format (both
+-- captures and the method.gg list do).
+local FILL_HEADER = "Cost to fill"
+
+-- Merchant's Favor per sealed crate (Brian, 2026-11-17; player reports on
+-- conquestcapped / wow.gg / u4gm): every tier has white and green crates,
+-- green pays double. The crate's tier comes from ForeverCrateMats.CRATES
+-- by itemID (any client language); the multiplier from the crate's own
+-- quality. Base by tier: Apprentice 5, Journeyman 10, Expert 15, Artisan
+-- 20. Artisan is unconfirmed (shown "Est." until a turn-in confirms it).
+-- Only white (1) and green (2) are known; any other quality (game files
+-- reportedly hold higher ones) or a crate not in the table shows no Favor.
+local TIER_FAVOR = {
+    Apprentice = { favor = 5 },
+    Journeyman = { favor = 10 },
+    Expert = { favor = 15 },
+    Artisan = { favor = 20, estimated = true },
+}
+local FAVOR_MULTIPLIER = { [1] = 1, [2] = 2 }
+
+local function CrateFavor(itemID, rarity)
+    local multiplier = FAVOR_MULTIPLIER[rarity]
+    local crateMats = PocketCFO_Valuation:GetModule("ForeverCrateMats", true)
+    local crate = multiplier and crateMats and crateMats.CRATES and crateMats.CRATES[itemID]
+    local tier = crate and TIER_FAVOR[crate.tier]
+    if not tier then
+        return nil
+    end
+    return tier.favor * multiplier, tier.estimated
+end
+local GetItemIDForItemInfo = C_Item and C_Item.GetItemIDForItemInfo
+
+local function IsForever()
+    local core = _G.PocketCFO
+    return type(core) == "table" and core.flavor == "forever"
+end
+
+-- Color codes in the list text (2026-11-17: the last bundle on every
+-- crate failed to resolve, e.g. "Tin Ore", while the others worked; the
+-- list is wrapped in a color code, so the last name ends in "|r").
+-- Removes |cAARRGGBB, |cn<name>: and |r.
+local function StripColorCodes(text)
+    text = string.gsub(text, "|c%x%x%x%x%x%x%x%x", "")
+    text = string.gsub(text, "|cn[^:]*:", "")
+    text = string.gsub(text, "|r", "")
+    return (string.gsub(text, "^%s*(.-)%s*$", "%1"))
+end
+
+-- { { count, name }, ... } from the crate's use line, or nil.
+local function ReadCrateBundles(data)
+    local lines = type(data) == "table" and data.lines or nil
+    if type(lines) ~= "table" then
+        return nil
+    end
+    for _, line in ipairs(lines) do
+        local text = type(line) == "table" and line.leftText or nil
+        if type(text) == "string" and line.spellID and string.find(text, "\n", 1, true) then
+            local bundles
+            for part in string.gmatch(text, "[^\n]+") do
+                local count, name = string.match(part, "^%s*%-%s*(%d+)%s+(.-)%s*$")
+                if count then
+                    name = StripColorCodes(name)
+                    bundles = bundles or {}
+                    bundles[#bundles + 1] = { count = tonumber(count), name = name }
+                end
+            end
+            if bundles then
+                return bundles
+            end
+        end
+    end
+    return nil
 end
 
 local function Now()
@@ -425,12 +526,78 @@ local function LookUpPocketValue(tooltip, itemLink, itemID, bound)
     return result, marketKey, "Value: " .. tostring(result.source)
 end
 
+-- Crate "Cost to fill" rows: { rows = { { label, text, value } }, lowest,
+-- pending }. lowest only when two or more bundles are priced (same rule as
+-- the value rows: with one value, no highlight).
+local function BuildFillRows(data, itemID, rarity)
+    local bundles = ReadCrateBundles(data)
+    if not bundles then
+        return nil
+    end
+    local fill = { rows = {} }
+    fill.favor, fill.favorEstimated = CrateFavor(itemID, rarity)
+    fill.header = FILL_HEADER
+    if fill.favor then
+        fill.header = FILL_HEADER .. " \194\183 " .. fill.favor .. " Favor" .. (fill.favorEstimated and " (Est.)" or "")
+    end
+    local priced = 0
+    for _, bundle in ipairs(bundles) do
+        -- ForeverCrateMats first (every crate mat, any client language);
+        -- GetItemIDForItemInfo only as the fallback for a mat not on that
+        -- list (works only for items the player holds; 0 otherwise).
+        local itemID
+        local crateMats = PocketCFO_Valuation:GetModule("ForeverCrateMats", true)
+        if crateMats and crateMats.GetItemIDByName then
+            itemID = crateMats:GetItemIDByName(bundle.name)
+        end
+        if not itemID and GetItemIDForItemInfo then
+            local okID, id = pcall(GetItemIDForItemInfo, bundle.name)
+            itemID = okID and tonumber(id) or nil
+            if itemID == 0 then
+                itemID = nil -- confirmed 2026-11-17: 0 for a mat the player doesn't hold (Bronze Tube)
+            end
+        end
+        if not itemID then
+            fill.pending = true -- name not resolved yet; build again next hover
+        end
+        local value
+        if itemID then
+            local result = LookUpPocketValue(nil, nil, itemID, false)
+            local each = result and tonumber(result.value) or nil
+            value = each and each * bundle.count or nil
+        end
+        if value then
+            priced = priced + 1
+        end
+        fill.rows[#fill.rows + 1] = {
+            label = "  " .. bundle.count .. " " .. bundle.name,
+            text = value and (fill.favor
+                and (FormatCopper(value) .. "  (" .. FormatCopper(value / fill.favor) .. " per Favor)")
+                or FormatCopper(value)) or "No price",
+            value = value,
+            -- for Crate analysis (Tooltip:GetCrateFill): what to buy
+            itemID = itemID,
+            count = bundle.count,
+            name = bundle.name,
+            each = value and (value / bundle.count) or nil,
+        }
+    end
+    if priced >= 2 then
+        for _, row in ipairs(fill.rows) do
+            if row.value and (not fill.lowest or row.value < fill.lowest) then
+                fill.lowest = row.value
+            end
+        end
+    end
+    return fill
+end
+
 -- Everything the tooltip shows for one item, ready to draw:
 --   values = { { label, text, value }, ... } (PCFO Value, Disenchant, Vendor)
 --   highest = the largest value when two or more rows show
 --   scanAt = AH scan time for the "Scanned ... ago" line, uncertain = few
 --   listings, dropLines = container rare drops
-local function BuildRows(tooltip, itemLink, bound)
+local function BuildRows(tooltip, itemLink, bound, data)
     local itemID = LinkItemID(itemLink)
     local rows = { values = {} }
     if not itemID then
@@ -507,6 +674,27 @@ local function BuildRows(tooltip, itemLink, bound)
         end
         rows.highest = highest
     end
+
+    -- Waylaid Crate (Forever only): Cost to fill per bundle.
+    if classID == 0 and IsForever() then
+        local fill = BuildFillRows(data, itemID, rarity)
+        if fill then
+            rows.fill = fill
+            if fill.pending then
+                rows.pending = true
+            end
+        else
+            -- A known crate with no bundle list yet: the game hasn't loaded
+            -- the crate's text, so the first tooltip comes without it (seen
+            -- 2026-11-17: AH crates not yet loaded showed no crate rows for
+            -- up to ROW_SECONDS). Don't remember these rows; the redraw with
+            -- the full text builds them again.
+            local crateMats = PocketCFO_Valuation:GetModule("ForeverCrateMats", true)
+            if crateMats and crateMats.CRATES and crateMats.CRATES[itemID] then
+                rows.pending = true
+            end
+        end
+    end
     return rows
 end
 
@@ -516,7 +704,7 @@ local ROW_SECONDS = 60
 local ROW_MAX_ENTRIES = 500
 local rowMemo, rowMemoCount = {}, 0
 
-local function GetRows(tooltip, itemLink, bound)
+local function GetRows(tooltip, itemLink, bound, data)
     local _, keyItemLevel = GetItemKeyArgs(tooltip)
     local key = itemLink .. (bound and "#bound" or "") .. (keyItemLevel and ("#ilvl" .. keyItemLevel) or "")
     local version = PocketCFO_Valuation.valueVersion or 0
@@ -525,7 +713,7 @@ local function GetRows(tooltip, itemLink, bound)
     if entry and entry.version == version and now - entry.at < ROW_SECONDS then
         return entry.rows
     end
-    local rows = BuildRows(tooltip, itemLink, bound)
+    local rows = BuildRows(tooltip, itemLink, bound, data)
     if not rows.pending then
         if rowMemoCount >= ROW_MAX_ENTRIES then
             rowMemo, rowMemoCount = {}, 0
@@ -538,13 +726,34 @@ local function GetRows(tooltip, itemLink, bound)
     return rows
 end
 
+local function DrawFillRows(tooltip, fill)
+    if not fill then
+        return
+    end
+    tooltip:AddLine(fill.header, VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3])
+    for _, row in ipairs(fill.rows) do
+        local color = OTHER_COLOR
+        if not row.value then
+            color = NOTE_COLOR
+        elseif fill.lowest and row.value == fill.lowest then
+            color = HIGHEST_COLOR
+        end
+        tooltip:AddDoubleLine(row.label, row.text,
+            OTHER_COLOR[1], OTHER_COLOR[2], OTHER_COLOR[3],
+            color[1], color[2], color[3])
+    end
+end
+
 local function DrawRows(tooltip, rows)
     local first = rows.values[1]
-    if not first then
+    if not first and not rows.fill then
         return
     end
     -- The hook ran already for this tooltip build: don't add the rows twice.
-    if TooltipHasRow(tooltip, first.label, first.text) then
+    if first and TooltipHasRow(tooltip, first.label, first.text) then
+        return
+    end
+    if not first and TooltipHasRow(tooltip, rows.fill.header) then
         return
     end
     for _, row in ipairs(rows.values) do
@@ -567,6 +776,52 @@ local function DrawRows(tooltip, rows)
     for _, text in ipairs(rows.dropLines or {}) do
         tooltip:AddLine(text, NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])
     end
+    DrawFillRows(tooltip, rows.fill)
+end
+
+-- "You have" line (Brian, 2026-11-21; claude/Shopping_List_Design.md
+-- section 8): where this character has the item, so players know where to
+-- go get it (bank, mail, an auction to cancel). Only places with some show;
+-- no line when there are none. Counts come from core
+-- InventoryStateService:GetItemPlaces: bags live, every other place from its
+-- last scan, looked up per item ID (built once per scan, not per hover).
+-- Not remembered with the value rows: counts change without the value
+-- version moving. Flavor: Both (no warband bank on Forever, so never shown).
+local PLACE_ORDER = {
+    { key = "bags", label = "Bags" },
+    { key = "bank", label = "Bank" },
+    { key = "warbank", label = "Warband bank" },
+    { key = "mail", label = "Mail" },
+    { key = "ah", label = "AH" },
+}
+local PLACES_LABEL = "You have"
+
+local function DrawPlacesLine(tooltip, itemLink)
+    local core = _G.PocketCFO
+    local service = core and core.InventoryStateService
+    local itemID = LinkItemID(itemLink)
+    if not itemID or not service or not service.GetItemPlaces then
+        return
+    end
+    local places = service:GetItemPlaces(itemID)
+    local parts = {}
+    for _, place in ipairs(PLACE_ORDER) do
+        local count = tonumber(places[place.key]) or 0
+        if count > 0 then
+            parts[#parts + 1] = place.label .. " " .. (BreakUpLargeNumbers and BreakUpLargeNumbers(count) or tostring(count))
+        end
+    end
+    if #parts == 0 then
+        return
+    end
+    local text = table.concat(parts, " \194\183 ")
+    -- The hook ran already for this tooltip build: don't add it twice.
+    if TooltipHasRow(tooltip, PLACES_LABEL) then
+        return
+    end
+    tooltip:AddDoubleLine(PLACES_LABEL, text,
+        VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3],
+        OTHER_COLOR[1], OTHER_COLOR[2], OTHER_COLOR[3])
 end
 
 local function OnItemTooltip(tooltip, data)
@@ -584,8 +839,9 @@ local function OnItemTooltip(tooltip, data)
         SetLastLookup(itemLink, nil, nil, nil, "Quality reagent slot - per-quality lines")
         return
     end
-    local rows = GetRows(tooltip, itemLink, IsBoundTooltip(tooltip, data, itemLink))
+    local rows = GetRows(tooltip, itemLink, IsBoundTooltip(tooltip, data, itemLink), data)
     DrawRows(tooltip, rows)
+    DrawPlacesLine(tooltip, itemLink)
     SetLastLookup(itemLink, rows.marketKey, rows.value, rows.freshness, rows.note)
 end
 
@@ -706,6 +962,41 @@ end
 
 function Tooltip:GetLastLookup()
     return self.lastLookup
+end
+
+-- Crate analysis (Forever only, PocketCFO_AH CrateAnalysis): the same crate
+-- numbers the crate tooltip shows, without a tooltip. Returns nil when not
+-- Forever, not a crate, or the game hasn't loaded the crate's text yet.
+-- Theoretical: C_TooltipInfo.GetHyperlink with a crate link built from
+-- GetItemInfo / "item:<id>" returns the same use line as a hovered crate
+-- (captures used hovered links).
+function Tooltip:GetCrateFill(crateID)
+    if not IsForever() or not crateID or not C_TooltipInfo or not C_TooltipInfo.GetHyperlink then
+        return nil
+    end
+    local okInfo, itemName, itemLink, rarity = pcall(GetItemInfo, crateID)
+    if not okInfo or not itemName then
+        return nil
+    end
+    local okData, data = pcall(C_TooltipInfo.GetHyperlink, itemLink or ("item:" .. crateID))
+    if not okData or type(data) ~= "table" then
+        return nil
+    end
+    local fill = BuildFillRows(data, crateID, tonumber(rarity))
+    if not fill then
+        return nil
+    end
+    local result = LookUpPocketValue(nil, nil, crateID, false)
+    fill.crateValue = result and tonumber(result.value) or nil
+    fill.itemName = itemName
+    fill.rarity = tonumber(rarity)
+    return fill
+end
+
+-- Same money text as the tooltip (Crate analysis uses it so numbers read
+-- the same in both places).
+function Tooltip:FormatMoney(value)
+    return FormatCopper(value)
 end
 
 function Tooltip:OnEnable()

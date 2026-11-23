@@ -36,9 +36,11 @@
 -- those openings are already local, so they would count twice).
 --
 -- Confidence filter (2026-11-07, Brian): local openings are filtered before
--- they count (last 11 months, 3 days per bag and per item, one-offs as a
--- group, a bag never contains itself, seedOnly seed containers); see LocalRow
--- and claude/Container_Confidence_Design.md. Flavor: Both.
+-- they count (last 11 months, items seen in 3 openings or on 3 days, one-offs
+-- as a group, a bag never contains itself, seedOnly seed containers); see
+-- LocalRow and claude/Container_Confidence_Design.md. 2026-11-18 (Brian): the
+-- 3-day bag rule is gone and items count by openings, not days ("it's about
+-- opens"). Flavor: Both.
 
 local PocketCFO = _G.PocketCFO
 
@@ -236,16 +238,21 @@ local localCache = {}   -- [containerItemID] = row-shaped totals (see LocalRow)
 -- (the Payout bag "could contain" itself, a fishing cap and gloves). Local
 -- openings are read only from the last LOCAL_WINDOW_MONTHS of day rows (month
 -- rows never: old openings age out, and last year's holiday bag contents
--- don't mix in). A bag's local openings count only once it was opened on
--- MIN_DAYS different days; an item (or currency) counts only once it was
--- seen on MIN_DAYS different days, or when the seed / live seed lists it for
--- that bag. Non-stackable outputs (one-offs) that miss the threshold on their
--- own count when the bag's one-offs together were seen on MIN_DAYS days. A
--- bag never contains itself; a seed container's excludedOutputs never count.
+-- don't mix in). A bag's local openings count from its first opening
+-- (2026-11-18, Brian: the 3-day bag rule is removed; opening 50 today is as
+-- good as 50 over a week). An item (or currency) counts once it came out
+-- MIN_TIMES times (ledger entries for it from that bag, i.e. day row n: a
+-- mail leak is one entry), or was seen on MIN_DAYS different days, or the
+-- seed / live seed lists it for that bag. Moved history rows have n = 0, so
+-- they confirm by days only (one day at most). Non-stackable outputs
+-- (one-offs) that miss on their own count when the bag's one-offs together
+-- came out MIN_TIMES times or on MIN_DAYS days. A bag never contains itself;
+-- a seed container's excludedOutputs never count.
 -- Unconfirmed items are left out (the ledger keeps them; /mcg containerlog
 -- lists them); the opening count is not reduced.
 local LOCAL_WINDOW_MONTHS = 11
 local MIN_DAYS = 3
+local MIN_TIMES = 3
 
 -- First day ("YYYY-MM-DD") of the local window.
 local function WindowStart(now)
@@ -353,7 +360,9 @@ local function LocalRow(containerItemID)
         localCache[containerItemID] = false
         return nil
     end
-    row.bagConfirmed = row.bagDays >= MIN_DAYS
+    -- Bag rule removed 2026-11-18: any opening counts. Field kept for
+    -- MCG_Diagnostic ContainerSeedExport, which reads it.
+    row.bagConfirmed = true
 
     -- Every output seen, with the days it was seen on.
     local seen = {}   -- ["item:123"] = { kind, iid, quantity, historyQuantity, days, daySet }
@@ -363,11 +372,13 @@ local function LocalRow(containerItemID)
             local key = r.kind .. ":" .. tostring(r.iid)
             local entry = seen[key]
             if not entry then
-                entry = { kind = r.kind, iid = r.iid, quantity = 0, historyQuantity = 0, days = 0, daySet = {} }
+                entry = { kind = r.kind, iid = r.iid, quantity = 0, historyQuantity = 0, days = 0, times = 0,
+                    daySet = {} }
                 seen[key] = entry
             end
             local qty = tonumber(r.qty) or 0
             entry.quantity = entry.quantity + qty
+            entry.times = entry.times + (tonumber(r.n) or 0)
             if history ~= nil and r.c == history then
                 entry.historyQuantity = entry.historyQuantity + qty
             end
@@ -398,16 +409,17 @@ local function LocalRow(containerItemID)
     end
 
     -- Confirm each output; one-offs that miss on their own wait for the group.
-    local confirmed, oneOffs, oneOffDays, oneOffDayCount = {}, {}, {}, 0
+    local confirmed, oneOffs, oneOffDays, oneOffDayCount, oneOffTimes = {}, {}, {}, 0, 0
     for key, entry in pairs(seen) do
         if entry.kind == "item" and IsExcludedOutput(containerItemID, entry.iid, seedContainer) then
             entry.reason = (NumberOrNil(entry.iid) == containerItemID) and "the bag itself" or "excluded by the seed"
-        elseif entry.days >= MIN_DAYS or seedListed[key] then
+        elseif entry.times >= MIN_TIMES or entry.days >= MIN_DAYS or seedListed[key] then
             confirmed[key] = true
         elseif entry.kind == "item" then
             local stackable = IsStackableItem(entry.iid)
             if stackable == false then
                 oneOffs[#oneOffs + 1] = key
+                oneOffTimes = oneOffTimes + entry.times
                 for day in pairs(entry.daySet) do
                     if not oneOffDays[day] then
                         oneOffDays[day] = true
@@ -420,7 +432,7 @@ local function LocalRow(containerItemID)
             end
         end
     end
-    if oneOffDayCount >= MIN_DAYS then
+    if oneOffDayCount >= MIN_DAYS or oneOffTimes >= MIN_TIMES then
         for _, key in ipairs(oneOffs) do
             confirmed[key] = true
         end
@@ -430,7 +442,7 @@ local function LocalRow(containerItemID)
         if confirmed[key] then
             if entry.kind == "item" then
                 row.outputTotals[entry.iid] = { itemID = entry.iid, quantity = entry.quantity,
-                    historyQuantity = entry.historyQuantity, days = entry.days }
+                    historyQuantity = entry.historyQuantity, days = entry.days, times = entry.times }
             else
                 -- History currency is partial: left out, like history openings.
                 local quantity = entry.quantity - entry.historyQuantity
@@ -441,7 +453,8 @@ local function LocalRow(containerItemID)
         else
             row.unconfirmed[#row.unconfirmed + 1] = { kind = entry.kind, iid = entry.iid, quantity = entry.quantity,
                 days = entry.days,
-                reason = entry.reason or string.format("seen on %d of %d days", entry.days, MIN_DAYS) }
+                reason = entry.reason or string.format("came out %d of %d times (%d of %d days)", entry.times,
+                    MIN_TIMES, entry.days, MIN_DAYS) }
         end
     end
 
@@ -506,14 +519,11 @@ function ContainerOutcomeService:GetExpectedContents(containerReference)
 
     local localRow = LocalRow(containerItemID)
     local localPending = localRow and localRow.itemDataPending or nil
-    -- Confidence filter (see LocalRow): local openings count only once the
-    -- bag was opened on MIN_DAYS days, and never for a seedOnly container on
-    -- a player's install (the dev install's local openings are the live seed).
+    -- Confidence filter (see LocalRow): local openings never count for a
+    -- seedOnly container on a player's install (the dev install's local
+    -- openings are the live seed). The 3-day bag rule was removed 2026-11-18.
     local localHeldBack = nil
-    if localRow and not localRow.bagConfirmed then
-        localHeldBack = "notEnoughDays"
-        localRow = nil
-    elseif localRow and seedContainer and seedContainer.seedOnly and not IsDevInstall() then
+    if localRow and seedContainer and seedContainer.seedOnly and not IsDevInstall() then
         localHeldBack = "seedOnly"
         localRow = nil
     end
@@ -644,7 +654,7 @@ function ContainerOutcomeService:GetExpectedContents(containerReference)
         expectedContents = expectedContents,
         -- Local one-offs couldn't be classified yet: don't cache this result.
         itemDataPending = (localRow ~= nil and localPending) or nil,
-        -- Why local openings were left out ("notEnoughDays" / "seedOnly"), or nil.
+        -- Why local openings were left out ("seedOnly"), or nil.
         localHeldBack = localHeldBack,
     }
 end
@@ -789,8 +799,8 @@ if diagnostics and diagnostics.RegisterCommand then
             return (ok and name) or ("item " .. tostring(itemID))
         end
         local lines = { string.format(
-            "=== Containers opened (your openings, last %d months, average per opening; counts after %d days) ===",
-            LOCAL_WINDOW_MONTHS, MIN_DAYS) }
+            "=== Containers opened (your openings, last %d months, average per opening; items count after %d openings or %d days) ===",
+            LOCAL_WINDOW_MONTHS, MIN_TIMES, MIN_DAYS) }
         local any = false
         for _, itemID in ipairs(ContainerOutcomeService:GetObservedContainerItemIDs()) do
             local row = LocalRow(itemID)
@@ -799,17 +809,17 @@ if diagnostics and diagnostics.RegisterCommand then
             local opens = NumberOrNil(row.openCount) or 0
             local liveOpens = NumberOrNil(row.liveOpenCount) or 0
             local seedContainer = SeedRows(itemID)
-            local status = row.bagConfirmed and "counted" or "NOT counted yet"
-            if row.bagConfirmed and seedContainer and seedContainer.seedOnly then
+            local status = "counted"
+            if seedContainer and seedContainer.seedOnly then
                 status = "seed only for players"
             end
             lines[#lines + 1] = string.format("  %s  itemID=%s  opens=%d (since 10-30: %d)  days=%d  %s  gold/open=%s",
                 Name(itemID), tostring(itemID), opens, liveOpens, row.bagDays or 0, status,
                 FormatCopper(liveOpens > 0 and (NumberOrNil(row.copperTotal) or 0) / liveOpens or 0))
             for _, output in pairs(row.outputTotals or {}) do
-                lines[#lines + 1] = string.format("      %s (%s)  total=%d  per open=%.2f  days=%d",
+                lines[#lines + 1] = string.format("      %s (%s)  total=%d  per open=%.2f  times=%d  days=%d",
                     Name(output.itemID), tostring(output.itemID), output.quantity or 0,
-                    opens > 0 and (output.quantity or 0) / opens or 0, output.days or 0)
+                    opens > 0 and (output.quantity or 0) / opens or 0, output.times or 0, output.days or 0)
             end
             for currencyID, currency in pairs(row.currencyTotals or {}) do
                 lines[#lines + 1] = string.format("      currency %s  total=%d  per open=%.2f  days=%d",

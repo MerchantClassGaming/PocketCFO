@@ -14,6 +14,9 @@
 --       Grand Beasts: loot parts and lures used;
 --       gathering: By profession (only for a character with 2+ gathering
 --         professions; one with nothing gathered shows "none"), By zone;
+--         a run with extras (2026-11-20: mob loot, chests, looted gold,
+--         repairs) shows a Loot list instead: each profession, Other loot,
+--         Looted gold, Repairs (beasts: under their Loot list too);
 --       runs (gathering, fishing, Grand Beasts) and custom sessions: the 10
 --         most recent, each with its date and start time, its own time and
 --         its own gold per hour;
@@ -599,15 +602,22 @@ function GoldWindow:RenderGoldPerHourRanking()
             return
         end
         local isBeasts = row.activity == "beasts"
-        if isBeasts or row.showProfessions then
-            lines[#lines + 1] = { label = isBeasts and "    |cff888888Loot|r" or "    |cff888888By profession|r",
-                count = "", amount = "" }
+        if isBeasts or row.showProfessions or row.hasExtras then
+            local header = (isBeasts or row.hasExtras) and "    |cff888888Loot|r" or "    |cff888888By profession|r"
+            lines[#lines + 1] = { label = header, count = "", amount = "" }
             for _, part in ipairs(row.parts) do
                 local none = part.copper == 0 and (part.loots or 0) == 0
                 lines[#lines + 1] = {
                     label = "      |cffbbbbbb" .. part.label .. "|r",
                     count = string.format("%d%%", math.floor(part.share * 100 + 0.5)),
                     amount = none and "|cff888888none|r" or FormatRate(part.perHour),
+                }
+            end
+            for _, gold in ipairs(row.gold or {}) do
+                lines[#lines + 1] = {
+                    label = "      |cffbbbbbb" .. gold.label .. "|r",
+                    count = "",
+                    amount = FormatRate(gold.perHour),
                 }
             end
         end

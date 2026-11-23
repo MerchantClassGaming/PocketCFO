@@ -23,6 +23,40 @@ end
 -- Only worked out after login, and kept once known.
 local realmGroupKey
 
+-- No realm name (Brian, 2026-11-21, WoW Forever beta): GetAutoCompleteRealms
+-- and GetNormalizedRealmName both came back empty (GetRealmName too), so no
+-- realm group was known: tooltips showed no PCFO Value and scans saved
+-- nothing. Prices then use the saved realm group with the most recent full
+-- scan. Nothing saved yet (new install or wipe): the fixed key "Forever",
+-- so the first scan creates it and it's used from then on. Flavor:
+-- Forever-only (gated).
+local NO_REALM_KEY = "Forever"
+
+local function MostRecentRealmGroupKey()
+    local core = _G.PocketCFO
+    if not (core and core.flavor == "forever") then
+        return nil
+    end
+    local db = PocketCFO_Valuation.db
+    if not (db and db.global) then
+        return nil
+    end
+    local groups = type(db.global.realmGroups) == "table" and db.global.realmGroups or {}
+    local bestKey, bestScan
+    for key, store in pairs(groups) do
+        local lastScan = type(store) == "table" and tonumber(store.timeOfLastReplicateScan) or 0
+        if not bestKey or lastScan > bestScan then
+            bestKey, bestScan = key, lastScan
+        end
+    end
+    bestKey = bestKey or NO_REALM_KEY
+    realmGroupKey = bestKey
+    if core.AppendSessionLog then
+        core:AppendSessionLog("[MCG] PricingCache: no realm name from the game; using realm group: " .. tostring(bestKey))
+    end
+    return bestKey
+end
+
 local function GetRealmGroupKey()
     if realmGroupKey then
         return realmGroupKey
@@ -45,7 +79,7 @@ local function GetRealmGroupKey()
     if #names == 0 then
         local name = GetNormalizedRealmName and GetNormalizedRealmName()
         if type(name) ~= "string" or name == "" then
-            return nil
+            return MostRecentRealmGroupKey()
         end
         names[1] = name
     end
@@ -512,6 +546,38 @@ function PricingCache:SetPricingRow(marketKey, row)
     BroadcastPricingUpdated(marketKey, cache[marketKey].itemID, cache[marketKey].source)
 
     return cache[marketKey]
+end
+
+-- Searched, not listed (Brian, 2026-11-20): a live AH search for this item
+-- ID finished, and rows last seen before it started (timestamp < seenSince)
+-- weren't in it, so nothing is listed at that price right now. They get
+-- notListedAt = at. A new price for the row (SetPricingRow) replaces the
+-- whole row, which clears the mark. Only the tool ladder reads it
+-- (ValuationRuleSet CurrentValue): a sold-out better version stops capping
+-- other items, while its own value keeps its last price. Returns how many
+-- rows were marked. Flavor: Both.
+function PricingCache:MarkNotListed(itemID, seenSince, at)
+    itemID = tonumber(itemID)
+    seenSince = tonumber(seenSince)
+    local cache = GetCacheRoot()
+    if not itemID or not seenSince or not cache then
+        return 0
+    end
+    at = tonumber(at) or Now()
+    local marked, firstKey = 0, nil
+    for marketKey in pairs(GetItemIndex(cache)[itemID] or {}) do
+        local row = cache[marketKey]
+        if type(row) == "table" and (tonumber(row.timestamp) or 0) < seenSince
+            and (tonumber(row.notListedAt) or 0) < at then
+            row.notListedAt = at
+            marked = marked + 1
+            firstKey = firstKey or marketKey
+        end
+    end
+    if marked > 0 then
+        BroadcastPricingUpdated(firstKey, itemID, "not-listed")
+    end
+    return marked
 end
 
 -- Scan diagnostics (rejected price levels) for a market priced by an item

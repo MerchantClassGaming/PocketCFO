@@ -416,6 +416,66 @@ function InventoryStateService:GetLocationSnapshot(ownerKey, location)
     return GetObservationRows(ownerKey, location)
 end
 
+-- ---------------------------------------------------------------------------
+-- Where you have an item (2026-11-21, design: claude/Shopping_List_Design.md
+-- section 8). Counts per item ID for one stored place, for hover-speed
+-- lookups: the item tooltip "You have" line and the shopping list.
+-- Built once per stored list and reused until that place is scanned again
+-- (ObservationStore:Replace always stores a new rows table, so a new table
+-- means a new scan). In memory only, never saved. Stored scans only:
+-- adjustments are not applied.
+-- ---------------------------------------------------------------------------
+
+local storedCountCache = {}
+
+function InventoryStateService:GetStoredItemCount(ownerKey, location, itemID)
+    itemID = tonumber(itemID)
+    if not ownerKey or not itemID then
+        return 0
+    end
+    location = NormalizeLocation(location)
+    local rows = GetObservationRows(ownerKey, location)
+    local cacheKey = tostring(ownerKey) .. "|" .. tostring(location)
+    local entry = storedCountCache[cacheKey]
+    if not entry or entry.rows ~= rows then
+        local counts = {}
+        for _, row in ipairs(rows) do
+            local id = tonumber(row.itemID)
+            if id then
+                counts[id] = (counts[id] or 0) + (tonumber(row.quantity) or 0)
+            end
+        end
+        entry = { rows = rows, counts = counts }
+        storedCountCache[cacheKey] = entry
+    end
+    return entry.counts[itemID] or 0
+end
+
+-- This character's places plus the warband bank:
+-- { bags, bank, warbank, mail, ah }. Bags are the live count (the stored bag
+-- scan can trail a loot or a craft); every other place is the last scan.
+-- Theoretical: C_Item.GetItemCount(itemID) with no other arguments counts
+-- bags including the reagent bag on retail, bags only on Forever.
+local LiveItemCount = (C_Item and C_Item.GetItemCount) or _G.GetItemCount
+
+function InventoryStateService:GetItemPlaces(itemID)
+    itemID = tonumber(itemID)
+    local places = { bags = 0, bank = 0, warbank = 0, mail = 0, ah = 0 }
+    if not itemID then
+        return places
+    end
+    if type(LiveItemCount) == "function" then
+        local ok, count = pcall(LiveItemCount, itemID)
+        places.bags = ok and tonumber(count) or 0
+    end
+    local ownerKey = CurrentOwnerKey()
+    places.bank = self:GetStoredItemCount(ownerKey, "bank", itemID)
+    places.mail = self:GetStoredItemCount(ownerKey, "mail", itemID)
+    places.ah = self:GetStoredItemCount(ownerKey, "ah", itemID)
+    places.warbank = self:GetStoredItemCount(WARBAND_OWNER_KEY, "warbank", itemID)
+    return places
+end
+
 function InventoryStateService:GetSnapshotRoot()
     local root = {}
     local observations = GetObservationStore() and GetObservationStore():List() or {}

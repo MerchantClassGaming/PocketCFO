@@ -17,6 +17,18 @@
 --              Under MIN_INSTANCE_SECONDS it is not saved (zoning in by
 --              accident). A manual session wins: while one runs, entering an
 --              instance doesn't start another.
+--              Leaving the group (2026-11-18, Brian): a dungeon or raid
+--              session ends when you go from grouped to not grouped (left or
+--              kicked), at the moment you left the instance, or now if still
+--              inside. Delves / scenarios and solo runs keep the 10-minute
+--              rule. See OnGroupChanged.
+--              Stopped by the player (2026-11-22, Brian): Stop (or Ctrl-click
+--              Stop) on an instance session keeps that instance + difficulty
+--              from starting a new session (re-entry, corpse run, reset and
+--              rerun) until you enter a different instance / difficulty, leave
+--              or join a group, or log out. See RememberStopped.
+--              Difficulty 0 inside a dungeon / raid / delve (2026-11-22, Forever
+--              ghost re-entry) is treated as not ready: CheckInstance waits.
 -- One session at a time per character. Automatic gathering runs
 -- (ActivityRuns) keep recording underneath and are not affected.
 --
@@ -41,8 +53,8 @@
 --   - Going out (2026-11-05): mats used in crafts and items disenchanted
 --     subtract their book value (the value they came in at, from the Item
 --     Ledger's book value record); units with no book value subtract at
---     today's price. BoP items (bound on pickup) are worth 0 while held; what
---     they bring when they leave is the gain.
+--     today's price. (2026-11-05 to 2026-11-22 BoP items were worth 0 while
+--     held; reverted, see Item value.)
 --   - Crafts (Going Out step 1, 2026-11-05): output and resourcefulness
 --     returns count as items in; mats used count as used (craft out entries),
 --     so a craft adds output minus mats. A craft whose mats couldn't be read
@@ -57,7 +69,9 @@
 --     ActivityRuns:GetUnitValue), else the vendor price. Bound items
 --     (bind on pickup, quest, account/warband bound) use the vendor price, or
 --     for a character with Enchanting the higher of the disenchant estimate and
---     the vendor price (Brian 2026-10-27).
+--     the vendor price (Brian 2026-10-27; restored 2026-11-22 after the
+--     2026-11-05 "0 while held" rule left dungeon loot uncounted). No vendor
+--     price and no estimate: 0 (it can't be sold), not "no price".
 --
 -- Theoretical until seen in-game: GetInstanceInfo instance types for delves
 -- (scenario) and Forever dungeons; roll wins on Forever reaching the ledger;
@@ -166,6 +180,7 @@ local function DB()
     db.history = db.history or {}
     db.recentNames = db.recentNames or {}
     db.log = db.log or {}
+    db.stoppedInstance = db.stoppedInstance or {}
     return db
 end
 
@@ -411,9 +426,22 @@ function ActivitySessions:Start(name)
     self:SendMessage("MCG_SESSIONS_FILED")
 end
 
+-- Stopped by the player (2026-11-22, Brian): an instance session's dungeon +
+-- difficulty is remembered so CheckInstance doesn't start it again. Cleared
+-- by entering a different instance / difficulty, a group change (leaving or
+-- joining) or an intentional logout. Saved, so /reload keeps it.
+local function RememberStopped(db, guid, session)
+    if session and session.kind == "instance" then
+        db.stoppedInstance[guid] = { instanceID = session.instanceID, difficultyID = session.difficultyID }
+        Log("stopped by player: %s won't restart until a different instance or group", tostring(session.name))
+    end
+end
+
 function ActivitySessions:Stop()
+    local db = DB()
     local guid = PlayerGUID()
-    if guid then
+    if db and guid then
+        RememberStopped(db, guid, db.current[guid])
         self:File(guid, nil)
     end
 end
@@ -427,6 +455,7 @@ function ActivitySessions:Discard()
     if not session then
         return
     end
+    RememberStopped(db, guid, session)
     db.current[guid] = nil
     Log("discarded %s (thrown away by the player)", tostring(session.name))
     self:SendMessage("MCG_SESSIONS_FILED")
@@ -602,7 +631,43 @@ function ActivitySessions:CheckInstance()
             instanceID = info[9]
         end
     end
+    -- Difficulty not known yet (2026-11-22, seen on Forever): walking back in
+    -- as a ghost reported difficultyID 0, then 1 after the rez, which ended
+    -- the session and started two new ones. A dungeon / raid / delve with
+    -- difficulty 0 isn't ready: change nothing and wait for the next check.
+    if inInstance and name and INSTANCE_TYPES[instanceType] and (tonumber(difficultyID) or 0) == 0 then
+        if not self.waitingDifficulty then
+            self.waitingDifficulty = true
+            Log("%s: difficulty not known yet, waiting", tostring(name))
+        end
+        return
+    end
+    self.waitingDifficulty = nil
+
     local inside = inInstance and name and INSTANCE_TYPES[instanceType] or false
+
+    -- Session ended by leaving the group while still inside (grace-period
+    -- portout): don't start a new one for the same instance until we're out.
+    -- Stopped by the player in this instance: stay stopped here. Entering a
+    -- different instance / difficulty clears it.
+    local stopped = db.stoppedInstance[guid]
+    if stopped and inside then
+        if stopped.instanceID == instanceID and stopped.difficultyID == difficultyID then
+            if not current then
+                return
+            end
+        else
+            db.stoppedInstance[guid] = nil
+        end
+    end
+
+    local held = self.groupLeftInstance
+    if held then
+        if inside and not current and held.instanceID == instanceID and held.difficultyID == difficultyID then
+            return
+        end
+        self.groupLeftInstance = nil
+    end
 
     if inside then
         local same = current and current.instanceID == instanceID and current.difficultyID == difficultyID
@@ -805,10 +870,24 @@ function ActivitySessions:GetUnitValue(link, itemID, enchanter, priceCache)
     sellPrice = ok and tonumber(sellPrice) or 0
     local value
     if ok and name and BOUND[tonumber(bindType)] then
-        -- BoP (Brian 2026-11-05): no gold value while held. What it brings
-        -- when it leaves (vendor gold, disenchant mats) is the gain. Was
-        -- vendor price (or disenchant estimate for enchanters).
-        value = 0
+        -- Bound (Brian 2026-11-22, back to the 2026-10-27 rule): the vendor
+        -- price, or for an enchanter the higher of the disenchant estimate and
+        -- the vendor price. The 2026-11-05 rule (0 while held, the gain counts
+        -- when it leaves) missed nearly all dungeon loot: the session ends at
+        -- the door and the vendoring happens in town afterwards.
+        value = sellPrice   -- 0 when it can't be sold: worth nothing, not "no price"
+        if enchanter then
+            local valuation = _G.PocketCFO_Valuation
+            local estimator = valuation and valuation.GetModule and valuation:GetModule("DisenchantValue", true)
+            local okDE, estimate = false, nil
+            if estimator and estimator.GetEstimate then
+                okDE, estimate = pcall(estimator.GetEstimate, estimator, link)
+            end
+            estimate = okDE and tonumber(estimate) or nil
+            if estimate and estimate > value then
+                value = math.floor(estimate + 0.5)
+            end
+        end
     else
         local runs = PocketCFO:GetModule("ActivityRuns", true)
         value = runs and runs.GetUnitValue and runs:GetUnitValue(itemID, link) or nil
@@ -896,8 +975,53 @@ function ActivitySessions:OnTick()
     self:CheckInstance()
 end
 
+-- Leaving the group (2026-11-18, Brian). Flavor: Both.
+--   Grouped -> not grouped (left or kicked) ends a dungeon or raid session
+--   (instanceType party / raid). Delves and other scenarios are solo-able and
+--   keep the 10-minute rule; a run you were never grouped for never sees the
+--   transition. Ends at the moment you left the instance (outsideSince), or
+--   now if still inside; loot during the grace-period portout isn't counted.
+--   Theoretical: GROUP_ROSTER_UPDATE firing on leave / kick and IsInGroup()
+--   going false, on both clients; follower dungeons (NPC party) unknown.
+local GROUP_END_TYPES = { party = true, raid = true }
+
+local function InGroup()
+    return IsInGroup and IsInGroup() and true or false
+end
+
+function ActivitySessions:OnGroupChanged()
+    local grouped = InGroup()
+    local was = self.wasInGroup
+    self.wasInGroup = grouped
+    -- Leaving or joining a group clears a player Stop (see RememberStopped).
+    if was ~= grouped then
+        local db = DB()
+        local guid = PlayerGUID()
+        if db and guid and db.stoppedInstance[guid] then
+            db.stoppedInstance[guid] = nil
+            Log("group changed: stopped instance cleared")
+        end
+    end
+    if not was or grouped then
+        return
+    end
+    local guid = PlayerGUID()
+    local session = guid and self:GetCurrent(guid)
+    if not session or session.kind ~= "instance" or session.pausedAt
+        or not GROUP_END_TYPES[session.instanceType] then
+        return
+    end
+    if not session.outsideSince then
+        self.groupLeftInstance = { instanceID = session.instanceID, difficultyID = session.difficultyID }
+    end
+    Log("left group: %s ended", tostring(session.name))
+    self:File(guid, session.outsideSince or Now())
+end
+
 eventFrame:SetScript("OnEvent", function(_, event, ...)
-    if event == "PLAYER_LOGOUT" then
+    if event == "GROUP_ROSTER_UPDATE" then
+        ActivitySessions:OnGroupChanged()
+    elseif event == "PLAYER_LOGOUT" then
         local session = ActivitySessions:GetCurrent()
         if session then
             Bank(session)
@@ -924,6 +1048,10 @@ local ABANDONED_SECONDS = 1800
 
 function ActivitySessions:EndForLogout()
     local guid = PlayerGUID()
+    local db = DB()
+    if db and guid then
+        db.stoppedInstance[guid] = nil
+    end
     local session = guid and self:GetCurrent(guid)
     if session and session.kind == "manual" then
         -- Custom sessions survive a logout (2026-11-05); the clock was banked.
@@ -976,6 +1104,8 @@ function ActivitySessions:OnEnable()
     eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     eventFrame:RegisterEvent("PLAYER_LOGOUT")
+    self.wasInGroup = InGroup()
+    eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
     if messenger and not self.listening then
         messenger:RegisterMessage("MCG_ITEM_LEDGER_ENTRY", function(_, entry)
             ActivitySessions:OnLedgerEntry(entry)
@@ -1005,14 +1135,24 @@ function ActivitySessions:BuildReport()
             FormatCopper(stats.keptCopper), FormatCopper(stats.currencyCopper),
             stats.keptUnpriced > 0 and string.format(" (%d unpriced)", stats.keptUnpriced) or "")
     end
+    -- Per item (2026-11-22, Brian): counts, the unit value used for what's
+    -- still kept, and the line total (kept value + sold gold - used book value).
+    local function DescribeItems(session)
+        for link, entry in pairs(session.items or {}) do
+            local kept = (tonumber(entry.looted) or 0) - (tonumber(entry.sold) or 0) - (tonumber(entry.used) or 0)
+            local unit = kept ~= 0 and self:GetUnitValue(link, entry.itemID, session.enchanter, cache) or nil
+            local total = (tonumber(entry.soldCopper) or 0) - (tonumber(entry.usedBook) or 0) + (unit or 0) * kept
+            lines[#lines + 1] = string.format("    %s in=%d sold=%d used=%d kept=%d unit=%s total=%s%s",
+                tostring(entry.name or link), entry.looted or 0, entry.sold or 0, entry.used or 0, kept,
+                unit and FormatCopper(unit) or "none", FormatCopper(total),
+                (kept > 0 and not unit) and " (no price)" or "")
+        end
+    end
     local current = self:GetCurrent()
     lines[#lines + 1] = "=== Current ==="
     if current then
         Describe("  ", current)
-        for link, entry in pairs(current.items or {}) do
-            lines[#lines + 1] = string.format("    %s in=%d sold=%d used=%d soldCopper=%s", tostring(entry.name or link),
-                entry.looted or 0, entry.sold or 0, entry.used or 0, FormatCopper(entry.soldCopper or 0))
-        end
+        DescribeItems(current)
         for currencyID, row in pairs(current.currencies or {}) do
             lines[#lines + 1] = string.format("    currency %s gained=%d spent=%d", tostring(currencyID),
                 row.gained or 0, row.spent or 0)
@@ -1030,6 +1170,9 @@ function ActivitySessions:BuildReport()
     local list = entry and entry.sessions or {}
     for index = #list, math.max(1, #list - 9), -1 do
         Describe("  " .. date("%m-%d %H:%M", list[index].startedAt or 0) .. "  ", list[index])
+        if index == #list then
+            DescribeItems(list[index])
+        end
     end
     lines[#lines + 1] = ""
     lines[#lines + 1] = "=== Log ==="

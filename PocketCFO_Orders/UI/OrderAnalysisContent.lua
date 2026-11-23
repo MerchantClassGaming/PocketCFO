@@ -91,6 +91,55 @@ function OrderAnalysisContent:Build(parentFrame)
     self.built = true
 end
 
+-- ---------------------------------------------------------------------------
+-- Shopping list (2026-11-21, claude/Shopping_List_Design.md step 4):
+-- "Add to list" on the right of the Costs heading. Adds every Costs mat that
+-- can be bought (no currencies, bound mats or unchosen slots).
+-- ---------------------------------------------------------------------------
+
+local function CostItems(rows)
+    local items = {}
+    for _, row in ipairs(rows or {}) do
+        if row.itemID and not row.currencyID and not row.bound and not row.notChosen then
+            items[#items + 1] = { itemID = row.itemID, qty = tonumber(row.quantity) or 1 }
+        end
+    end
+    return items
+end
+
+local function ItemsKey(items)
+    local parts = {}
+    for _, item in ipairs(items) do
+        parts[#parts + 1] = tostring(item.itemID) .. ":" .. tostring(item.qty)
+    end
+    return table.concat(parts, ",")
+end
+
+local function HideAddControl(self)
+    if self.addControl then
+        self.addControl.frame:Hide()
+    end
+end
+
+local function PlaceAddControl(self, headerIndex, nextIndex, rows)
+    local list = _G.PocketCFO and _G.PocketCFO.ShoppingList
+    local header = nextIndex > headerIndex and self.rowFrames and self.rowFrames[headerIndex] or nil
+    local items = CostItems(rows)
+    if not list or not list.CreateAddControl or not header or #items == 0 then
+        HideAddControl(self)
+        return
+    end
+    if not self.addControl then
+        self.addControl = list:CreateAddControl(self.parentFrame, {})
+    end
+    local frame = self.addControl.frame
+    frame:ClearAllPoints()
+    frame:SetPoint("RIGHT", header, "RIGHT", 0, 0)
+    frame:SetFrameLevel((header:GetFrameLevel() or 1) + 2)
+    self.addControl:SetItems(items, "order", ItemsKey(items))
+    frame:Show()
+end
+
 local function HideRows(self)
     for _, row in ipairs(self.rowFrames or {}) do
         row:Hide()
@@ -107,6 +156,7 @@ local function HideAll(self)
     self.matNoteText:Hide()
     self.statusText:Hide()
     HideRows(self)
+    HideAddControl(self)
 end
 
 function OrderAnalysisContent:ShowLoading()
@@ -423,7 +473,10 @@ function OrderAnalysisContent:ShowResolved(displayModel)
     index, yOffset = AddSection(self, index, yOffset, "Estimated Resourcefulness Returns", displayModel.expectedResourcefulness, "positive", {
         infoTooltip = RESOURCEFULNESS_TOOLTIP,
     })
-    index, yOffset = AddSection(self, index, yOffset, "Costs", BuildCostRows(displayModel), "negative")
+    local costsIndex = index
+    local costRows = BuildCostRows(displayModel)
+    index, yOffset = AddSection(self, index, yOffset, "Costs", costRows, "negative")
+    PlaceAddControl(self, costsIndex, index, costRows)
 
     for extraIndex = index, #(self.rowFrames or {}) do
         self.rowFrames[extraIndex]:Hide()

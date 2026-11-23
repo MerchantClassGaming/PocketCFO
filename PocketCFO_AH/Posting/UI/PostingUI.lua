@@ -354,6 +354,10 @@ local function AddCompareLines(tooltip, row)
         else
             why = "?"
         end
+        -- Raised to a recent sale of this exact version (2026-11-17).
+        if bounds.ceilingFromSale then
+            why = "your last sale"
+        end
         -- Raised to the floor (SmartPricing bounds.ceilingAtFloor, 2026-11-07).
         -- Kept, not hidden (Brian, 2026-11-15: a missing line reads as a
         -- bug), with why it equals the lowest.

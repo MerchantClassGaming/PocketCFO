@@ -69,7 +69,10 @@ function GoldPerHourReport:GetMinRankSeconds(periodKey)
     return periodKey == "today" and MIN_RATE_SECONDS or MIN_RANK_SECONDS
 end
 
-local PART_LABELS = { beastkill = "Beast kill loot" }
+local PART_LABELS = { beastkill = "Beast kill loot", extras = "Other loot" }
+-- Gold on a run (extras, 2026-11-20): looted gold in, repairs out.
+local GOLD_LABELS = { looted = "Looted gold", repair = "Repairs" }
+local EXTRA_PART = "extras"
 
 local function Runs()
     return PocketCFO:GetModule("ActivityRuns", true)
@@ -287,7 +290,7 @@ local function RecentRunLine(runs, run, priceCache)
     local gross = runs:ValueAtToday(run.items, priceCache)
     local cost, costUnpriced = runs:GetRunCost(run)
     local seconds = runs:GetRunSeconds(run)
-    local copper = gross - cost
+    local copper = gross - cost + runs:GetRunGold(run)
     return {
         at = run.startedAt or run.endedAt or 0,
         label = date("%b %d %H:%M", run.startedAt or run.endedAt or 0),
@@ -313,15 +316,19 @@ end
 --   No dropped parts: the run as is. All parts dropped (one profession, the
 --   usual case): the run as is, on that profession's dropped row.
 --   Mixed: one slice per dropped part plus one for the rest, each with its
---   own items and parts; run time split by share of loots. Zones and lure
---   costs stay on the rest (zones are not kept per profession).
+--   own items and parts; run time split by share of loots. Zones, lure
+--   costs and extras (Other loot part, gold; 2026-11-20) stay on the rest
+--   (zones are not kept per profession). Extras are never a profession:
+--   they don't decide the split and don't share the time.
 local function SplitDroppedGathering(run, dropped)
     if (run.activity or "gathering") ~= "gathering" or not next(dropped) then
         return { { run = run } }
     end
     local droppedKeys, keptKeys = {}, {}
     for partKey in pairs(run.parts or {}) do
-        if dropped[partKey] then
+        if partKey == EXTRA_PART then
+            -- rides along with the rest (see above)
+        elseif dropped[partKey] then
             droppedKeys[#droppedKeys + 1] = partKey
         else
             keptKeys[#keptKeys + 1] = partKey
@@ -336,8 +343,10 @@ local function SplitDroppedGathering(run, dropped)
     local runs = Runs()
     local totalSeconds = runs:GetRunSeconds(run)
     local totalLoots = 0
-    for _, part in pairs(run.parts) do
-        totalLoots = totalLoots + (tonumber(part.loots) or 0)
+    for partKey, part in pairs(run.parts) do
+        if partKey ~= EXTRA_PART then
+            totalLoots = totalLoots + (tonumber(part.loots) or 0)
+        end
     end
     local function Share(part)
         return totalLoots > 0 and ((tonumber(part.loots) or 0) / totalLoots) or 0
@@ -346,13 +355,19 @@ local function SplitDroppedGathering(run, dropped)
         local slice = { startedAt = run.startedAt, lastLootAt = run.lastLootAt,
             endedAt = run.endedAt or run.lastLootAt or run.startedAt, activity = "gathering",
             seconds = 0, items = {}, parts = {}, zones = withExtras and run.zones or {},
-            costs = withExtras and run.costs or nil, costUnpriced = withExtras and run.costUnpriced or nil }
+            costs = withExtras and run.costs or nil, costUnpriced = withExtras and run.costUnpriced or nil,
+            gold = withExtras and run.gold or nil }
         local share = 0
         for _, partKey in ipairs(partKeys) do
             local part = run.parts[partKey]
             slice.parts[partKey] = part
             MergeItems(slice.items, part.items)
             share = share + Share(part)
+        end
+        local extras = withExtras and run.parts[EXTRA_PART]
+        if extras then
+            slice.parts[EXTRA_PART] = extras
+            MergeItems(slice.items, extras.items)
         end
         slice.seconds = totalSeconds * share
         slice.tripShare = share  -- this piece's part of the run's trip overhead
@@ -372,6 +387,7 @@ end
 -- { ranked = { row }, unranked = { row }, hideable = { { key, label } } }
 -- row = { key, label (activity), name (character), activity, runs, seconds, copper, cost, costUnpriced, perHour,
 --         showProfessions, parts = { { label, copper, share, loots, perHour } },
+--         gold = { { key, label, copper, perHour } } (looted gold, repairs negative), hasExtras,
 --         zones = { { label, seconds, copper, perHour } },
 --         recent = { { label, active, seconds, copper, perHour, costUnpriced } } }
 function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
@@ -391,13 +407,18 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
         local activity = run.activity or "gathering"
         local key = droppedKey and (guid .. ":gathering:dropped:" .. droppedKey) or (guid .. ":" .. activity)
         local character = byCharacter[key] or { guid = guid, activity = activity, droppedKey = droppedKey,
-            runs = 0, seconds = 0, rateSeconds = 0, cost = 0, items = {}, parts = {}, zones = {}, runList = {} }
+            runs = 0, seconds = 0, rateSeconds = 0, cost = 0, gold = {}, goldTotal = 0, items = {}, parts = {}, zones = {}, runList = {} }
         byCharacter[key] = character
         character.runs = character.runs + 1
         character.runList[#character.runList + 1] = run
         local cost, costUnpriced = runs:GetRunCost(run)
         character.cost = character.cost + cost
         character.costUnpriced = character.costUnpriced or costUnpriced
+        for category, amount in pairs(run.gold or {}) do
+            amount = tonumber(amount) or 0
+            character.gold[category] = (character.gold[category] or 0) + amount
+            character.goldTotal = character.goldTotal + amount
+        end
         local runSeconds = runs:GetRunSeconds(run)
         character.seconds = character.seconds + runSeconds
         character.rateSeconds = character.rateSeconds + runSeconds + TRIP_OVERHEAD_SECONDS * (run.tripShare or 1)
@@ -447,7 +468,7 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
     for key, character in pairs(byCharacter) do
         local name, classFile = CharacterInfo(character.guid, history)
         local gross = runs:ValueAtToday(character.items, priceCache)
-        local copper = gross - character.cost
+        local copper = gross - character.cost + character.goldTotal
         local row = {
             key = key,
             hideKey = character.droppedKey and ("gathering:dropped:" .. character.droppedKey)
@@ -464,9 +485,22 @@ function GoldPerHourReport:BuildRanking(periodKey, characterGUID)
             costPerHour = runs:PerHour(character.cost, character.rateSeconds),
             perHour = (not character.costUnpriced) and runs:PerHour(copper, character.rateSeconds) or nil,
             parts = {},
+            gold = {},
+            hasExtras = character.parts[EXTRA_PART] ~= nil or next(character.gold) ~= nil,
             zones = {},
             recent = {},
         }
+        for category, amount in pairs(character.gold) do
+            if amount ~= 0 then
+                row.gold[#row.gold + 1] = {
+                    key = category,
+                    label = GOLD_LABELS[category] or category,
+                    copper = amount,
+                    perHour = runs:PerHour(amount, character.rateSeconds),
+                }
+            end
+        end
+        table.sort(row.gold, function(a, b) return a.copper > b.copper end)
         for partKey, part in pairs(character.parts) do
             local partCopper = runs:ValueAtToday(part.items, priceCache)
             row.parts[#row.parts + 1] = {
@@ -659,7 +693,9 @@ local function FillFromGroup(target, group, runs)
             list[#list + 1] = { label = label, copper = copper, perHour = runs:PerHour(copper, group.rateSeconds) }
         end
     end
-    Add(target.items, "Still in your bags", group.kept)
+    -- Was "Still in your bags" (Brian 2026-11-22: unclear). Same number: what
+    -- the session's items are worth (kept at today's value, minus mats used).
+    Add(target.items, "Item value", group.kept)
     Add(target.items, "Sold", group.sold)
     Add(target.items, "Currencies", group.currencies)
     local categories = {}

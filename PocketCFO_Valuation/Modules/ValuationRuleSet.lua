@@ -270,7 +270,9 @@ local function RealStats(marketKey)
     return fingerprint ~= "" and fingerprint or nil
 end
 
--- Current price of a row, or nil when it has no price or is out of date.
+-- Current price of a row, or nil when it has no price, is out of date, or
+-- a live search since it was seen found nothing listed (PricingCache
+-- MarkNotListed, Brian 2026-11-20: a sold-out blue must not keep capping).
 local function CurrentValue(row, cutoff)
     if type(row) ~= "table" then
         return nil
@@ -279,18 +281,24 @@ local function CurrentValue(row, cutoff)
     if not timestamp or timestamp < cutoff then
         return nil
     end
+    local notListedAt = tonumber(row.notListedAt)
+    if notListedAt and notListedAt >= timestamp then
+        return nil
+    end
     return tonumber(row.value)
 end
 
 -- Average current price of every real-stat version at one quality, or a
--- plain (no-stats) key's current price.
+-- plain (no-stats) key's current price. Second return: "same" when the
+-- plain key priced it (no stats to differ), "average" when stat versions
+-- were averaged.
 local function QualityAverage(rows, base, cutoff, keep)
     local plain = CurrentValue(rows[base], cutoff)
     if plain and keep and not keep(base, plain) then
         plain = nil
     end
     if plain then
-        return plain
+        return plain, "same"
     end
     local prefix = base .. "|stats:"
     local total, count = 0, 0
@@ -306,7 +314,7 @@ local function QualityAverage(rows, base, cutoff, keep)
     if count == 0 then
         return nil
     end
-    return total / count
+    return total / count, "average"
 end
 
 -- Profession gear stat groups (Brian, 2026-11-06): stats a buyer treats as
@@ -348,7 +356,9 @@ PocketCFO_Valuation.StatGroupKey = StatGroupKey
 
 -- A better quality's price for capping: same stats if current, otherwise
 -- the cheapest current price in the same stat group (2026-11-06), otherwise
--- the current average at that quality.
+-- the current average at that quality. Second return (2026-11-20): which
+-- one priced it, "same" | "group" | "average"; smart posting ranks a same
+-- stat better version above a similar-stat listing.
 local function BetterQualityPrice(rows, itemID, quality, stats, cutoff, keep)
     local base = tostring(itemID) .. "|q" .. tostring(quality)
     if stats then
@@ -358,7 +368,7 @@ local function BetterQualityPrice(rows, itemID, quality, stats, cutoff, keep)
             value = nil
         end
         if value then
-            return value
+            return value, "same"
         end
         local group = StatGroupKey(stats)
         local prefix = base .. "|stats:"
@@ -378,8 +388,15 @@ local function BetterQualityPrice(rows, itemID, quality, stats, cutoff, keep)
             end
         end
         if cheapest then
-            return cheapest
+            return cheapest, "group"
         end
+        -- A real stat and only other-stat prices at this quality: the
+        -- average is not this stat (a stat-less item's plain key stays "same").
+        local average = QualityAverage(rows, base, cutoff, keep)
+        if average then
+            return average, "average"
+        end
+        return nil
     end
     return QualityAverage(rows, base, cutoff, keep)
 end
@@ -602,7 +619,17 @@ Rules:Add({
         if not newest then
             return
         end
+        -- A price counts only if it was seen in the last complete full scan
+        -- or after it (Brian, 2026-11-20): the full scan sees the whole AH,
+        -- so anything older wasn't listed then. The 3-day window from the
+        -- newest price stays as the limit when there's no full scan (or it
+        -- is older than that), so values still don't vanish for a player who
+        -- didn't log in for a week (2026-10-23).
         local cutoff = newest - CURRENT_WINDOW_SECONDS
+        local lastFullScan = type(cache.GetLastScanTime) == "function" and tonumber(cache:GetLastScanTime()) or nil
+        if lastFullScan and lastFullScan > cutoff then
+            cutoff = lastFullScan
+        end
 
         local provenance = ctx.result and ctx.result.provenance
         local stats = RealStats(provenance and provenance.marketKey)
@@ -625,15 +652,16 @@ Rules:Add({
         -- and always counts.
         local priced = {}
         for _, position in ipairs(better) do
-            local price = BetterQualityPrice(RowsFor(position.itemID), position.itemID, position.quality, stats, cutoff,
+            local price, kind = BetterQualityPrice(RowsFor(position.itemID), position.itemID, position.quality, stats, cutoff,
                 NotClown(position.itemID))
             if price then
-                priced[#priced + 1] = { position = position, price = price }
+                priced[#priced + 1] = { position = position, price = price, kind = kind }
             end
         end
         table.sort(priced, function(a, b) return a.position.share < b.position.share end)
 
         local lowestCap, lowestFrom, lowestFromPrice
+        local sameStat = false
         for index, entry in ipairs(priced) do
             local above
             for later = index + 1, #priced do
@@ -655,14 +683,25 @@ Rules:Add({
                 if not lowestCap or cap < lowestCap then
                     lowestCap, lowestFrom, lowestFromPrice = cap, entry.position, entry.price
                 end
+                if entry.kind == "same" then
+                    sameStat = true
+                end
             end
         end
 
+        -- ladder = true: the cap came from the tool ladder, so the item is a
+        -- like item and smart posting prices it from the better version
+        -- (Brian, 2026-11-20). ladderSameStat: a better version with this
+        -- item's own stat is listed (ranked above a similar-stat listing).
         NoteCap(ctx, lowestCap, lowestFrom and {
             itemID = lowestFrom.itemID,
             quality = lowestFrom.quality,
             price = lowestFromPrice,
+            ladder = true,
         } or nil)
+        if lowestCap and type(ctx.result) == "table" then
+            ctx.result.ladderSameStat = sameStat or nil
+        end
         local ownCurrent = OwnCurrentPrice(RowsFor(itemID), itemID, quality, stats, cutoff)
         local target, note, filledFromLadder
         if ownCurrent and (not lowestCap or ownCurrent <= lowestCap) then

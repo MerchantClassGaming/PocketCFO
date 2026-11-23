@@ -119,6 +119,28 @@
 --   Questing time counts in the run like any other gap; the run keeps its
 --   normal label. Only Stop or RUN_END_SECONDS without loot ends a run.
 --
+-- Extras (Brian, 2026-11-20; claude/Gathering_Run_Extras_Design.md): while a
+--   run is open it also counts what else the hour produced. Matters most on
+--   Forever (no flying: you fight your way from node to node) and for
+--   skinning everywhere. Flavor: Both.
+--   - Only gathering / fishing / beast loot (AddLoot) starts a run, keeps it
+--     alive and counts toward MIN_RUN_LOOTS. Extras never touch run.loots or
+--     lastLootAt.
+--   - Items: Item Ledger entries (MCG_ITEM_LEDGER_ENTRY) coming in with
+--     category looted (mob corpses), other (chests, objects) or container
+--     (bag contents). Gathering and fishing entries are skipped (AddLoot
+--     already has them). Great beast kill loot is skipped (AddBeastExtras has
+--     it). Added to run.items (so the ranking re-prices them like the rest),
+--     the "extras" part and the zone, at today's price when they come in.
+--   - A container opened during the run (MCG_CONTAINER_OPENING) is used up:
+--     -1 per opening on the container item, so a bag looted on the run counts
+--     as its contents only, and one already held counts as contents minus the bag.
+--   - Gold: run.gold[category] = copper, looted gold in (+) and repairs out
+--     (-) only. Everything else (vendor sales, AH, mail, training, flights)
+--     has nothing to do with the route, and vendor-selling loot would count
+--     the item twice. Added to the run's value (GetRunGold).
+--   - Nothing is counted while a run is paused.
+--
 -- Messages (split 2026-10-26: rebuilding the ranking on every loot lagged each skin):
 --   MCG_ACTIVITY_RUNS_UPDATED - loot added to the run in progress (live numbers only)
 --   MCG_ACTIVITY_RUNS_FILED   - a run was filed or saved runs changed (ranking)
@@ -157,6 +179,11 @@ local GATHER_LABELS = {
 }
 local BEAST_EXTRAS_DELAY = 1   -- seconds; lets the skin window's loot land in the run first
 local BEAST_PART = "beastkill"
+-- Extras (2026-11-20, see header).
+local EXTRA_PART = "extras"
+ActivityRuns.EXTRA_PART = EXTRA_PART
+local EXTRA_ITEM_CATS = { looted = true, other = true, container = true }
+local RUN_GOLD_CATS = { looted = true, repair = true }
 
 local PRICE_CACHE_SECONDS = 1800
 
@@ -1051,6 +1078,130 @@ function ActivityRuns:GetRunCost(run)
     return copper, run and run.costUnpriced or false
 end
 
+-- Net gold on a run (looted gold minus repairs, 2026-11-20). Copper.
+function ActivityRuns:GetRunGold(run)
+    local copper = 0
+    for _, amount in pairs(run and run.gold or {}) do
+        copper = copper + (tonumber(amount) or 0)
+    end
+    return copper
+end
+
+-- ---------------------------------------------------------------------------
+-- Extras (2026-11-20, see header)
+-- ---------------------------------------------------------------------------
+
+-- The current character's run if extras may land on it: open, not paused,
+-- not past its end time (an ended run is filed here instead).
+local function RunForExtras()
+    local db = RunsDB()
+    local guid = PlayerGUID()
+    local run = db and guid and db.current[guid]
+    if not run or run.pausedAt then
+        return nil
+    end
+    if ActivityRuns:FinishRunIfEnded(guid, time()) then
+        ActivityRuns:SendMessage("MCG_ACTIVITY_RUNS_FILED")
+        return nil
+    end
+    return db.current[guid]
+end
+
+-- Adds qty (negative = used up) of one item to a bucket without counting a
+-- loot, so the run's loot count and main zone stay gathering-only.
+local function AddExtraItem(bucket, slot, copper)
+    bucket.copper = (bucket.copper or 0) + copper
+    bucket.items = bucket.items or {}
+    AddItem(bucket.items, slot)
+end
+
+local function ApplyExtraItem(run, itemID, link, qty, countLoot)
+    local unit = ActivityRuns:GetUnitValue(itemID, link)
+    local slot = { itemID = itemID, link = link, qty = qty, unitValue = unit }
+    local copper = (unit or 0) * qty
+    run.copper = (run.copper or 0) + copper
+    run.items = run.items or {}
+    AddItem(run.items, slot)
+    run.parts = run.parts or {}
+    local part = run.parts[EXTRA_PART] or NewBucket()
+    run.parts[EXTRA_PART] = part
+    part.source = "extras"
+    AddExtraItem(part, slot, copper)
+    if countLoot then
+        part.loots = (part.loots or 0) + 1
+    end
+    AddExtraItem(CurrentZoneBucket(run), slot, copper)
+end
+
+local function IsGreatBeast(npcID)
+    local capture = npcID and PocketCFO:GetModule("BeastSkinCapture", true)
+    local beasts = capture and capture.GetBeasts and capture:GetBeasts()
+    return beasts and beasts[npcID] ~= nil or false
+end
+
+-- One Item Ledger entry (MCG_ITEM_LEDGER_ENTRY).
+function ActivityRuns:OnLedgerEntry(_, entry)
+    if type(entry) ~= "table" then
+        return
+    end
+    if entry.kind == "gold" then
+        if not RUN_GOLD_CATS[entry.cat] then
+            return
+        end
+        local amount = tonumber(entry.qty) or 0
+        if amount == 0 then
+            return
+        end
+        local run = RunForExtras()
+        if not run then
+            return
+        end
+        if entry.dir == "out" then
+            amount = -amount
+        end
+        run.gold = run.gold or {}
+        run.gold[entry.cat] = (run.gold[entry.cat] or 0) + amount
+        SessionLog("run extra gold %s %d", tostring(entry.cat), amount)
+        self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
+        return
+    end
+    if entry.kind ~= "item" or entry.dir ~= "in" or not EXTRA_ITEM_CATS[entry.cat] then
+        return
+    end
+    local itemID = tonumber(entry.iid)
+    local qty = tonumber(entry.qty) or 0
+    if not itemID or qty <= 0 then
+        return
+    end
+    if entry.cat == "looted" and IsGreatBeast(tonumber(entry.src)) then
+        return
+    end
+    local run = RunForExtras()
+    if not run then
+        return
+    end
+    ApplyExtraItem(run, itemID, entry.link, qty, true)
+    SessionLog("run extra %s item %d x%d", tostring(entry.cat), itemID, qty)
+    self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
+end
+
+-- A container opened during the run is used up (its contents arrived as
+-- container ledger entries just before this message).
+function ActivityRuns:OnContainerOpening(_, opening)
+    local opens = tonumber(opening and opening.opens) or 0
+    local itemID = tonumber(opening and opening.itemID)
+    if opens <= 0 or not itemID then
+        return
+    end
+    local run = RunForExtras()
+    if not run then
+        return
+    end
+    ApplyExtraItem(run, itemID, opening.link, -opens, false)
+    SessionLog("run extra container %d opened x%d", itemID, opens)
+    self:SendMessage("MCG_ACTIVITY_RUNS_UPDATED")
+end
+
 -- ---------------------------------------------------------------------------
 -- Read API (PocketCFO_PnL, minimap button). Callers must not modify tables.
 -- ---------------------------------------------------------------------------
@@ -1202,7 +1353,7 @@ function ActivityRuns:GetRunStats(run, now)
         return nil
     end
     local cost, costUnpriced = self:GetRunCost(run)
-    local copper = self:ValueItems(run.items) - cost
+    local copper = self:ValueItems(run.items) - cost + self:GetRunGold(run)
     local seconds = self:GetRunSeconds(run, now)
     local zone, zoneLoots = nil, -1
     for name, bucket in pairs(run.zones or {}) do
@@ -1285,6 +1436,9 @@ function ActivityRuns:OnEnable()
     self:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE", "OnInteractionHide")
     -- A container's average contents changed: its value may have too.
     self:RegisterMessage("MCG_CONTAINER_OPENED", "ClearPriceCache")
+    -- Extras (2026-11-20): mob loot, chests, containers, looted gold, repairs.
+    self:RegisterMessage("MCG_ITEM_LEDGER_ENTRY", "OnLedgerEntry")
+    self:RegisterMessage("MCG_CONTAINER_OPENING", "OnContainerOpening")
     if C_Timer and C_Timer.NewTicker then
         self.ticker = C_Timer.NewTicker(CHECK_SECONDS, function()
             ActivityRuns:CheckEndedRuns()

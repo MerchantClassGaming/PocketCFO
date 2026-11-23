@@ -4,6 +4,7 @@
 --   Left-click:  toggle the Gold window on the last tab used (2026-10-31;
 --                Gold per Hour the first time) (PocketCFO_PnL)
 --   Right-click: toggle the tracker window (PocketCFO_PnL)
+--   Shift-click: toggle the shopping list (2026-11-21, ShoppingListWindow.lua)
 -- Button position / hidden state: PocketCFO_DB.global.minimap (LibDBIcon's table).
 -- The existing Addon Compartment entry (BetaFeatures.lua) is unchanged.
 -- Theoretical: LibDBIcon on WoW Forever (library supports Classic clients).
@@ -97,6 +98,10 @@ function MinimapButton:OnEnable()
         text = "PocketCFO",
         icon = ICON,
         OnClick = function(_, mouseButton)
+            if IsShiftKeyDown and IsShiftKeyDown() and PocketCFO.OpenShoppingList then
+                PocketCFO.OpenShoppingList()
+                return
+            end
             if mouseButton == "RightButton" then
                 local runs = PocketCFO:GetModule("ActivityRuns", true)
                 if runs then
@@ -118,9 +123,16 @@ function MinimapButton:OnEnable()
             tooltip:AddLine(" ")
             tooltip:AddDoubleLine("Gathered today (all toons)", FormatMoney(TodayGathered()),
                 0.8, 0.8, 0.8, 1, 1, 1)
+            local list = PocketCFO.ShoppingList
+            local toBuy = list and #list:GetLines() or 0
+            if toBuy > 0 then
+                tooltip:AddDoubleLine("Shopping list", toBuy .. (toBuy == 1 and " item to buy" or " items to buy"),
+                    0.8, 0.8, 0.8, 1, 1, 1)
+            end
             tooltip:AddLine(" ")
             tooltip:AddLine("Left-click: Gold window", 0.6, 0.6, 0.6)
             tooltip:AddLine("Right-click: Tracker", 0.6, 0.6, 0.6)
+            tooltip:AddLine("Shift-click: Shopping list", 0.6, 0.6, 0.6)
         end,
     })
     if not dataObject then
