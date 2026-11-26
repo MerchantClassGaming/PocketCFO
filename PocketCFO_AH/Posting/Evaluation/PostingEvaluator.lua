@@ -170,7 +170,7 @@ end
 -- Nobody lists this exact item and a better version for sale sets the max
 -- (Brian, 2026-11-16): say so, so "no other listings" doesn't read as "post
 -- it as high as I like", and the player doesn't need the tooltip to see why.
-local CAPPED_BY_BETTER_NOTE = "No exact listings. Capped by a better version for sale."
+local CAPPED_BY_BETTER_NOTE = "No exact listings. Priced from a better version for sale."
 
 -- The max was raised to a recent sale of this exact version (SmartPricing
 -- bounds.ceilingFromSale, Brian 2026-11-17): "your last sale (1,059g, 6
@@ -594,10 +594,10 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
     -- (SmartPricing MAX_HEADROOM, 2026-11-15): above the max is always the max.
     if ceiling and ceiling > 0 and lowestPrice > ceiling then
         -- Nobody is listed at the max: we picked it (check, 2026-11-06).
-        local note = "Others listed far higher. Priced at the max."
+        local note = "Others listed higher. Priced at the highest we'd match."
         local check = true
         if bounds.ceilingBase == "rule" then
-            note = "Others higher. Priced at highest we'd match."
+            note = "Others listed higher. Priced from a better version for sale."
             check = not BetterVersionMax(bounds)
         end
         if bounds.ceilingAtFloor then
@@ -606,7 +606,7 @@ local function EvaluateSmart(row, rule, ladderResult, marketSettings, evaluation
         -- Max raised to a recent sale (2026-11-17): Check, since others
         -- list higher and the player may want to go up.
         if bounds.ceilingFromSale then
-            note = "Others listed far higher. Priced at " .. LastSaleText(bounds) .. "."
+            note = "Others listed higher. Priced at " .. LastSaleText(bounds) .. "."
             check = true
         end
         local result = Result(true, ceiling, note .. dealNote, lowestAuction)

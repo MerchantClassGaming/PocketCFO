@@ -1,29 +1,19 @@
-Forever and Retail
-Valuation now falls back to last scanned if Blizzard doesn't report a realm on login. This addresses a recent update from Blizzard (bug or "feature") where realm names are not always being sent.
-
-Shopping lists
-Add items to a shopping list from the recipe analysis window. This will look at reagents you already have in inventory (bags or bank) and add how many more you need to make the desired quantity of outputs. Open the shopping list at any time by shift+clicking on the Pocket CFO minimap icon. Add things manually to the list when the list is open.
-
-Fixed 2 bugs causing the gold tracker to double count certain drops in dungeons.
-
-AH Smart Pricing
-Made the notes a little easier to understand what was really happening.
-
-Item Tooltips
-Now shows where and how many of an item you have.
-
-Gold Tracker
-Automatic gathering sessions now include gold earned from mob loot and chests collected during the run.
-
 Forever Only
 Merchant Favor analysis
-On the Pocket CFO Dashboard, you now have an "analysis" section. The first item added here is the crate analysis. Pushing the crate analysis button will run through all of the waylaid crates available and the cheapest way to fill them from current prices, giving you a "cost per favor" calculation and showing you the cheapest way to gain favor. Clicking the "add" button on the right side of the analysis will add missing items to your shopping list (1 add button for each line in the analysis).
+- Use this to figure out the cheapest way to earn a specific amount of merchant's favor based on current auction house pricing.
+- Analysis now has its own tab along the bottom of the Pocket CFO Auction House window.
+- Type in how much Favor you want before you run it. Analyze scans the Auction House (about a minute and a half), or uses your last scan if it's less than 15 minutes old, so the answer comes from current prices. The scan also refreshes all your item values.
+- The plan shows the cheapest way to reach that Favor. Each line is a crate, what to fill it with, how many, the gold and the gold per Favor. As the cheap listings run out, the plan moves to the next cheapest option, so the same crate can show up twice with two different fills.
+- Everything is priced at what it sells for, even items you already own, since you could sell them instead.
+- Shows when a higher level would make it cheaper (for example "At level 20 this would cost 2g less").
+- One "Add plan to shopping list" button adds the whole plan. Your Shopping List takes off what you already have.
+- Runs at your own faction's Auction House only.
 
-Gold Tracker no longer resets if you die in a dungeon and run back/reenter to resurrect.
+Separate prices for each Auction House
+- Alliance, Horde and Neutral Auction Houses now keep their own prices, separately for each ruleset (Normal, PvP and so on). A scan at Booty Bay no longer mixes into your faction's prices.
+- Everything in PocketCFO uses your faction's prices. If you've scanned a Neutral Auction House, item tooltips also show a "Neutral AH" line with that price and how long ago it was scanned, so you can see which side pays more.
 
-Retail Only
-Patron Orders
-Orders that will award 1 knowledge point for a first craft bonus now show the bonus in the order summary as +1KP (added to any rewards that also give knowledge points), meaning you can see +1, +2, or +3 KP depending on first craft bonus and rewards.
-
-Shopping lists
-On retail, you get buttons on the orders screens to add missing items to the shopping list to complete profitable orders or all orders.
+Forever and Retail
+AH Smart Pricing
+- More consistent wording on the "others listed higher" notes.
+- The Post button no longer flashes on and off while items are still being priced. It stays off until everything is ready.

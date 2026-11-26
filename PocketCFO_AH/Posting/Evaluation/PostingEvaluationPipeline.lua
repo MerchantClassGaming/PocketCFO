@@ -697,12 +697,15 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
     if not row then
         controller.evaluating = false
         SortEvaluatedRows(controller.rows)
-        controller:NotifyQueueChanged("complete")
-        SessionLog("PostingController: evaluation complete rows=%d", #(controller.rows or {}))
         -- Smart view: re-check once if mat prices were still loading.
+        -- Scheduled before "complete" so a pending re-check already counts
+        -- as evaluating when the list redraws: no Post Selected flash
+        -- (Brian, 2026-11-25).
         if type(controller.RetryLoadingPrices) == "function" then
             pcall(controller.RetryLoadingPrices, controller)
         end
+        controller:NotifyQueueChanged("complete")
+        SessionLog("PostingController: evaluation complete rows=%d", #(controller.rows or {}))
         return
     end
 
@@ -741,6 +744,19 @@ function PostingEvaluationPipeline:EvaluateRow(controller, generation)
 
     local function FinishRow(auctions, lookupMeta)
         if generation ~= controller.generation then
+            return
+        end
+
+        -- Skipped by the player while its search ran (Skip works during
+        -- evaluation, Brian 2026-11-25): keep the Skip, move to the next row.
+        -- A row Kept mid-search is already off the list, so the result
+        -- written below lands on a row nothing shows.
+        if row.userSkipped then
+            if self.lookupCallActive then
+                self.continuePending = true
+            else
+                self:EvaluateRow(controller, generation)
+            end
             return
         end
 

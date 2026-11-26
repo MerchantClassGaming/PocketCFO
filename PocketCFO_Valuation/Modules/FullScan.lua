@@ -529,6 +529,7 @@ function FullScan:ProcessFinalizeChunk()
     cache:SetLastScanTime(self.status.startedAt or self.status.completedAt)
     self.status.lastError = nil
     self.status.rejectReason = nil
+    self:HandListingsToKeepers()
     self:ClearRuntimeState()
     self:UnregisterScanEvents()
     self:RegisterPassiveProbe()
@@ -545,6 +546,79 @@ function FullScan:ProcessFinalizeChunk()
     local gearPairs = PocketCFO_Valuation:GetModule("ProfessionGearPairs", true)
     if gearPairs and gearPairs.Rebuild then
         gearPairs:Rebuild()
+    end
+end
+
+-- ─── Listing keepers (2026-11-24, claude/Analysis_Tab_Design.md) ───────────
+-- The scan keeps no auction rows. A module that needs the listings of a
+-- few items (Crate analysis: 126 crates and mats, Forever) registers them;
+-- at the end of each finished scan it gets, per item ID, every listing
+-- level cheapest first: { { price = copper each, qty = n }, ... }. Items
+-- with nothing listed are left out. Flavor: Both (no keeper on retail, so
+-- it does nothing there).
+--   FullScan:AddListingKeeper(key, itemIDs, function(listings, scanStartedAt) end)
+function FullScan:AddListingKeeper(key, itemIDs, callback)
+    if not key or type(callback) ~= "function" then
+        return
+    end
+    local wanted = {}
+    for _, itemID in ipairs(itemIDs or {}) do
+        itemID = tonumber(itemID)
+        if itemID then
+            wanted[itemID] = true
+        end
+    end
+    self.listingKeepers = self.listingKeepers or {}
+    self.listingKeepers[key] = { wanted = wanted, callback = callback }
+end
+
+function FullScan:HandListingsToKeepers()
+    if not self.listingKeepers or not next(self.listingKeepers) then
+        return
+    end
+    -- Price -> quantity per item ID (all market keys of an item together).
+    local byItem = {}
+    for _, bucket in pairs(self.buckets or {}) do
+        local itemID = tonumber(bucket.identity and bucket.identity.itemID)
+        if itemID then
+            for _, keeper in pairs(self.listingKeepers) do
+                if keeper.wanted[itemID] then
+                    local levels = byItem[itemID] or {}
+                    byItem[itemID] = levels
+                    for _, observation in ipairs(bucket.observations or {}) do
+                        local qty = tonumber(observation.quantity) or 1
+                        local price = tonumber(observation.unitPrice)
+                            or tonumber(observation.buyout)
+                        if price and price > 0 and qty > 0 then
+                            levels[price] = (levels[price] or 0) + qty
+                        end
+                    end
+                    break
+                end
+            end
+        end
+    end
+    local listings = {}
+    for itemID, levels in pairs(byItem) do
+        local list = {}
+        for price, qty in pairs(levels) do
+            list[#list + 1] = { price = price, qty = qty }
+        end
+        table.sort(list, function(a, b)
+            return a.price < b.price
+        end)
+        listings[itemID] = list
+    end
+    local startedAt = self.status and (self.status.startedAt or self.status.completedAt) or Now()
+    for key, keeper in pairs(self.listingKeepers) do
+        local mine = {}
+        for itemID in pairs(keeper.wanted) do
+            mine[itemID] = listings[itemID]
+        end
+        local ok, err = pcall(keeper.callback, mine, startedAt)
+        if not ok then
+            PocketCFO:Debug("FullScan: listing keeper %s failed: %s", tostring(key), tostring(err))
+        end
     end
 end
 

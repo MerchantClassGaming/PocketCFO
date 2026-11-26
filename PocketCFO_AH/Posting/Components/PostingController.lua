@@ -263,6 +263,12 @@ function PostingController:IsEvaluationInProgress()
     if self.evaluating == true then
         return true
     end
+    -- A re-check is waiting to start (RetryLoadingPrices): still evaluating,
+    -- so Post Selected doesn't turn on and back off (Brian, 2026-11-25).
+    -- Tied to the run, so a Refresh or new run cancels it by itself.
+    if self.retryPendingGeneration ~= nil and self.retryPendingGeneration == self.generation then
+        return true
+    end
 
     for _, row in ipairs(self.rows or {}) do
         local status = row and row.evaluation and row.evaluation.status or row and row.status
@@ -925,7 +931,8 @@ local function LoadingRows(rows)
         local loading = bounds and bounds.pricesLoading and not row.loadingRetried
         -- Same one-time re-check for a row whose AH search didn't finish.
         local searchFailed = row.evaluation and row.evaluation.searchIncomplete and not row.searchRetried
-        if (loading or searchFailed) and row.candidate then
+        -- Never re-check a row the player skipped: it would undo the Skip.
+        if (loading or searchFailed) and row.candidate and not row.userSkipped then
             list[#list + 1] = row
         end
     end
@@ -937,23 +944,34 @@ function PostingController:RetryLoadingPrices()
         return
     end
     local generation = self.generation
+    self.retryPendingGeneration = generation
     C_Timer.After(LOADING_RETRY_DELAY, function()
+        if self.retryPendingGeneration == generation then
+            self.retryPendingGeneration = nil
+        end
         if self.generation ~= generation then
             return
         end
+        -- No re-check after all: redraw so Post Selected turns on.
+        local function Done()
+            self:NotifyQueueChanged("complete")
+        end
         if not (_G.AuctionHouseFrame and _G.AuctionHouseFrame:IsShown()) then
+            return Done()
+        end
+        if self:IsEvaluationInProgress() then
             return
         end
-        if self:IsEvaluationInProgress() or self:IsPostingInProgress() or HasOverrides(self.rows) then
-            return
+        if self:IsPostingInProgress() or HasOverrides(self.rows) then
+            return Done()
         end
         local smart = PocketCFO_AH:GetModule("SmartPricing", true)
         if not smart then
-            return
+            return Done()
         end
         local rows = LoadingRows(self.rows)
         if #rows == 0 then
-            return
+            return Done()
         end
         for _, row in ipairs(rows) do
             row.loadingRetried = true

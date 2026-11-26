@@ -52,13 +52,21 @@ local function Debug(msg, ...)
 end
 
 -- This realm group's history table, or nil before the group is known.
-local function GetGroupHistory()
+-- forScan (Forever, 2026-11-24, claude/Forever_Markets_Design.md): a scan
+-- records into the market of the AH it ran at (PricingCache scan key);
+-- lookups read your faction's market (read key). Same key on retail.
+local function GetGroupHistory(forScan)
     local db = PocketCFO_Valuation.db
     if not db or not db.global then
         return nil
     end
     local cache = PocketCFO_Valuation:GetModule("PricingCache", true)
-    local key = cache and cache.GetRealmGroupKey and cache:GetRealmGroupKey()
+    local key
+    if forScan and cache and cache.GetScanMarketKey then
+        key = cache:GetScanMarketKey()
+    else
+        key = cache and cache.GetRealmGroupKey and cache:GetRealmGroupKey()
+    end
     if not key then
         return nil
     end
@@ -208,7 +216,7 @@ function ScanHistory:RecordFromBucket(marketKey, bucket, scanValue)
         if not price or price <= 0 then
             return
         end
-        local group = GetGroupHistory()
+        local group = GetGroupHistory(true)
         if not group then
             return
         end

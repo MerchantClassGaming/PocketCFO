@@ -23,41 +23,164 @@ end
 -- Only worked out after login, and kept once known.
 local realmGroupKey
 
--- No realm name (Brian, 2026-11-21, WoW Forever beta): GetAutoCompleteRealms
--- and GetNormalizedRealmName both came back empty (GetRealmName too), so no
--- realm group was known: tooltips showed no PCFO Value and scans saved
--- nothing. Prices then use the saved realm group with the most recent full
--- scan. Nothing saved yet (new install or wipe): the fixed key "Forever",
--- so the first scan creates it and it's used from then on. Flavor:
--- Forever-only (gated).
-local NO_REALM_KEY = "Forever"
-
-local function MostRecentRealmGroupKey()
+local function SessionLog(text)
     local core = _G.PocketCFO
-    if not (core and core.flavor == "forever") then
-        return nil
+    if core and core.AppendSessionLog then
+        core:AppendSessionLog("[MCG] PricingCache: " .. text)
     end
-    local db = PocketCFO_Valuation.db
-    if not (db and db.global) then
-        return nil
-    end
-    local groups = type(db.global.realmGroups) == "table" and db.global.realmGroups or {}
-    local bestKey, bestScan
-    for key, store in pairs(groups) do
-        local lastScan = type(store) == "table" and tonumber(store.timeOfLastReplicateScan) or 0
-        if not bestKey or lastScan > bestScan then
-            bestKey, bestScan = key, lastScan
-        end
-    end
-    bestKey = bestKey or NO_REALM_KEY
-    realmGroupKey = bestKey
-    if core.AppendSessionLog then
-        core:AppendSessionLog("[MCG] PricingCache: no realm name from the game; using realm group: " .. tostring(bestKey))
-    end
-    return bestKey
 end
 
-local function GetRealmGroupKey()
+local function IsForever()
+    local core = _G.PocketCFO
+    return core and core.flavor == "forever" or false
+end
+
+-- ---------------------------------------------------------------------------
+-- Forever markets (Brian, 2026-11-24). Forever has one Alliance, one Horde
+-- and one Neutral Auction House per ruleset (Normal, PvP, Roleplay,
+-- Hardcore), and the game gives no realm name (GetRealmName,
+-- GetNormalizedRealmName and GetAutoCompleteRealms all empty). Each market
+-- gets its own prices. Key = "Forever-<ruleset>-<side>":
+--   ruleset  C_GameRules.GetCurrentGameModeRecordID(). Confirmed in-game
+--            2026-11-24: 14 on PvP (Alliance), 15 on Normal (Horde).
+--   side     While an AH is open: the auctioneer's faction, none = Neutral.
+--            Confirmed: Golothas (Darnassus) Alliance, Thathung (Orgrimmar)
+--            Horde, O'reely (Booty Bay) none. Otherwise: your character's
+--            faction.
+-- Two keys (Brian, 2026-11-24, claude/Forever_Markets_Design.md):
+--   read key  Your faction's market, always (even at a Neutral AH). Every
+--             price lookup: PCFO Value, Smart Posting, Cancel, recipes,
+--             Shopping List, ledger values.
+--   scan key  The open AH's market (your faction's when no AH is open).
+--             Scans and item searches save here, and scan status (last
+--             scan, 15-minute cooldown, "No prices yet") reads from here.
+-- The tooltip's "Neutral AH" line reads the Neutral market on its own
+-- (GetNeutralEntry). A full scan stops if the AH closes (FullScan), so one
+-- scan never writes into two markets.
+-- Theoretical: the record ID stays the same across logins and patches;
+-- Gadgetzan / Everlook auctioneers also have no faction.
+-- Replaces the Nov 21 "most recently scanned realm group" fallback.
+-- Flavor: Forever-only (gated).
+-- ---------------------------------------------------------------------------
+local FOREVER_KEY_PREFIX = "Forever-"
+local foreverRuleset, foreverFaction
+local foreverAHSide -- "Alliance" / "Horde" / "Neutral" while an AH is open
+
+local function ForeverRuleset()
+    if foreverRuleset then
+        return foreverRuleset
+    end
+    local fn = C_GameRules and C_GameRules.GetCurrentGameModeRecordID
+    if type(fn) ~= "function" then
+        return nil
+    end
+    local ok, id = pcall(fn)
+    id = ok and tonumber(id) or nil
+    if not id or id <= 0 then
+        return nil
+    end
+    foreverRuleset = id
+    return id
+end
+
+local function ForeverFaction()
+    if foreverFaction then
+        return foreverFaction
+    end
+    local faction = UnitFactionGroup and UnitFactionGroup("player")
+    if faction == "Alliance" or faction == "Horde" then
+        foreverFaction = faction
+    end
+    return foreverFaction
+end
+
+local function ForeverMarketKey(side)
+    local ruleset = ForeverRuleset()
+    if not ruleset or not side then
+        return nil
+    end
+    return FOREVER_KEY_PREFIX .. ruleset .. "-" .. side
+end
+
+local function ForeverReadKey()
+    return ForeverMarketKey(ForeverFaction())
+end
+
+local function ForeverScanKey()
+    return ForeverMarketKey(foreverAHSide or ForeverFaction())
+end
+
+-- The open AH's side: the auctioneer's faction, none = Neutral. nil when
+-- the game hasn't given an auctioneer (no npc unit).
+local function AuctioneerSide()
+    if not (UnitGUID and UnitGUID("npc")) then
+        return nil
+    end
+    local faction = UnitFactionGroup and UnitFactionGroup("npc")
+    if faction == "Alliance" or faction == "Horde" then
+        return faction
+    end
+    return "Neutral"
+end
+
+-- Only the scan key moves with the open AH; price lookups never do, so
+-- nothing needs recomputing. Logged when the scan market changes.
+local function SetForeverAHSide(side)
+    local before = ForeverScanKey()
+    foreverAHSide = side
+    local after = ForeverScanKey()
+    if before ~= after then
+        SessionLog(string.format("scan market %s -> %s", tostring(before), tostring(after)))
+    end
+end
+
+if IsForever() then
+    local ahOpen = false
+    local sideFrame = CreateFrame("Frame")
+    sideFrame:RegisterEvent("AUCTION_HOUSE_SHOW")
+    sideFrame:RegisterEvent("AUCTION_HOUSE_CLOSED")
+    sideFrame:SetScript("OnEvent", function(_, event)
+        if event == "AUCTION_HOUSE_CLOSED" then
+            ahOpen = false
+            SetForeverAHSide(nil)
+            return
+        end
+        ahOpen = true
+        local side = AuctioneerSide()
+        if side then
+            SetForeverAHSide(side)
+            return
+        end
+        -- No auctioneer yet: try once more shortly. Still none = this AH is
+        -- treated as your faction's.
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0.3, function()
+                if not ahOpen then
+                    return
+                end
+                local later = AuctioneerSide()
+                if later then
+                    SetForeverAHSide(later)
+                else
+                    SessionLog("AH opened with no auctioneer; using your faction's market")
+                end
+            end)
+        end
+    end)
+end
+
+-- forScan: the scan key (Forever: the open AH's market). Otherwise the
+-- read key. Retail has one key for both.
+local function GetRealmGroupKey(forScan)
+    if IsForever() then
+        if IsLoggedIn and not IsLoggedIn() then
+            return nil
+        end
+        if forScan then
+            return ForeverScanKey()
+        end
+        return ForeverReadKey()
+    end
     if realmGroupKey then
         return realmGroupKey
     end
@@ -79,7 +202,7 @@ local function GetRealmGroupKey()
     if #names == 0 then
         local name = GetNormalizedRealmName and GetNormalizedRealmName()
         if type(name) ~= "string" or name == "" then
-            return MostRecentRealmGroupKey()
+            return nil
         end
         names[1] = name
     end
@@ -323,14 +446,65 @@ local function MigrateMarketKeys(db)
     end
 end
 
+-- Forever: prices saved before markets were split (2026-11-24) sit under
+-- an old key ("Forever", or the realm name the beta still gave, e.g.
+-- "CAMWOWUS2Realm6PvP"). The first faction market created on this install
+-- takes the most recently scanned of them, with its scan history; the rest
+-- are dropped. Not a Neutral market: nearly every old scan was at a faction
+-- AH. Anything already blended in is replaced item by item by the next
+-- full scan at each AH. Flavor: Forever-only (gated).
+local function MoveOldForeverPrices(db, key, store)
+    if not IsForever() or key:find("%-Neutral$") then
+        return
+    end
+    local bestKey, bestScan
+    for oldKey, oldStore in pairs(db.global.realmGroups) do
+        if type(oldKey) == "string" and oldKey:sub(1, #FOREVER_KEY_PREFIX) ~= FOREVER_KEY_PREFIX then
+            local lastScan = type(oldStore) == "table" and tonumber(oldStore.timeOfLastReplicateScan) or 0
+            if not bestKey or lastScan > bestScan then
+                bestKey, bestScan = oldKey, lastScan
+            end
+        end
+    end
+    if not bestKey then
+        return
+    end
+    local old = db.global.realmGroups[bestKey]
+    if type(old) == "table" then
+        for field, value in pairs(old) do
+            store[field] = value
+        end
+    end
+    local history = type(db.global.scanHistory) == "table" and db.global.scanHistory or nil
+    if history and history[bestKey] ~= nil then
+        history[key] = history[bestKey]
+    end
+    local dropped = 0
+    for oldKey in pairs(db.global.realmGroups) do
+        if type(oldKey) == "string" and oldKey:sub(1, #FOREVER_KEY_PREFIX) ~= FOREVER_KEY_PREFIX then
+            db.global.realmGroups[oldKey] = nil
+            if history then
+                history[oldKey] = nil
+            end
+            if oldKey ~= bestKey then
+                dropped = dropped + 1
+            end
+        end
+    end
+    SessionLog(string.format("old Forever prices moved %s -> %s (other old groups dropped=%d)",
+        tostring(bestKey), tostring(key), dropped))
+end
+
 -- This realm group's saved data:
 --   { pricingCache = {}, timeOfLastReplicateScan = n, timeOfLastReplicateRequest = n }
-local function GetGroupStore()
+-- forScan: the scan key's store (Forever: the open AH's market), else the
+-- read key's store. Same store on retail.
+local function GetGroupStore(forScan)
     local db = PocketCFO_Valuation.db
     if not db or not db.global then
         return nil
     end
-    local key = GetRealmGroupKey()
+    local key = GetRealmGroupKey(forScan)
     if not key then
         return nil
     end
@@ -350,6 +524,7 @@ local function GetGroupStore()
             db.global.pricingCache = nil
             db.global.timeOfLastReplicateScan = nil
         end
+        MoveOldForeverPrices(db, key, store)
         db.global.realmGroups[key] = store
     end
     store.pricingCache = store.pricingCache or {}
@@ -357,8 +532,8 @@ local function GetGroupStore()
     return store
 end
 
-local function GetCacheRoot()
-    local store = GetGroupStore()
+local function GetCacheRoot(forScan)
+    local store = GetGroupStore(forScan)
     return store and store.pricingCache or nil
 end
 
@@ -367,16 +542,21 @@ end
 -- Built in one walk the first time it's asked for, then kept current by
 -- SetValue / SetPricingRow, so GetCandidatesForItemID is a lookup instead
 -- of a walk over every cached market (~27,500 rows) on each call. Rebuilt
--- if the cache table itself is replaced (e.g. a wipe).
-local itemIndex, itemIndexFor
+-- if the cache table itself is replaced (e.g. a wipe). One index per cache
+-- table (Forever, 2026-11-24): at a Neutral AH, lookups read your faction's
+-- market while searches write the Neutral one, so the two indexes are kept
+-- side by side instead of rebuilding on every switch. Weak keys: a
+-- replaced cache table's index goes with it.
+local itemIndexes = setmetatable({}, { __mode = "k" })
 
 local function KeyItemID(marketKey)
     return tonumber(tostring(marketKey):match("^(%d+)|"))
 end
 
 local function GetItemIndex(cache)
-    if itemIndex and itemIndexFor == cache then
-        return itemIndex
+    local existing = itemIndexes[cache]
+    if existing then
+        return existing
     end
     local index = {}
     for marketKey in pairs(cache) do
@@ -390,14 +570,15 @@ local function GetItemIndex(cache)
             keys[marketKey] = true
         end
     end
-    itemIndex, itemIndexFor = index, cache
+    itemIndexes[cache] = index
     return index
 end
 
 -- Keeps a built index current after a write. Does nothing before the
 -- index is first built (the first build picks the row up).
 local function IndexKey(cache, marketKey)
-    if not itemIndex or itemIndexFor ~= cache then
+    local itemIndex = itemIndexes[cache]
+    if not itemIndex then
         return
     end
     local itemID = KeyItemID(marketKey)
@@ -427,18 +608,50 @@ function PricingCache:GetCache()
     return GetCacheRoot()
 end
 
+-- The read key: where price lookups come from (Forever: your faction's
+-- market).
 function PricingCache:GetRealmGroupKey()
     return GetRealmGroupKey()
 end
 
+-- The scan key: where scans and item searches save, and what scan status
+-- describes (Forever: the open AH's market). Same as GetRealmGroupKey on
+-- retail.
+function PricingCache:GetScanMarketKey()
+    return GetRealmGroupKey(true)
+end
+
+-- The Neutral AH's saved price for a market key on your ruleset, for the
+-- tooltip's "Neutral AH" line (Brian, 2026-11-24). Returns value,
+-- timestamp, or nil when not Forever, no Neutral scan, or no price for
+-- this key. Reads only: never creates the Neutral market's store.
+-- Flavor: Forever-only (gated).
+function PricingCache:GetNeutralEntry(marketKey)
+    if not IsForever() or not marketKey or tostring(marketKey) == "" then
+        return nil
+    end
+    local key = ForeverMarketKey("Neutral")
+    local db = PocketCFO_Valuation.db
+    local groups = key and db and db.global and db.global.realmGroups
+    local store = type(groups) == "table" and groups[key] or nil
+    local cache = type(store) == "table" and store.pricingCache or nil
+    local row = type(cache) == "table" and cache[tostring(marketKey)] or nil
+    local value = NormalizeValue(row)
+    if not value then
+        return nil
+    end
+    return value, tonumber(row.timestamp)
+end
+
 -- When this realm group last finished a full scan (server time), or nil.
+-- Scan status: the scan key (Forever: the open AH's market).
 function PricingCache:GetLastScanTime()
-    local store = GetGroupStore()
+    local store = GetGroupStore(true)
     return store and tonumber(store.timeOfLastReplicateScan) or nil
 end
 
 function PricingCache:SetLastScanTime(timestamp)
-    local store = GetGroupStore()
+    local store = GetGroupStore(true)
     if store then
         store.timeOfLastReplicateScan = tonumber(timestamp)
     end
@@ -448,12 +661,12 @@ end
 -- nil. Drives the 15-minute cooldown: Blizzard's own cooldown counts from
 -- the request, finished or not.
 function PricingCache:GetLastRequestTime()
-    local store = GetGroupStore()
+    local store = GetGroupStore(true)
     return store and tonumber(store.timeOfLastReplicateRequest) or nil
 end
 
 function PricingCache:SetLastRequestTime(timestamp)
-    local store = GetGroupStore()
+    local store = GetGroupStore(true)
     if store then
         store.timeOfLastReplicateRequest = tonumber(timestamp)
     end
@@ -478,7 +691,7 @@ function PricingCache:SetValue(marketKey, value, timestamp, source)
         return nil
     end
 
-    local cache = GetCacheRoot()
+    local cache = GetCacheRoot(true)
     if not cache then
         return nil
     end
@@ -506,7 +719,7 @@ function PricingCache:SetPricingRow(marketKey, row)
         return nil
     end
 
-    local cache = GetCacheRoot()
+    local cache = GetCacheRoot(true)
     if not cache then
         return nil
     end
@@ -559,7 +772,7 @@ end
 function PricingCache:MarkNotListed(itemID, seenSince, at)
     itemID = tonumber(itemID)
     seenSince = tonumber(seenSince)
-    local cache = GetCacheRoot()
+    local cache = GetCacheRoot(true)
     if not itemID or not seenSince or not cache then
         return 0
     end

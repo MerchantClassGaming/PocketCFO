@@ -554,6 +554,10 @@ function PostingUI:StartEdit(button, field)
     if not RowEditable(controller, self.rows, row)
         and not (field == "usually" and row.evaluation and not (row.posting and row.posting.pending == true)
             and not IsEvaluationInProgress(controller, self.rows) and not IsPostingInProgress(controller, self.rows)) then
+        -- Can't edit now (e.g. evaluating), but the click still selects the
+        -- row, same as clicking the rest of it, so Skip / Keep can use it
+        -- (Brian, 2026-11-25).
+        self:SelectRow(button.queueIndex, false)
         return
     end
     self:SelectRow(button.queueIndex, false)
@@ -638,13 +642,29 @@ function PostingUI:FinishEdit(commit)
     end
 end
 
+-- Skip and Keep work during evaluation (Brian, 2026-11-25), but only on a
+-- row the player clicked: the list re-sorts after every row and the
+-- automatic selection follows the top row, so it can move as they click.
+-- Never while posting.
+function PostingUI:CanSkipOrKeepSelected()
+    local controller = self:GetController()
+    local selected = self.selectedIndex and self.rows and self.rows[self.selectedIndex] or nil
+    if not selected or IsPostingInProgress(controller, self.rows) then
+        return false
+    end
+    if IsEvaluationInProgress(controller, self.rows) and self.autoSelected then
+        return false
+    end
+    return true
+end
+
 function PostingUI:HandleSkipSelected()
     local row = self.selectedIndex and self.rows and self.rows[self.selectedIndex] or nil
     local controller = self:GetController()
     if not row or not controller or not controller.SkipRow then
         return
     end
-    if IsEvaluationInProgress(controller, self.rows) or IsPostingInProgress(controller, self.rows) then
+    if not self:CanSkipOrKeepSelected() then
         return
     end
     self.selectedIndex = nil
@@ -658,7 +678,7 @@ function PostingUI:HandleKeepSelected()
     if not row or not controller or not controller.KeepRow then
         return
     end
-    if IsEvaluationInProgress(controller, self.rows) or IsPostingInProgress(controller, self.rows) then
+    if not self:CanSkipOrKeepSelected() then
         return
     end
     self.selectedIndex = nil
@@ -975,15 +995,16 @@ function PostingUI:RefreshRows()
             self.postSelectedButton:Disable()
         end
 
+        local canSkipOrKeep = self:CanSkipOrKeepSelected()
         if self.keepButton then
-            if selected and not evaluating and not posting then
+            if canSkipOrKeep then
                 self.keepButton:Enable()
             else
                 self.keepButton:Disable()
             end
         end
         if self.skipButton then
-            if selected and not evaluating and not posting and not selected.userSkipped
+            if canSkipOrKeep and not selected.userSkipped
                 and RowStatus(selected) ~= "Posted" then
                 self.skipButton:Enable()
             else

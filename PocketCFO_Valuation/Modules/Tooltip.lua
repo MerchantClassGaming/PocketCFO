@@ -592,6 +592,37 @@ local function BuildFillRows(data, itemID, rarity)
     return fill
 end
 
+-- The Neutral AH row: { text, at } or nil. Tries the PCFO Value's market
+-- key first, then the item link's own key (an item with no faction price
+-- still gets its Neutral line). Flavor: Forever-only (caller gates).
+local NEUTRAL_LABEL = "Neutral AH"
+
+local function BuildNeutralRow(itemLink, marketKey)
+    local cacheModule = PocketCFO_Valuation:GetModule("PricingCache", true)
+    if not cacheModule or not cacheModule.GetNeutralEntry then
+        return nil
+    end
+    local value, at
+    if marketKey then
+        value, at = cacheModule:GetNeutralEntry(marketKey)
+    end
+    if not value and itemLink then
+        local identity = PocketCFO_Valuation:GetModule("PricingIdentity", true)
+        local okKey, ownKey = false, nil
+        if identity and identity.BuildMarketKey then
+            okKey, ownKey = pcall(identity.BuildMarketKey, identity, itemLink)
+        end
+        if okKey and ownKey and ownKey ~= marketKey then
+            value, at = cacheModule:GetNeutralEntry(ownKey)
+        end
+    end
+    local text = FormatCopper(value)
+    if not text then
+        return nil
+    end
+    return { text = text, at = at }
+end
+
 -- Everything the tooltip shows for one item, ready to draw:
 --   values = { { label, text, value }, ... } (PCFO Value, Disenchant, Vendor)
 --   highest = the largest value when two or more rows show
@@ -640,6 +671,16 @@ local function BuildRows(tooltip, itemLink, bound, data)
     rows.marketKey = marketKey
     rows.value = pocketValue
     rows.freshness = result and (result.isFresh and "fresh" or "stale") or nil
+
+    -- Neutral AH (Brian, 2026-11-24, claude/Forever_Markets_Design.md): the
+    -- Neutral AH's scanned price for this item, beside the PCFO Value (your
+    -- faction's AH). We can't tell if the player is buying or selling, so
+    -- both show. Only when a Neutral scan priced it; not on bound copies.
+    -- The scanned price itself, without the PCFO Value rules (caps). Not part
+    -- of the highest-value color. Flavor: Forever-only (gated).
+    if IsForever() and not bound then
+        rows.neutral = BuildNeutralRow(itemLink, marketKey)
+    end
 
     -- Disenchant (Est.): gear only. DisenchantValue checks the same gate
     -- again with its own data; this one just avoids calling it at all for
@@ -746,14 +787,17 @@ end
 
 local function DrawRows(tooltip, rows)
     local first = rows.values[1]
-    if not first and not rows.fill then
+    if not first and not rows.fill and not rows.neutral then
         return
     end
     -- The hook ran already for this tooltip build: don't add the rows twice.
     if first and TooltipHasRow(tooltip, first.label, first.text) then
         return
     end
-    if not first and TooltipHasRow(tooltip, rows.fill.header) then
+    if not first and rows.fill and TooltipHasRow(tooltip, rows.fill.header) then
+        return
+    end
+    if not first and not rows.fill and TooltipHasRow(tooltip, NEUTRAL_LABEL, rows.neutral.text) then
         return
     end
     for _, row in ipairs(rows.values) do
@@ -772,6 +816,16 @@ local function DrawRows(tooltip, rows)
             and ("Few listings \194\183 scanned " .. lastScanAge .. " ago")
             or ("Scanned " .. lastScanAge .. " ago")
         tooltip:AddLine(scanText, NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])
+    end
+    -- Neutral AH line (Forever only), with its own scan age.
+    if rows.neutral then
+        tooltip:AddDoubleLine(NEUTRAL_LABEL, rows.neutral.text,
+            VALUE_COLOR[1], VALUE_COLOR[2], VALUE_COLOR[3],
+            OTHER_COLOR[1], OTHER_COLOR[2], OTHER_COLOR[3])
+        local neutralAge = rows.neutral.at and FormatLastScanAge(rows.neutral.at) or nil
+        if neutralAge then
+            tooltip:AddLine("Neutral scanned " .. neutralAge .. " ago", NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])
+        end
     end
     for _, text in ipairs(rows.dropLines or {}) do
         tooltip:AddLine(text, NOTE_COLOR[1], NOTE_COLOR[2], NOTE_COLOR[3])

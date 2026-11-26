@@ -54,6 +54,9 @@ local PAGE_ORDER = {
     { key = "keep", title = "Keep List", short = "Keep List", frameKey = "KeepListPage" },
     -- Item Watch (2026-11-16, UI/SalesWatchUI.lua; was "Sales Watch"): smart view only.
     { key = "watch", title = "Item Watch", short = "Item Watch", frameKey = "SalesWatchPage" },
+    -- Analysis (2026-11-24, UI/AnalysisTab.lua, claude/Analysis_Tab_Design.md):
+    -- Forever only for now (IsAnalysisAvailable); retail never shows it.
+    { key = "analysis", title = "Analysis", short = "Analysis", frameKey = "AnalysisPage" },
 }
 
 local PAGE_BY_KEY = {}
@@ -71,6 +74,7 @@ local PAGE_TAB_WIDTHS = {
     ignore = 88,
     keep = 82,
     watch = 96,
+    analysis = 82,
 }
 
 local PAGE_DESCRIPTIONS = {
@@ -1249,7 +1253,21 @@ local function IsSmartView()
     return smart ~= nil and smart:IsSmartView() == true
 end
 
+-- Analysis tab: Forever only (PocketCFO.flavor == "forever"), shown whether
+-- or not AH posting is on, once an analysis has registered (AnalysisTab.lua
+-- is loaded only by PocketCFO_AH_Camelot.toc). Retail: always false.
+local function IsAnalysisAvailable()
+    if not (PocketCFO and PocketCFO.flavor == "forever") then
+        return false
+    end
+    local tab = PocketCFO_AH:GetModule("AnalysisTab", true)
+    return tab ~= nil and tab:HasEntries() == true
+end
+
 function AHPostingUI:IsPageAllowed(pageKey)
+    if pageKey == "analysis" then
+        return IsAnalysisAvailable()
+    end
     if IsSmartView() then
         return SMART_PAGES[pageKey] == true
     end
@@ -1266,7 +1284,9 @@ function AHPostingUI:ApplyBetaPageVisibility()
     if not main or not main.InternalTabs then
         return
     end
-    local showTabs = IsSmartView() or IsAuctionHouseBetaEnabled()
+    -- Forever: the Analysis tab shows with AH posting off too, so the tab row
+    -- shows (Dashboard + Analysis). Retail: IsAnalysisAvailable is false.
+    local showTabs = IsSmartView() or IsAuctionHouseBetaEnabled() or IsAnalysisAvailable()
     local tabX = 12
     for _, page in ipairs(PAGE_ORDER) do
         local tab = main.InternalTabs[page.key]
@@ -1375,6 +1395,8 @@ function AHPostingUI:RefreshPage(pageKey)
         self:RenderKeepList(frame)
     elseif pageKey == "watch" then
         self:RenderSalesWatch(frame)
+    elseif pageKey == "analysis" then
+        self:RenderAnalysis(frame)
     elseif pageKey == "post" then
         self:RenderPostAuctions(frame)
     elseif pageKey == "cancel" then
@@ -1489,36 +1511,27 @@ function AHPostingUI:SelectPage(pageKey)
     end
 end
 
--- Forever only (PocketCFO.flavor == "forever"): the Dashboard splits 50/50,
--- Pricing on the left, the Analysis box (UI/CrateAnalysisUI.lua, loaded only
--- by PocketCFO_AH_Camelot.toc) on the right (Brian, 2026-11-19; was a 220px
--- Pricing column). The split is anchored to the page's middle so it holds
--- at any width. Retail keeps the full-width Pricing section below unchanged.
-local DASHBOARD_COLUMN_GAP = 12
-
+-- Dashboard: Pricing, full width (both flavors). The Forever Analysis box
+-- that sat on the right (2026-11-19) moved to its own Analysis tab
+-- (2026-11-24, RenderAnalysis below).
 function AHPostingUI:RenderDashboard(parent)
     AddChild(parent, CreateLabel(parent, "Pricing", 16, -12, 200, "GameFontNormal"))
     local mount = CreateFrame("Frame", nil, parent)
     mount:SetPoint("TOPLEFT", parent, "TOPLEFT", 16, -40)
-    local crateUI = PocketCFO and PocketCFO.flavor == "forever"
-        and PocketCFO_AH:GetModule("CrateAnalysisUI", true) or nil
-    if crateUI and crateUI.Render then
-        mount:SetPoint("BOTTOMRIGHT", parent, "BOTTOM", -DASHBOARD_COLUMN_GAP, 16)
-        local analysisLabel = CreateLabel(parent, "Analysis", 0, -12, 200, "GameFontNormal")
-        analysisLabel:ClearAllPoints()
-        analysisLabel:SetPoint("TOPLEFT", parent, "TOP", DASHBOARD_COLUMN_GAP, -12)
-        AddChild(parent, analysisLabel)
-        local analysisMount = CreateFrame("Frame", nil, parent)
-        analysisMount:SetPoint("TOPLEFT", parent, "TOP", DASHBOARD_COLUMN_GAP, -40)
-        analysisMount:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
-        AddChild(parent, analysisMount)
-        crateUI:Render(analysisMount)
-    else
-        mount:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
-    end
+    mount:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -16, 16)
     AddChild(parent, mount)
     self.pricingMount = mount
     self:EmbedPricingSection()
+end
+
+-- Analysis page (Forever only; UI/AnalysisTab.lua builds it once).
+function AHPostingUI:RenderAnalysis(parent)
+    local tab = PocketCFO_AH:GetModule("AnalysisTab", true)
+    if tab and tab.Render then
+        tab:Render(parent)
+    else
+        AddChild(parent, CreateLabel(parent, "Analysis unavailable.", 10, -12, 320, "GameFontRedSmall"))
+    end
 end
 
 function AHPostingUI:RenderProfiles(parent)
